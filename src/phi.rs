@@ -21,6 +21,7 @@ use crate::types::TaskType;
 use crate::verify::{Verifier, VerifyResult};
 use anyhow::Result;
 use futures::future::BoxFuture;
+use std::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -47,6 +48,8 @@ pub struct PhiConfig {
     /// Bounds total concurrent recursive tasks to prevent OOM on wide trees.
     /// Default: 100 permits. Each phi() call holds one permit for its duration.
     pub concurrency: Arc<Semaphore>,
+    /// Reuses JoinSet allocations across recursion levels.
+    pub joinset_pool: Arc<Mutex<Vec<JoinSet<(usize, Result<String>)>>>>,
     /// Trace ID for correlating logs across recursive phi calls.
     /// Survives the entire recursion tree — all children share the same trace_id.
     /// 16 bytes (blake3 truncated) — negligible allocation cost per request.
@@ -59,6 +62,24 @@ pub struct PhiConfig {
 /// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
+const MAX_JOINSET_POOL: usize = 32;
+
+fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
+    cfg.joinset_pool
+        .lock()
+        .ok()
+        .and_then(|mut pool| pool.pop())
+        .unwrap_or_else(JoinSet::new)
+}
+
+fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
+    set.detach_all();
+    if let Ok(mut pool) = cfg.joinset_pool.lock() {
+        if pool.len() < MAX_JOINSET_POOL {
+            pool.push(set);
+        }
+    }
+}
 
 async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) {
     set.abort_all();
@@ -304,7 +325,7 @@ pub fn phi(
 
         // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
         // Each spawn acquires a concurrency permit to bound total recursive tasks.
-        let mut set = JoinSet::new();
+        let mut set = checkout_joinset(&cfg);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let cfg = Arc::clone(&cfg);
             let sem = Arc::clone(&cfg.concurrency);
@@ -333,6 +354,7 @@ pub fn phi(
                 _ = shutdown_rx.changed() => {
                     tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children");
                     abort_and_drain(&mut set, depth).await;
+                    return_joinset(&cfg, set);
                     return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
                 }
                 join_result = set.join_next() => {
@@ -368,6 +390,7 @@ pub fn phi(
         }
 
         if let Some(e) = fatal_error {
+            return_joinset(&cfg, set);
             return Err(e);
         }
 
@@ -376,6 +399,7 @@ pub fn phi(
             indexed_results.into_iter().map(|(_, text)| text).collect();
 
         if child_results.is_empty() {
+            return_joinset(&cfg, set);
             return Ok(format!(
                 "[degraded: all {} children failed at depth {depth}]",
                 num_children
@@ -403,6 +427,8 @@ pub fn phi(
             cfg.max_tokens,
         )
         .await;
+
+        return_joinset(&cfg, set);
 
         // Graceful degradation for neural reduce failures
         match reduce_result {

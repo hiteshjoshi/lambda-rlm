@@ -4,17 +4,18 @@
 //! replay cache, per-call timeout, retries with exponential backoff,
 //! telemetry counters. All state is lock-free (atomics).
 //!
-use crate::resilience::{BudgetGuard, CallBudget, CircuitBreaker, ReplayCache};
+use crate::resilience::{BudgetGuard, CachePermit, CallBudget, CircuitBreaker, ReplayCache};
 use crate::types::CodeGenerator;
 use anyhow::Result;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Maximum SSE stream buffer size. Prevents OOM from malicious or
 /// runaway endpoints streaming unbounded data. 10MB accommodates the
@@ -133,13 +134,37 @@ struct StreamDelta {
 
 struct InflightGuard<'a> {
     map: &'a DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
+    gauge: &'a AtomicUsize,
     key: String,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         self.map.remove(&self.key);
+        self.gauge.fetch_sub(1, Ordering::AcqRel);
+        if self.map.is_empty() {
+            self.map.shrink_to_fit();
+        }
     }
+}
+
+pub struct ResourceStack<'a> {
+    _budget: BudgetGuard<'a>,
+    _cache_permit: CachePermit<'a>,
+    _bulkhead: SemaphorePermit<'a>,
+}
+
+impl ResourceStack<'_> {
+    fn commit_budget(&mut self) {
+        self._budget.commit();
+    }
+}
+
+pub struct OracleMetrics {
+    pub budget_guards_live: u64,
+    pub inflight_requests: usize,
+    pub cache_hit_rate: f64,
+    pub circuit_breaker_state: &'static str,
 }
 
 // ── Bulkhead ─────────────────────────────────────────────────────
@@ -190,7 +215,7 @@ impl FireworksProvider {
         use futures::StreamExt;
         let mut result = String::new();
         let mut stream = response.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = BytesMut::with_capacity(8192);
         let mut event_data = String::new();
         let mut bom_stripped = false;
         let mut event_count: usize = 0;
@@ -208,15 +233,15 @@ impl FireworksProvider {
 
             if !bom_stripped {
                 if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                    buf.drain(..3);
+                    let _ = buf.split_to(3);
                 }
                 bom_stripped = true;
             }
 
-            while let Some((line_end, skip)) = sse_line_boundary(&buf) {
+            while let Some((line_end, skip)) = sse_line_boundary(&buf[..]) {
                 let line = String::from_utf8(buf[..line_end].to_vec())
                     .map_err(|e| anyhow::anyhow!("SSE stream contains invalid UTF-8: {e}"))?;
-                buf.drain(..line_end + skip);
+                let _ = buf.split_to(line_end + skip);
 
                 if line.is_empty() {
                     if !event_data.is_empty() {
@@ -377,6 +402,7 @@ pub struct Oracle {
     /// IMPORTANT: Oracle intentionally has no back-reference to PhiConfig.
     /// Keep ownership one-way (PhiConfig -> Oracle) to prevent Arc cycles.
     inflight: DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
+    inflight_gauge: AtomicUsize,
     /// Cooperative shutdown flag. When set, in-flight and future API calls
     /// fail fast instead of proceeding, preventing wasted billing after shutdown.
     shutdown: AtomicBool,
@@ -420,6 +446,7 @@ impl Oracle {
             max_retries,
             shutdown: AtomicBool::new(false),
             inflight: DashMap::new(),
+            inflight_gauge: AtomicUsize::new(0),
             cache_hits: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             total_input_chars: AtomicU64::new(0),
@@ -457,6 +484,43 @@ impl Oracle {
     /// Release n previously reserved budget units.
     pub fn budget_unreserve(&self, n: usize) {
         self.budget.release_n(n)
+    }
+
+    pub async fn acquire_resources(&self) -> Result<ResourceStack<'_>> {
+        if !self.budget.try_acquire() {
+            anyhow::bail!(
+                "Call budget exhausted (remaining: {})",
+                self.budget.remaining()
+            );
+        }
+        let budget = BudgetGuard::new(&self.budget);
+        let cache_permit = self.cache.reserve();
+        let bulkhead = self.bulkhead.llm().acquire().await?;
+        Ok(ResourceStack {
+            _budget: budget,
+            _cache_permit: cache_permit,
+            _bulkhead: bulkhead,
+        })
+    }
+
+    pub fn check_inflight_leak(&self) -> bool {
+        self.inflight_gauge.load(Ordering::Acquire) == self.inflight.len()
+    }
+
+    pub fn metrics(&self) -> OracleMetrics {
+        let calls = self.calls();
+        let cache_hits = self.cache_hits.load(Ordering::Acquire);
+        let cache_hit_rate = if calls == 0 {
+            0.0
+        } else {
+            cache_hits as f64 / calls as f64
+        };
+        OracleMetrics {
+            budget_guards_live: self.budget.leaked_guards(),
+            inflight_requests: self.inflight.len(),
+            cache_hit_rate,
+            circuit_breaker_state: self.circuit.state(),
+        }
     }
 
     /// Signal shutdown to cancel in-flight and prevent future API calls.
@@ -498,14 +562,8 @@ impl Oracle {
     ///   - Fatal (auth failure): trip circuit breaker immediately, no retry
     ///   - Non-retryable (4xx except 429): fail fast, no retry
     pub async fn call(&self, system: &str, user_prompt: &str, max_tokens: u32) -> Result<String> {
-        // 1. Budget acquire + RAII guard
-        if !self.budget.try_acquire() {
-            anyhow::bail!(
-                "Call budget exhausted (remaining: {})",
-                self.budget.remaining()
-            );
-        }
-        let mut guard = BudgetGuard::new(&self.budget);
+        // 1. Ordered resource acquisition: Budget -> Cache -> Bulkhead
+        let mut resources = self.acquire_resources().await?;
 
         // 2. Cache check
         let cache_key = ReplayCache::key(&self.model, system, user_prompt, max_tokens);
@@ -523,7 +581,7 @@ impl Oracle {
                 user_prompt.len(),
                 cached.len()
             );
-            guard.commit();
+            resources.commit_budget();
             return Ok(cached);
         }
 
@@ -540,7 +598,7 @@ impl Oracle {
                     loop {
                         if let Some(ref result) = *rx.borrow() {
                             self.cache_hits.fetch_add(1, Ordering::AcqRel);
-                            guard.commit();
+                            resources.commit_budget();
                             return Ok(result.clone());
                         }
                         if rx.changed().await.is_err() {
@@ -554,6 +612,7 @@ impl Oracle {
                     let (tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
                     let tx = Arc::new(tx);
                     vacant.insert(Arc::clone(&tx));
+                    self.inflight_gauge.fetch_add(1, Ordering::AcqRel);
                     break tx;
                 }
             }
@@ -562,11 +621,11 @@ impl Oracle {
         // RAII guard removes entry on all exit paths (success, error, panic).
         let _inflight_guard = InflightGuard {
             map: &self.inflight,
+            gauge: &self.inflight_gauge,
             key: cache_key.clone(),
         };
 
-        // 3. Semaphore — held for entire call including retries
-        let _permit = self.bulkhead.llm().acquire().await.unwrap();
+        // 3. Bulkhead permit is now held by ResourceStack.
         let n = self.call_count.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Idempotency key: stable across retries of the same call, unique per
@@ -589,7 +648,7 @@ impl Oracle {
         };
 
         if self.dry_run {
-            guard.commit();
+            resources.commit_budget();
             return Ok(format!(
                 "[DRY RUN] Call #{n} ({} chars in, max_tok={max_tokens})",
                 user_prompt.len()
@@ -602,7 +661,7 @@ impl Oracle {
             // Cooperative shutdown: fail fast instead of starting new API calls.
             // Prevents wasted billing when shutdown signal has fired.
             if self.shutdown.load(Ordering::Acquire) {
-                guard.commit();
+                resources.commit_budget();
                 anyhow::bail!("Cancelled by shutdown signal");
             }
 
@@ -610,7 +669,7 @@ impl Oracle {
             if !self.circuit.allow_request() {
                 let failures = self.circuit.failures();
                 tracing::warn!(failures, cooldown_s = 30, "circuit breaker open");
-                guard.commit(); // budget consumed: we tried
+                resources.commit_budget(); // budget consumed: we tried
                 anyhow::bail!(
                     "Circuit breaker open -- {} consecutive failures, cooling off 30s",
                     failures
@@ -681,7 +740,7 @@ impl Oracle {
                     );
                     // Broadcast result to single-flight waiters before returning
                     let _ = inflight_tx.send(Some(text.clone()));
-                    guard.commit();
+                    resources.commit_budget();
                     return Ok(text);
                 }
                 Err(e) if e.is_fatal() => {
@@ -690,7 +749,7 @@ impl Oracle {
                     self.errors.fetch_add(1, Ordering::AcqRel);
                     tracing::error!(call = n, error = %e, "fatal API error, not retrying");
                     eprintln!("    M #{n} FATAL: {e}");
-                    guard.commit();
+                    resources.commit_budget();
                     anyhow::bail!("{e}");
                 }
                 Err(e) => {
@@ -701,7 +760,7 @@ impl Oracle {
 
                     if !e.is_retryable() {
                         // Non-retryable (e.g., 4xx client error): fail fast
-                        guard.commit();
+                        resources.commit_budget();
                         anyhow::bail!("{e}");
                     }
 
@@ -710,7 +769,7 @@ impl Oracle {
             }
         }
 
-        guard.commit(); // budget consumed: we made real API attempts
+        resources.commit_budget(); // budget consumed: we made real API attempts
         Err(last_error
             .map(|e| anyhow::anyhow!("{e}"))
             .unwrap_or_else(|| anyhow::anyhow!("all retries exhausted")))
@@ -743,7 +802,11 @@ impl Oracle {
         let output_chars = self.total_output_chars.load(Ordering::Acquire);
         let latency_ms = self.total_latency_ms.load(Ordering::Acquire);
         let budget_remaining = self.budget.remaining();
-        let leaked_budget_guards = self.budget.leaked_guards();
+        let metrics = self.metrics();
+        let leaked_budget_guards = metrics.budget_guards_live;
+        let inflight_requests = metrics.inflight_requests;
+        let inflight_gauge = self.inflight_gauge.load(Ordering::Acquire);
+        let inflight_consistent = self.check_inflight_leak();
         let codegen_claude_calls = self.codegen_claude_calls.load(Ordering::Acquire);
         let codegen_opencode_calls = self.codegen_opencode_calls.load(Ordering::Acquire);
         let codegen_claude_latency_ms = self.codegen_claude_latency_ms.load(Ordering::Acquire);
@@ -794,6 +857,33 @@ impl Oracle {
                 format_args!("    Budget guard leaks: {leaked_budget_guards}\n"),
             );
         }
+        w(
+            &mut buf,
+            format_args!("    Inflight entries: {inflight_requests}\n"),
+        );
+        if inflight_requests != inflight_gauge {
+            w(
+                &mut buf,
+                format_args!(
+                    "    Inflight gauge mismatch: map={inflight_requests} gauge={inflight_gauge}\n"
+                ),
+            );
+        }
+        w(
+            &mut buf,
+            format_args!(
+                "    Inflight invariant: {}\n",
+                if inflight_consistent { "ok" } else { "mismatch" }
+            ),
+        );
+        w(
+            &mut buf,
+            format_args!("    Circuit state:    {}\n", metrics.circuit_breaker_state),
+        );
+        w(
+            &mut buf,
+            format_args!("    Cache hit rate:   {:.2}%\n", metrics.cache_hit_rate * 100.0),
+        );
         w(
             &mut buf,
             format_args!("    Codegen Claude:   {codegen_claude_calls} call(s)\n"),

@@ -69,9 +69,8 @@ fn codegen_circuit(generator: &CodeGenerator) -> Result<&'static CircuitBreaker>
     static CLAUDE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     static OPENCODE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     let circuit = match generator {
-        CodeGenerator::Claude => {
-            CLAUDE_CIRCUIT.get_or_init(|| CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN))
-        }
+        CodeGenerator::Claude => CLAUDE_CIRCUIT
+            .get_or_init(|| CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN)),
         CodeGenerator::Opencode => OPENCODE_CIRCUIT
             .get_or_init(|| CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN)),
     };
@@ -153,7 +152,9 @@ pub async fn run_code_generator(
 }
 
 fn error_has_context(error: &anyhow::Error, marker: &str) -> bool {
-    error.chain().any(|cause| cause.to_string().contains(marker))
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(marker))
 }
 
 fn validate_analysis_result_content(result: &str) -> Result<()> {
@@ -184,6 +185,27 @@ fn validate_generator_output(generator: &CodeGenerator, output: &str) -> Result<
     Ok(())
 }
 
+#[cfg(unix)]
+fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("refusing unsafe result path: {}", path.display()))?;
+    let meta = file.metadata()?;
+    Ok((file, meta.len(), meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect result path: {}", path.display()))?;
+    anyhow::ensure!(!meta.file_type().is_symlink(), "refusing symlink result file");
+    let file = std::fs::File::open(path)?;
+    Ok((file, meta.len(), 0, 0))
+}
+
 async fn write_result_file_atomically(
     work_dir: &Path,
     result: &str,
@@ -192,10 +214,11 @@ async fn write_result_file_atomically(
     validate_analysis_result_content(result)?;
 
     let result_file = work_dir.join(RESULT_FILE_NAME);
-    if let Ok(meta) = tokio::fs::symlink_metadata(&result_file).await {
+    if result_file.exists() {
+        let (_existing, size, _dev, _ino) = open_file_no_follow(&result_file)?;
         anyhow::ensure!(
-            !meta.file_type().is_symlink(),
-            "refusing to write through symlink result file"
+            size <= MAX_RESULT_BYTES as u64,
+            "existing result file exceeds safety bound"
         );
     }
 
@@ -239,12 +262,6 @@ async fn remove_result_file(work_dir: &Path) {
     }
 }
 
-fn first_non_empty_line(text: &str) -> &str {
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("(no output)")
-}
-
 fn last_non_empty_line(text: &str) -> &str {
     text.lines()
         .rev()
@@ -262,12 +279,8 @@ impl CodeGenerator {
         }
         validate_generator_output(self, &stdout)?;
 
-        // Output-format invariant by generator:
-        // - Claude streams progress/thinking first, then prints the actionable result last.
-        // - OpenCode emits the concise actionable result first, then diagnostics.
         let summary = match self {
-            CodeGenerator::Claude => last_non_empty_line(&stdout),
-            CodeGenerator::Opencode => first_non_empty_line(&stdout),
+            CodeGenerator::Claude | CodeGenerator::Opencode => last_non_empty_line(&stdout),
         };
 
         Ok(Arc::from(summary))
@@ -386,15 +399,21 @@ where
     Ok(out)
 }
 
-fn classify_non_success_exit(generator_name: &str, status: std::process::ExitStatus) -> anyhow::Error {
+fn classify_non_success_exit(
+    generator_name: &str,
+    status: std::process::ExitStatus,
+) -> anyhow::Error {
     match status.code() {
         Some(127) => anyhow::anyhow!("{generator_name} command not found (exit 127)")
             .context("codegen_fatal"),
         Some(1) => anyhow::anyhow!("{generator_name} exited with retryable CLI error (exit 1)")
             .context("codegen_retryable"),
-        Some(code) => anyhow::anyhow!("{generator_name} exited with code {code}")
-            .context("codegen_retryable"),
-        None => anyhow::anyhow!("{generator_name} terminated by signal").context("codegen_retryable"),
+        Some(code) => {
+            anyhow::anyhow!("{generator_name} exited with code {code}").context("codegen_retryable")
+        }
+        None => {
+            anyhow::anyhow!("{generator_name} terminated by signal").context("codegen_retryable")
+        }
     }
 }
 
@@ -633,12 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn first_non_empty_line_extracts_first_signal() {
-        let output = "\n\nFix applied\nMore details\n";
-        assert_eq!(first_non_empty_line(output), "Fix applied");
-    }
-
-    #[test]
     fn last_non_empty_line_extracts_final_signal() {
         let output = "line one\n\nline two\n\n";
         assert_eq!(last_non_empty_line(output), "line two");
@@ -654,8 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_result_uses_first_line_for_opencode() {
-        let output = b"fix done\nmetadata\n";
+    fn extract_result_uses_last_line_for_opencode() {
+        let output = b"metadata\nfix done\n";
         let summary = CodeGenerator::Opencode
             .extract_result(output)
             .expect("summary");
@@ -664,7 +677,9 @@ mod tests {
 
     #[test]
     fn extract_result_treats_empty_stdout_as_degraded() {
-        let summary = CodeGenerator::Opencode.extract_result(b"   \n\n").expect("summary");
+        let summary = CodeGenerator::Opencode
+            .extract_result(b"   \n\n")
+            .expect("summary");
         assert_eq!(summary.as_ref(), "(degraded: empty generator output)");
     }
 

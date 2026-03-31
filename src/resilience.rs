@@ -112,6 +112,18 @@ impl CircuitBreaker {
         self.consecutive_failures.load(Ordering::Acquire)
     }
 
+    pub fn state(&self) -> &'static str {
+        let failures = self.consecutive_failures.load(Ordering::Acquire);
+        if failures < self.threshold {
+            return "closed";
+        }
+        let last = self.last_failure_mono_ms.load(Ordering::Acquire);
+        if monotonic_ms() - last < self.cooldown_ms {
+            return "open";
+        }
+        "half_open"
+    }
+
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Release);
         self.half_open_probe.store(false, Ordering::Release);
@@ -333,6 +345,10 @@ pub struct ReplayCache {
     corruption_count: AtomicUsize,
 }
 
+pub struct CachePermit<'a> {
+    _cache: &'a ReplayCache,
+}
+
 impl ReplayCache {
     pub fn new(dir: PathBuf, enabled: bool, max_entries: usize) -> Self {
         if enabled {
@@ -471,6 +487,10 @@ impl ReplayCache {
 
     /// Read from cache with content-integrity verification.
     /// Returns None on miss, corruption (quarantined), or legacy format entries.
+    pub fn reserve(&self) -> CachePermit<'_> {
+        CachePermit { _cache: self }
+    }
+
     pub fn get(&self, key: &str) -> Option<String> {
         if !self.enabled.load(Ordering::Acquire) || !Self::validate_key(key) {
             return None;

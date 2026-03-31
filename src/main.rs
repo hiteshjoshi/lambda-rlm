@@ -296,19 +296,28 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
     if canonical_root.is_file() {
         let meta = std::fs::metadata(&canonical_root)
             .with_context(|| format!("Cannot stat {}", canonical_root.display()))?;
-        if meta.len() > MAX_AGGREGATE_BYTES {
-            anyhow::bail!(
-                "Single file {} bytes exceeds {} byte aggregate limit",
-                meta.len(),
-                MAX_AGGREGATE_BYTES
-            );
-        }
+        let oversized = meta.len() > MAX_AGGREGATE_BYTES;
         let mut out = format!("// === {} ===\n", path.display());
         let mut file = std::fs::File::open(&canonical_root)
             .with_context(|| format!("Failed to open {}", canonical_root.display()))?;
         use std::io::Read;
         file.read_to_string(&mut out)
             .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
+        if oversized {
+            let mut end = MAX_AGGREGATE_BYTES as usize;
+            while end > 0 && !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            let omitted = out.len().saturating_sub(end);
+            out.truncate(end);
+            out.push_str(&format!("\n// [TRUNCATED: {omitted} bytes omitted]\n"));
+            tracing::warn!(
+                path = %canonical_root.display(),
+                kept = end,
+                omitted,
+                "truncated oversized single-file input"
+            );
+        }
         return Ok(out);
     }
 
@@ -414,20 +423,23 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                 #[cfg(not(unix))]
                 let _ = (open_dev, open_ino);
 
-                accumulated_bytes = accumulated_bytes.checked_add(size).with_context(|| {
+                let next_total = accumulated_bytes.checked_add(size).with_context(|| {
                     format!(
                         "Aggregate size overflow while scanning {}",
                         file_path.display()
                     )
                 })?;
-                if accumulated_bytes > MAX_AGGREGATE_BYTES {
-                    anyhow::bail!(
-                        "Aggregate source size {} bytes exceeds {} byte limit after {} files",
-                        accumulated_bytes,
-                        MAX_AGGREGATE_BYTES,
-                        file_count
+                if next_total > MAX_AGGREGATE_BYTES {
+                    let omitted = next_total - MAX_AGGREGATE_BYTES;
+                    tracing::warn!(
+                        bytes = accumulated_bytes,
+                        omitted,
+                        "truncating source collection at aggregate byte cap"
                     );
+                    all_code.push_str(&format!("\n// [TRUNCATED: {omitted} bytes omitted]\n"));
+                    break;
                 }
+                accumulated_bytes = next_total;
                 use std::io::Read;
                 let checkpoint = all_code.len();
                 all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
@@ -445,6 +457,9 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                     }
                 }
             }
+        }
+        if accumulated_bytes >= MAX_AGGREGATE_BYTES {
+            break;
         }
     }
 
@@ -589,6 +604,7 @@ async fn run_analysis(
         verifier,
         shutdown: shutdown_rx,
         concurrency: concurrency_semaphore,
+        joinset_pool: Arc::new(std::sync::Mutex::new(Vec::new())),
         trace_id,
     });
 
