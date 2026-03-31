@@ -6,7 +6,8 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::{path::Path, process::Stdio};
+use tokio::time::{timeout, Duration};
 
 use crate::types::CodeGenerator;
 
@@ -114,8 +115,8 @@ async fn run_claude(
     Ok(summary)
 }
 
-/// Spawn opencode and wait for it to finish (no timeout).
-/// Returns OpenCode's output summary (first line).
+/// Spawn opencode in non-interactive mode and wait for it to finish.
+/// Returns OpenCode's output summary (last non-empty line).
 ///
 /// PRE: work_dir exists and is writable
 /// POST: opencode process has exited
@@ -137,19 +138,24 @@ async fn run_opencode(
     let prompt = build_prompt(question, iteration);
 
     let mut cmd = tokio::process::Command::new("opencode");
-    cmd.arg("-p")
+    cmd.arg("run")
+        .arg("--file")
+        .arg(".lambda-rlm-result.md")
+        .arg("--")
         .arg(&prompt)
         .current_dir(work_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     let child = cmd
         .spawn()
         .context("Failed to spawn `opencode` — is it installed and on PATH?")?;
 
-    let output = child
-        .wait_with_output()
+    let output = timeout(Duration::from_secs(300), child.wait_with_output())
         .await
+        .context("opencode timed out after 5 minutes")?
         .context("Failed to run opencode")?;
 
     let _ = std::fs::remove_file(&result_file);
@@ -169,6 +175,7 @@ async fn run_opencode(
 
     let summary = stdout
         .lines()
+        .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("(no output)")
         .to_string();
