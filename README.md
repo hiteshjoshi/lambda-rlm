@@ -210,11 +210,11 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `f58f5b4`
+Latest fix-loop hardening commit: `0044f18`
 
-- Hardened `codegen.rs` for production safety: bounded Claude/OpenCode execution, `kill_on_drop` process cleanup, and Unix process-group isolation.
-- Added atomic `.lambda-rlm-result.md` writes, input validation guards, and generic sanitized codegen failure reporting.
-- Added deterministic log retention (10 files per generator) and unit tests for output extraction and result validation edge cases.
+- Hardened code-generator lifecycle in `codegen.rs`: both Claude and OpenCode now always clean up `.lambda-rlm-result.md`, including timeout and spawn-failure paths, preventing stale state across fix-loop iterations.
+- Increased OpenCode timeout to match Claude's 15-minute budget to handle cold starts and large repos without premature timeout churn.
+- Added a clap `ArgGroup` for `--claude`/`--opencode` and switched aggregate-byte accounting to `checked_add` in `collect_source_files` to eliminate overflow risk under extreme inputs.
 
 See [CHANGELOG.md](CHANGELOG.md).
 
