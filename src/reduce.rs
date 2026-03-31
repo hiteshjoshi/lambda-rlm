@@ -7,7 +7,7 @@
 //! All reduce functions take verified inputs — refusal detection is
 //! handled upstream by the Verifier at leaf level.
 
-use crate::combinator::{comb_cross, merge_dedup, parse_items};
+use crate::combinator::{comb_cross, merge_dedup, merge_dedup_arc, parse_items};
 use crate::oracle::Oracle;
 use crate::types::TaskType;
 use anyhow::Result;
@@ -39,7 +39,10 @@ pub async fn reduce_for_task(
     oracle: Arc<Oracle>,
     max_tokens: u32,
 ) -> Result<String> {
-    debug_assert!(!child_results.is_empty(), "PRE: child_results must be non-empty");
+    debug_assert!(
+        !child_results.is_empty(),
+        "PRE: child_results must be non-empty"
+    );
     debug_assert!(depth <= max_depth, "PRE: depth must not exceed max_depth");
 
     let result = match task {
@@ -54,7 +57,15 @@ pub async fn reduce_for_task(
             }
         }
         TaskType::Summarise => {
-            reduce_summarise(child_results, question, depth, max_depth, &oracle, max_tokens).await
+            reduce_summarise(
+                child_results,
+                question,
+                depth,
+                max_depth,
+                &oracle,
+                max_tokens,
+            )
+            .await
         }
         TaskType::MultiHop => {
             reduce_multi_hop(
@@ -110,8 +121,11 @@ fn reduce_aggregate(child_results: Vec<String>) -> String {
     if useful.is_empty() {
         "No items found.".into()
     } else {
-        let all_items: Vec<String> = useful.iter().flat_map(|r| parse_items(r)).collect();
-        let deduped = merge_dedup(all_items);
+        let all_items: Vec<Arc<str>> = useful
+            .iter()
+            .flat_map(|r| parse_items(r).into_iter().map(Arc::<str>::from))
+            .collect();
+        let deduped = merge_dedup_arc(all_items);
         if deduped.is_empty() {
             "No items found.".into()
         } else {
@@ -122,7 +136,7 @@ fn reduce_aggregate(child_results: Vec<String>) -> String {
                     out.push('\n');
                 }
                 out.push_str("- ");
-                out.push_str(item);
+                out.push_str(item.as_ref());
             }
             out
         }
@@ -131,8 +145,11 @@ fn reduce_aggregate(child_results: Vec<String>) -> String {
 
 fn reduce_pairwise_intermediate(child_results: Vec<String>) -> String {
     let useful = filter_nonempty(child_results);
-    let all_items: Vec<String> = useful.iter().flat_map(|r| parse_items(r)).collect();
-    let deduped = merge_dedup(all_items);
+    let all_items: Vec<Arc<str>> = useful
+        .iter()
+        .flat_map(|r| parse_items(r).into_iter().map(Arc::<str>::from))
+        .collect();
+    let deduped = merge_dedup_arc(all_items);
     // Pre-allocate: "- " (2) + item + "\n" (1) per item
     let mut out = String::with_capacity(deduped.iter().map(|s| s.len() + 3).sum());
     for (i, item) in deduped.iter().enumerate() {
@@ -140,7 +157,7 @@ fn reduce_pairwise_intermediate(child_results: Vec<String>) -> String {
             out.push('\n');
         }
         out.push_str("- ");
-        out.push_str(item);
+        out.push_str(item.as_ref());
     }
     out
 }
@@ -158,7 +175,7 @@ async fn reduce_pairwise_top(
         return Ok("No entities found for comparison.".into());
     }
 
-    let groups: Vec<Vec<String>> = useful.iter().map(|r| parse_items(r)).collect();
+    let groups: Vec<Vec<String>> = useful.iter().map(|r| merge_dedup(parse_items(r))).collect();
     let pairs = comb_cross(&groups);
     eprintln!(
         "    CROSS: {} groups -> {} pairs (symbolic)",

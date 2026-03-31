@@ -56,6 +56,26 @@ pub struct PhiConfig {
 /// JS) generates millions of chunks that exhaust memory before semaphore
 /// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
+const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
+
+async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) {
+    set.abort_all();
+    let drain = async {
+        while let Some(res) = set.join_next().await {
+            drop(res);
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(JOINSET_DRAIN_TIMEOUT_SECS), drain)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            depth,
+            timeout_secs = JOINSET_DRAIN_TIMEOUT_SECS,
+            "joinset drain timed out after abort_all"
+        );
+    }
+}
 
 /// PRE: cfg.task != Auto (resolved in Phase 2)
 /// PRE: text.len() > 0
@@ -70,7 +90,12 @@ const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 /// available permits. This ordering guarantees liveness: no cycle exists in the
 /// resource acquisition graph. A future refactor that inverts this order (e.g.,
 /// acquiring Budget before Semaphore) risks deadlock under deep recursion.
-pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<OwnedSemaphorePermit>) -> BoxFuture<'static, Result<String>> {
+pub fn phi(
+    cfg: Arc<PhiConfig>,
+    text: String,
+    depth: usize,
+    permit: Option<OwnedSemaphorePermit>,
+) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         // Check for shutdown before doing any work
         if *cfg.shutdown.borrow() {
@@ -105,7 +130,11 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
 
         // ── BASE CASE: |P| ≤ τ → Verify(M(P)) ──
         if text.len() <= cfg.tau {
-            eprintln!("{indent}+- LEAF ({} chars) depth={depth} trace={}", text.len(), hex::encode(&cfg.trace_id[..4]));
+            eprintln!(
+                "{indent}+- LEAF ({} chars) depth={depth} trace={}",
+                text.len(),
+                hex::encode(&cfg.trace_id[..4])
+            );
             let (sys, prompt) = leaf_prompt(&text, &cfg.question, &cfg.task);
 
             match cfg.oracle.call(&sys, &prompt, 2048).await {
@@ -139,8 +168,17 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
 
         // ── DEPTH GUARD: prevent unbounded recursion on adversarial input ──
         if depth >= cfg.max_depth {
-            tracing::warn!(depth, max_depth = cfg.max_depth, chars = text.len(), "max recursion depth reached, treating as leaf");
-            eprintln!("{indent}+- DEPTH LIMIT ({} chars) depth={depth}/{}", text.len(), cfg.max_depth);
+            tracing::warn!(
+                depth,
+                max_depth = cfg.max_depth,
+                chars = text.len(),
+                "max recursion depth reached, treating as leaf"
+            );
+            eprintln!(
+                "{indent}+- DEPTH LIMIT ({} chars) depth={depth}/{}",
+                text.len(),
+                cfg.max_depth
+            );
             // Truncate to tau to stay within model context window
             let truncated = if text.len() > cfg.tau {
                 let mut end = cfg.tau;
@@ -156,11 +194,15 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                 Ok(raw) => match cfg.verifier.check(&raw, text.len()) {
                     VerifyResult::Accept(v) | VerifyResult::Degraded(v, _) => return Ok(v),
                     VerifyResult::Reject(reason) => {
-                        return Ok(format!("[degraded: depth limit, verification rejected: {reason}]"));
+                        return Ok(format!(
+                            "[degraded: depth limit, verification rejected: {reason}]"
+                        ));
                     }
                 },
                 Err(_) if depth > 0 => {
-                    return Ok(format!("[degraded: depth limit leaf failed at depth {depth}]"));
+                    return Ok(format!(
+                        "[degraded: depth limit leaf failed at depth {depth}]"
+                    ));
                 }
                 Err(e) => return Err(e),
             }
@@ -286,10 +328,8 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                 // hard abort to ensure RAII guards (BudgetGuard, SemaphorePermit)
                 // complete their Drop before we return.
                 _ = shutdown_rx.changed() => {
-                    tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children (30s timeout)");
-                    set.abort_all();
-                    let drain = async { while set.join_next().await.is_some() {} };
-                    let _ = tokio::time::timeout(Duration::from_secs(30), drain).await;
+                    tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children");
+                    abort_and_drain(&mut set, depth).await;
                     return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
                 }
                 join_result = set.join_next() => {
@@ -304,8 +344,7 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                             // Depth 0: record error but drain remaining tasks
                             // so their RAII guards drop cleanly.
                             fatal_error.get_or_insert(e);
-                            set.abort_all();
-                            while set.join_next().await.is_some() {}
+                            abort_and_drain(&mut set, depth).await;
                             break;
                         }
                         Some(Err(join_err)) if join_err.is_cancelled() => {
@@ -317,8 +356,7 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                         }
                         Some(Err(join_err)) => {
                             fatal_error.get_or_insert_with(|| anyhow::anyhow!("Child task failed: {join_err}"));
-                            set.abort_all();
-                            while set.join_next().await.is_some() {}
+                            abort_and_drain(&mut set, depth).await;
                             break;
                         }
                     }
@@ -331,10 +369,8 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
         }
 
         indexed_results.sort_by_key(|(idx, _)| *idx);
-        let child_results: Vec<String> = indexed_results
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
+        let child_results: Vec<String> =
+            indexed_results.into_iter().map(|(_, text)| text).collect();
 
         if child_results.is_empty() {
             return Ok(format!(
@@ -349,10 +385,7 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
             child_results.len(),
         );
 
-        if matches!(
-            cfg.task,
-            TaskType::Summarise | TaskType::MultiHop
-        ) {
+        if matches!(cfg.task, TaskType::Summarise | TaskType::MultiHop) {
             let chars: usize = child_results.iter().map(|r| r.len()).sum();
             eprintln!("{indent}|  (synthesis: {chars} chars)");
         }
@@ -432,10 +465,7 @@ pub async fn auto_detect_task(
     );
 
     let response = oracle.call(system, &user, 64).await?;
-    let normalized = response
-        .trim()
-        .to_lowercase()
-        .replace(['-', '_', ' '], "");
+    let normalized = response.trim().to_lowercase().replace(['-', '_', ' '], "");
 
     let task = match normalized.as_str() {
         "search" => TaskType::Search,
@@ -445,7 +475,10 @@ pub async fn auto_detect_task(
         "summarise" | "summarize" | "summary" => TaskType::Summarise,
         "multihop" => TaskType::MultiHop,
         other => {
-            tracing::warn!(raw = other, "auto-detect returned unknown task, defaulting to summarise");
+            tracing::warn!(
+                raw = other,
+                "auto-detect returned unknown task, defaulting to summarise"
+            );
             eprintln!(
                 "    Auto-detect returned '{}', defaulting to summarise",
                 other

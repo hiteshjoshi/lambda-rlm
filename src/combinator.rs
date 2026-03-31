@@ -4,6 +4,7 @@
 //! Plus: structural chunker, keyword utilities, text processing.
 
 use crate::types::TaskType;
+use std::sync::Arc;
 
 /// Split: Σ* × N → [Σ*]
 /// PRE: k > 0
@@ -146,10 +147,7 @@ pub fn extract_keywords(question: &str) -> Vec<String> {
         .to_lowercase()
         .split_whitespace()
         .filter(|w| w.len() > 2 && !stop.contains(&w.to_lowercase().as_str()))
-        .map(|w| {
-            w.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_string()
-        })
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|w| !w.is_empty())
         .collect()
 }
@@ -184,7 +182,8 @@ pub fn parse_items(text: &str) -> Vec<String> {
         .map(|l| {
             let t = l.trim();
             // Strip bullet markers: -, *, •, ▪, ▸, ►
-            let t = t.strip_prefix("- ")
+            let t = t
+                .strip_prefix("- ")
                 .or_else(|| t.strip_prefix("* "))
                 .or_else(|| t.strip_prefix("• "))
                 .or_else(|| t.strip_prefix("▪ "))
@@ -237,6 +236,21 @@ pub fn merge_dedup(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+pub fn merge_dedup_arc(items: Vec<Arc<str>>) -> Vec<Arc<str>> {
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .into_iter()
+        .filter(|item| {
+            let key: String = item
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            seen.insert(key)
+        })
+        .collect()
+}
+
 // ── Keyword Pre-filter — Algorithm 2, line 9 ────────────────────
 // Between Split and Map. Purely symbolic (zero neural cost).
 
@@ -257,7 +271,11 @@ pub fn filter_by_keyword_predicate(
                 .into_iter()
                 .filter(|chunk| keyword_matches(chunk, keywords))
                 .collect();
-            tracing::debug!(survived = filtered.len(), total = before, "keyword pre-filter");
+            tracing::debug!(
+                survived = filtered.len(),
+                total = before,
+                "keyword pre-filter"
+            );
             eprintln!(
                 "    PRUNE: {}/{} chunks survived keyword filter",
                 filtered.len(),

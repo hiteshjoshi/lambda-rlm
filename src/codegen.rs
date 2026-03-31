@@ -55,6 +55,12 @@ impl<'a> CodegenBudgetGuard<'a> {
 impl Drop for CodegenBudgetGuard<'_> {
     fn drop(&mut self) {
         if !self.committed {
+            if !std::thread::panicking() {
+                tracing::error!(
+                    units = self.units,
+                    "CodegenBudgetGuard dropped without commit() — restoring reserved budget"
+                );
+            }
             self.oracle.budget_unreserve(self.units);
         }
     }
@@ -245,6 +251,24 @@ fn last_non_empty_line(text: &str) -> String {
         .to_string()
 }
 
+impl CodeGenerator {
+    fn extract_result(&self, output: &[u8]) -> Result<String> {
+        let stdout = std::str::from_utf8(output)
+            .with_context(|| format!("{self} subprocess produced invalid UTF-8 on stdout"))?;
+        validate_generator_output(self, &stdout)?;
+
+        // Output-format invariant by generator:
+        // - Claude streams progress/thinking first, then prints the actionable result last.
+        // - OpenCode emits the concise actionable result first, then diagnostics.
+        let summary = match self {
+            CodeGenerator::Claude => last_non_empty_line(&stdout),
+            CodeGenerator::Opencode => first_non_empty_line(&stdout),
+        };
+
+        Ok(summary)
+    }
+}
+
 fn cleanup_old_logs(work_dir: &Path, generator: &CodeGenerator) {
     let mut entries: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
     let prefix = match generator {
@@ -403,14 +427,12 @@ async fn run_claude(
             MAX_RESULT_BYTES
         );
 
-        // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
-        // corrupting data that feeds downstream hashing and content analysis.
-        let stdout = String::from_utf8(output.stdout)
+        let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
+        let stdout = std::str::from_utf8(&output.stdout)
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
-        validate_generator_output(&CodeGenerator::Claude, &stdout)?;
 
         // Save full output to log — warn on failure rather than swallowing
-        if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
+        if let Err(e) = tokio::fs::write(&log_file, stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
 
@@ -419,11 +441,6 @@ async fn run_claude(
             tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
             anyhow::bail!("claude execution failed");
         }
-
-        // DESIGN DECISION: Claude prints the final actionable result at the end
-        // of stdout after intermediate progress output. We extract the last
-        // non-empty line to avoid coupling to unstable CLI formatting.
-        let summary = last_non_empty_line(&stdout);
 
         Ok(summary)
     }
@@ -472,11 +489,11 @@ async fn run_opencode(
             MAX_RESULT_BYTES
         );
 
-        let stdout = String::from_utf8(output.stdout)
+        let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
+        let stdout = std::str::from_utf8(&output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;
-        validate_generator_output(&CodeGenerator::Opencode, &stdout)?;
 
-        if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
+        if let Err(e) = tokio::fs::write(&log_file, stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
 
@@ -485,11 +502,6 @@ async fn run_opencode(
             tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
             anyhow::bail!("opencode execution failed");
         }
-
-        // DESIGN DECISION: OpenCode prints the final concise result first,
-        // then streams additional diagnostics. We extract the first non-empty
-        // line to keep the control loop stable across CLI format changes.
-        let summary = first_non_empty_line(&stdout);
 
         Ok(summary)
     }
@@ -551,6 +563,24 @@ mod tests {
     fn last_non_empty_line_extracts_final_signal() {
         let output = "line one\n\nline two\n\n";
         assert_eq!(last_non_empty_line(output), "line two");
+    }
+
+    #[test]
+    fn extract_result_uses_last_line_for_claude() {
+        let output = b"thinking...\n\nfix done\n";
+        let summary = CodeGenerator::Claude
+            .extract_result(output)
+            .expect("summary");
+        assert_eq!(summary, "fix done");
+    }
+
+    #[test]
+    fn extract_result_uses_first_line_for_opencode() {
+        let output = b"fix done\nmetadata\n";
+        let summary = CodeGenerator::Opencode
+            .extract_result(output)
+            .expect("summary");
+        assert_eq!(summary, "fix done");
     }
 
     #[test]

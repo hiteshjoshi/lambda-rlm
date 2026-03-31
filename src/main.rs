@@ -298,9 +298,13 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                 MAX_AGGREGATE_BYTES
             );
         }
-        let content = std::fs::read_to_string(&canonical_root)
+        let mut out = format!("// === {} ===\n", path.display());
+        let mut file = std::fs::File::open(&canonical_root)
+            .with_context(|| format!("Failed to open {}", canonical_root.display()))?;
+        use std::io::Read;
+        file.read_to_string(&mut out)
             .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
-        return Ok(format!("// === {} ===\n{}", path.display(), content));
+        return Ok(out);
     }
 
     let mut all_code = String::new();
@@ -420,12 +424,20 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                     );
                 }
                 use std::io::Read;
-                let mut content = String::new();
-                if file.read_to_string(&mut content).is_ok() {
-                    all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
-                    all_code.push_str(&content);
-                    all_code.push('\n');
-                    file_count += 1;
+                let checkpoint = all_code.len();
+                all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
+                match file.read_to_string(&mut all_code) {
+                    Ok(_) => {
+                        if !all_code.ends_with('\n') {
+                            all_code.push('\n');
+                        }
+                        file_count += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %file_path.display(), error = %error, "failed to read source file");
+                        all_code.truncate(checkpoint);
+                        skipped += 1;
+                    }
                 }
             }
         }

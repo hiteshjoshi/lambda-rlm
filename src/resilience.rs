@@ -816,6 +816,32 @@ mod tests {
         assert_eq!(budget.remaining(), 1);
     }
 
+    #[test]
+    fn budget_guard_drop_restores_on_panic_unwind() {
+        let budget = CallBudget::new(1);
+        assert!(budget.try_acquire());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = BudgetGuard::new(&budget);
+            panic!("chaos panic");
+        });
+        assert_eq!(budget.remaining(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_guard_drop_restores_on_task_abort() {
+        let budget = Arc::new(CallBudget::new(1));
+        assert!(budget.try_acquire());
+        let budget_for_task = Arc::clone(&budget);
+        let handle = tokio::spawn(async move {
+            let _guard = BudgetGuard::new(budget_for_task.as_ref());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(budget.remaining(), 1);
+    }
+
     #[tokio::test]
     async fn replay_cache_atomic_write() {
         let dir = unique_test_dir("rlm_test");
