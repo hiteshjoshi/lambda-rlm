@@ -198,6 +198,18 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+### v3.3 — Dead Code & Dependency Purge (`COMMIT_ID`)
+
+**Removed:**
+- `unicode-normalization` crate: NFKC normalization removed from hot-path `keyword_matches()` and `merge_dedup()`. Source code is ASCII — simple `to_lowercase()` is sufficient and eliminates per-chunk String allocation from normalization.
+- `unicode-segmentation` crate: grapheme-aware truncation in `phi()` input guard replaced with char-boundary truncation. Grapheme clusters add no value for source code processing.
+- `ErrorKind` enum (dead code, never used outside `#[allow(dead_code)]`).
+- `LlmProvider` trait and `ProviderFuture` type (dead code, unused abstraction).
+- `Bulkhead::cpu` semaphore and `Oracle::bulkhead()` accessor (dead code).
+- `OracleError::kind()` method (dead code).
+
+**Net: -153 lines removed, +6 added. 2 crate dependencies eliminated. 38/38 tests pass.**
+
 ### v3.2 — Subtractive Optimization (`327eacd`)
 
 **Removed:**

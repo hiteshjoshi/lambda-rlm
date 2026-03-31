@@ -155,10 +155,7 @@ pub fn extract_keywords(question: &str) -> Vec<String> {
 }
 
 pub fn keyword_matches(text: &str, keywords: &[String]) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    // NFKC normalization prevents homoglyph attacks from bypassing keyword filters
-    // (e.g., Cyrillic 'а' in "аuth" would not match "auth" without normalization).
-    let lower: String = text.nfkc().collect::<String>().to_lowercase();
+    let lower = text.to_lowercase();
     keywords.iter().any(|kw| lower.contains(kw.as_str()))
 }
 
@@ -226,18 +223,12 @@ pub fn parse_items(text: &str) -> Vec<String> {
 }
 
 pub fn merge_dedup(items: Vec<String>) -> Vec<String> {
-    use unicode_normalization::UnicodeNormalization;
     let mut seen = std::collections::BTreeSet::new();
     items
         .into_iter()
         .filter(|item| {
-            // NFKC normalization before dedup key generation ensures that
-            // homoglyphs (Cyrillic 'а' vs Latin 'a'), fullwidth characters,
-            // and compatibility forms are canonicalized. Without this,
-            // semantically identical items with different Unicode representations
-            // would survive deduplication.
             let key: String = item
-                .nfkc()
+                .chars()
                 .filter(|c| c.is_alphanumeric())
                 .collect::<String>()
                 .to_lowercase();

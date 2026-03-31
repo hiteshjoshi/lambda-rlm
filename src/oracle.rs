@@ -62,21 +62,6 @@ impl OracleError {
         matches!(self, Self::AuthFailed(_))
     }
 
-    /// Map to global ErrorKind for programmatic recovery in main.rs.
-    #[allow(dead_code)]
-    pub fn kind(&self) -> crate::types::ErrorKind {
-        match self {
-            Self::RateLimit { .. } | Self::Timeout(_) | Self::Network(_) => {
-                crate::types::ErrorKind::TransientNetwork
-            }
-            Self::ApiError { status, .. } if *status >= 500 => {
-                crate::types::ErrorKind::TransientNetwork
-            }
-            Self::AuthFailed(_) => crate::types::ErrorKind::PermanentLLMFailure,
-            Self::ApiError { .. } => crate::types::ErrorKind::PermanentLLMFailure,
-            Self::StreamCorrupted(_) => crate::types::ErrorKind::Corruption,
-        }
-    }
 }
 
 // ── Cancellation safety note ──────────────────────────────────────
@@ -168,65 +153,23 @@ const MAX_BULKHEAD_PERMITS: usize = 500;
 
 pub struct Bulkhead {
     llm: Arc<Semaphore>,
-    #[allow(dead_code)] // Reserved for CPU-bound reduce operations
-    cpu: Arc<Semaphore>,
 }
 
 impl Bulkhead {
     pub fn new(llm_permits: usize) -> Self {
-        // Allow runtime override for operators to tune based on container
-        // memory limits. Clamped to [1, MAX_BULKHEAD_PERMITS].
         let effective_llm = std::env::var("LAMBDA_RLM_BULKHEAD_LLM_PERMITS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(llm_permits)
             .clamp(1, MAX_BULKHEAD_PERMITS);
-        let cpu_permits = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
         Self {
             llm: Arc::new(Semaphore::new(effective_llm)),
-            cpu: Arc::new(Semaphore::new(cpu_permits)),
         }
     }
 
     pub fn llm(&self) -> &Semaphore {
         &self.llm
     }
-
-    #[allow(dead_code)] // Reserved for CPU-bound reduce operations
-    pub fn cpu(&self) -> &Semaphore {
-        &self.cpu
-    }
-}
-
-// ── LLM Provider Trait ───────────────────────────────────────────
-// Vendor-agnostic interface for LLM invocation. Enables zero-downtime
-// migration to local models or new APIs (e.g., Ollama, vLLM, Anthropic)
-// without changing Oracle's resilience logic (circuit breaker, budget,
-// cache, retries). Hot-swappable via config reload + restart.
-
-/// Future type for LlmProvider::invoke — avoids async_trait dependency.
-/// Retained as documentation for future provider implementations.
-#[allow(dead_code)]
-type ProviderFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = std::result::Result<String, OracleError>> + Send + 'a>,
->;
-
-#[allow(dead_code)] // Interface for future provider implementations
-pub trait LlmProvider: Send + Sync {
-    /// Raw API call with timeout. No retries, no cache, no budget check.
-    /// Implementations handle transport (HTTP, gRPC, local) and response parsing.
-    fn invoke(
-        &self,
-        system: &str,
-        user_prompt: &str,
-        max_tokens: u32,
-        idempotency_key: &str,
-    ) -> ProviderFuture<'_>;
-
-    /// Model identifier for cache key generation.
-    fn model_id(&self) -> &str;
 }
 
 /// Fireworks AI provider implementation.
@@ -512,11 +455,6 @@ impl Oracle {
     /// Release n previously reserved budget units.
     pub fn budget_unreserve(&self, n: usize) {
         self.budget.release_n(n)
-    }
-
-    #[allow(dead_code)]
-    pub fn bulkhead(&self) -> &Bulkhead {
-        &self.bulkhead
     }
 
     /// Signal shutdown to cancel in-flight and prevent future API calls.

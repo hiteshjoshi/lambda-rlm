@@ -15,7 +15,6 @@
 use crate::combinator::{
     comb_split, comb_split_overlap, filter_by_keyword_predicate, structural_chunk,
 };
-use unicode_segmentation::UnicodeSegmentation;
 use crate::oracle::Oracle;
 use crate::reduce::reduce_for_task;
 use crate::types::TaskType;
@@ -107,39 +106,11 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                 text.len(),
                 max_input
             );
-            // Find a safe truncation point that respects both UTF-8 char
-            // boundaries AND grapheme cluster boundaries (emoji ZWJ sequences,
-            // combining diacritics, skin-tone modifiers). Only scan a small
-            // window near the cut point — grapheme clusters are at most ~32 bytes.
             let mut byte_end = max_input;
             while byte_end > 0 && !text.is_char_boundary(byte_end) {
                 byte_end -= 1;
             }
-            let window_start = {
-                let mut s = byte_end.saturating_sub(64);
-                while s < byte_end && !text.is_char_boundary(s) {
-                    s += 1;
-                }
-                s
-            };
-            let window_end = {
-                let mut e = (byte_end + 4).min(text.len());
-                while e < text.len() && !text.is_char_boundary(e) {
-                    e += 1;
-                }
-                e
-            };
-            let window = &text[window_start..window_end];
-            let mut safe_end = window_start;
-            for (i, g) in window.grapheme_indices(true) {
-                let abs = window_start + i + g.len();
-                if abs <= byte_end {
-                    safe_end = abs;
-                } else {
-                    break;
-                }
-            }
-            text[..safe_end].to_string()
+            text[..byte_end].to_string()
         } else {
             text
         };
@@ -425,11 +396,9 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
 // ── Task Auto-Detection — Phase 2 ───────────────────────────────
 
 /// Sanitize document preview for LLM classification to prevent prompt injection.
-/// Strips control characters (except \n, \t), applies NFKC normalization to
-/// prevent homoglyph attacks (e.g., Cyrillic 'а' vs Latin 'a'), and truncates
-/// to a fixed byte length to prevent suffix attacks and injection via delimiter keywords.
+/// Strips control characters (except \n, \t) and truncates to a fixed byte length
+/// to prevent suffix attacks and injection via delimiter keywords.
 fn sanitize_for_classification(preview: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
     const MAX_PREVIEW_BYTES: usize = 2000;
     let truncated = if preview.len() > MAX_PREVIEW_BYTES {
         let mut end = MAX_PREVIEW_BYTES;
@@ -440,11 +409,8 @@ fn sanitize_for_classification(preview: &str) -> String {
     } else {
         preview
     };
-    // NFKC normalization → strip control characters (0x00-0x1F) except newline and tab.
-    // NFKC canonicalizes compatibility characters (e.g., fullwidth digits, ligatures)
-    // and decomposes+recomposes combining marks, preventing homoglyph steering.
     truncated
-        .nfkc()
+        .chars()
         .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
         .collect()
 }
