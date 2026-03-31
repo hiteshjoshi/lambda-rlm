@@ -37,6 +37,8 @@ pub struct PhiConfig {
     pub overlap: usize,
     pub max_tokens: u32,
     pub keywords: Vec<String>,
+    // Keep this a one-way reference (PhiConfig -> Oracle). Oracle must not
+    // store Arc<PhiConfig> or callbacks that capture PhiConfig to avoid cycles.
     pub oracle: Arc<Oracle>,
     pub verifier: Verifier,
     /// Cooperative shutdown signal. When the sender drops or sends true,
@@ -74,6 +76,7 @@ async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usiz
             timeout_secs = JOINSET_DRAIN_TIMEOUT_SECS,
             "joinset drain timed out after abort_all"
         );
+        set.detach_all();
     }
 }
 

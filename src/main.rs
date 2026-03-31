@@ -689,10 +689,22 @@ fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn sanitize_error(error: &anyhow::Error) -> &'static str {
+    tracing::error!(error = ?error, "request failed");
+    "Not Found"
+}
+
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{}", sanitize_error(&error));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     // Initialize structured logging with non-blocking writer.
     // Non-blocking prevents disk-full or slow disks from stalling the async
     // runtime — logs are dropped (with a counter) rather than blocking tasks.

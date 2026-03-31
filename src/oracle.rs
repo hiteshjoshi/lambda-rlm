@@ -374,6 +374,8 @@ pub struct Oracle {
     /// Single-flight coalescing: prevents thundering herd when N concurrent
     /// requests share the same cache key (e.g., after corruption quarantine).
     /// Only one request proceeds to the LLM; others wait for its result.
+    /// IMPORTANT: Oracle intentionally has no back-reference to PhiConfig.
+    /// Keep ownership one-way (PhiConfig -> Oracle) to prevent Arc cycles.
     inflight: Mutex<HashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>>,
     /// Cooperative shutdown flag. When set, in-flight and future API calls
     /// fail fast instead of proceeding, preventing wasted billing after shutdown.
@@ -867,6 +869,9 @@ fn sse_line_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom::sync::atomic::{AtomicUsize, Ordering as LoomOrdering};
+    use loom::sync::{Arc as LoomArc, Mutex as LoomMutex};
+    use loom::thread as loom_thread;
 
     #[test]
     fn oracle_error_retryable_classification() {
@@ -959,5 +964,43 @@ mod tests {
         assert!(results.windows(2).all(|w| w[0] == w[1]));
         // Value must be in range [0, cap]
         assert!(results[0] <= cap);
+    }
+
+    #[test]
+    fn inflight_single_flight_has_single_leader_under_race() {
+        loom::model(|| {
+            let map = LoomArc::new(LoomMutex::new(std::collections::HashMap::<
+                &'static str,
+                usize,
+            >::new()));
+            let leaders = LoomArc::new(AtomicUsize::new(0));
+
+            let map_a = LoomArc::clone(&map);
+            let leaders_a = LoomArc::clone(&leaders);
+            let t1 = loom_thread::spawn(move || {
+                let mut lock = map_a.lock().unwrap();
+                if !lock.contains_key("key") {
+                    lock.insert("key", 1);
+                    leaders_a.fetch_add(1, LoomOrdering::AcqRel);
+                }
+            });
+
+            let map_b = LoomArc::clone(&map);
+            let leaders_b = LoomArc::clone(&leaders);
+            let t2 = loom_thread::spawn(move || {
+                let mut lock = map_b.lock().unwrap();
+                if !lock.contains_key("key") {
+                    lock.insert("key", 1);
+                    leaders_b.fetch_add(1, LoomOrdering::AcqRel);
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(leaders.load(LoomOrdering::Acquire), 1);
+            let lock = map.lock().unwrap();
+            assert_eq!(lock.len(), 1);
+        });
     }
 }

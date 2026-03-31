@@ -265,7 +265,7 @@ impl CallBudget {
 #[must_use = "dropping a BudgetGuard without calling commit() restores the budget unit — this may mask a leak"]
 pub struct BudgetGuard<'a> {
     budget: &'a CallBudget,
-    committed: bool,
+    committed: AtomicBool,
 }
 
 /// Counter tracking live (uncommitted) BudgetGuards. Promoted to production
@@ -284,20 +284,20 @@ impl<'a> BudgetGuard<'a> {
         BUDGET_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         Self {
             budget,
-            committed: false,
+            committed: AtomicBool::new(false),
         }
     }
 
     /// Mark this budget unit as consumed. Must be called on all non-panic exits.
     pub fn commit(&mut self) {
-        self.committed = true;
+        self.committed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for BudgetGuard<'_> {
     fn drop(&mut self) {
         BUDGET_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
-        if !self.committed {
+        if !self.committed.swap(true, Ordering::AcqRel) {
             // Log uncommitted drops in production (unless panicking, where
             // cancellation-induced drops are expected and correct).
             if !std::thread::panicking() {
@@ -1096,7 +1096,7 @@ mod chaos_tests {
 
 #[cfg(test)]
 mod loom_tests {
-    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use loom::sync::Arc;
     use loom::thread;
 
@@ -1230,6 +1230,57 @@ mod loom_tests {
                     "remaining should be 2 after release without acquire"
                 );
             }
+        });
+    }
+
+    struct LoomHalfOpenGate {
+        probe_claimed: AtomicBool,
+    }
+
+    impl LoomHalfOpenGate {
+        fn new() -> Self {
+            Self {
+                probe_claimed: AtomicBool::new(false),
+            }
+        }
+
+        fn allow_probe(&self) -> bool {
+            self.probe_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+    }
+
+    #[test]
+    fn circuit_half_open_allows_single_probe_under_race() {
+        loom::model(|| {
+            let gate = Arc::new(LoomHalfOpenGate::new());
+            let successes = Arc::new(AtomicUsize::new(0));
+
+            let g1 = Arc::clone(&gate);
+            let s1 = Arc::clone(&successes);
+            let t1 = thread::spawn(move || {
+                if g1.allow_probe() {
+                    s1.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+
+            let g2 = Arc::clone(&gate);
+            let s2 = Arc::clone(&successes);
+            let t2 = thread::spawn(move || {
+                if g2.allow_probe() {
+                    s2.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(
+                successes.load(Ordering::Acquire),
+                1,
+                "half-open gate admitted more than one probe"
+            );
         });
     }
 }

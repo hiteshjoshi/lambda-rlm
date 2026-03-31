@@ -6,7 +6,6 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 use std::{path::Path, process::Stdio, sync::OnceLock, time::SystemTime};
@@ -66,26 +65,17 @@ impl Drop for CodegenBudgetGuard<'_> {
     }
 }
 
-fn codegen_circuits() -> &'static HashMap<CodeGenerator, CircuitBreaker> {
-    static CODEGEN_CIRCUITS: OnceLock<HashMap<CodeGenerator, CircuitBreaker>> = OnceLock::new();
-    CODEGEN_CIRCUITS.get_or_init(|| {
-        let mut circuits = HashMap::new();
-        circuits.insert(
-            CodeGenerator::Claude,
-            CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN),
-        );
-        circuits.insert(
-            CodeGenerator::Opencode,
-            CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN),
-        );
-        circuits
-    })
-}
-
 fn codegen_circuit(generator: &CodeGenerator) -> Result<&'static CircuitBreaker> {
-    codegen_circuits()
-        .get(generator)
-        .context("generator circuit not initialized")
+    static CLAUDE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    static OPENCODE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    let circuit = match generator {
+        CodeGenerator::Claude => {
+            CLAUDE_CIRCUIT.get_or_init(|| CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN))
+        }
+        CodeGenerator::Opencode => OPENCODE_CIRCUIT
+            .get_or_init(|| CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN)),
+    };
+    Ok(circuit)
 }
 
 /// Build the fix-loop prompt shared by all code generators.
@@ -327,14 +317,22 @@ async fn run_generator_process_with_timeout(
         format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
     })?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to capture generator stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("failed to capture generator stderr")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!("failed to capture generator stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!("failed to capture generator stderr");
+        }
+    };
 
     let stdout_task = tokio::spawn(async move {
         let mut reader = stdout;
@@ -350,9 +348,14 @@ async fn run_generator_process_with_timeout(
     });
 
     let status = match timeout(timeout_duration, child.wait()).await {
-        Ok(wait_result) => {
-            wait_result.with_context(|| format!("Failed to run {generator_name}"))?
-        }
+        Ok(wait_result) => match wait_result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(error).with_context(|| format!("Failed to run {generator_name}"));
+            }
+        },
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
