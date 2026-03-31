@@ -8,8 +8,8 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::time::Instant;
-use std::{path::Path, process::Stdio, sync::OnceLock, time::SystemTime};
-use tokio::io::AsyncReadExt;
+use std::{path::Path, process::Stdio, sync::Arc, sync::OnceLock, time::SystemTime};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout, Duration};
 
 use crate::oracle::Oracle;
@@ -109,7 +109,7 @@ pub async fn run_code_generator(
     work_dir: &Path,
     question: &str,
     iteration: usize,
-) -> Result<String> {
+) -> Result<Arc<str>> {
     let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
     let circuit = codegen_circuit(generator)?;
     anyhow::ensure!(
@@ -131,8 +131,17 @@ pub async fn run_code_generator(
             Ok(summary)
         }
         Err(error) => {
-            circuit.record_failure();
-            tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
+            if error_has_context(&error, "codegen_fatal") {
+                circuit.record_failure();
+                circuit.record_failure();
+                tracing::error!(generator = %generator, iteration, error = ?error, "code generation fatal failure");
+            } else if error_has_context(&error, "codegen_retryable") {
+                circuit.record_failure();
+                tracing::warn!(generator = %generator, iteration, error = ?error, "code generation retryable failure");
+            } else {
+                circuit.record_failure();
+                tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
+            }
             Err(
                 anyhow::anyhow!("code generation unavailable").context(match generator {
                     CodeGenerator::Claude => "claude_service_unavailable",
@@ -141,6 +150,10 @@ pub async fn run_code_generator(
             )
         }
     }
+}
+
+fn error_has_context(error: &anyhow::Error, marker: &str) -> bool {
+    error.chain().any(|cause| cause.to_string().contains(marker))
 }
 
 fn validate_analysis_result_content(result: &str) -> Result<()> {
@@ -226,25 +239,27 @@ async fn remove_result_file(work_dir: &Path) {
     }
 }
 
-fn first_non_empty_line(text: &str) -> String {
+fn first_non_empty_line(text: &str) -> &str {
     text.lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("(no output)")
-        .to_string()
 }
 
-fn last_non_empty_line(text: &str) -> String {
+fn last_non_empty_line(text: &str) -> &str {
     text.lines()
         .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("(no output)")
-        .to_string()
 }
 
 impl CodeGenerator {
-    fn extract_result(&self, output: &[u8]) -> Result<String> {
+    fn extract_result(&self, output: &[u8]) -> Result<Arc<str>> {
         let stdout = std::str::from_utf8(output)
             .with_context(|| format!("{self} subprocess produced invalid UTF-8 on stdout"))?;
+        if stdout.trim().is_empty() {
+            tracing::warn!(generator = %self, "generator completed with empty stdout; treating as degraded");
+            return Ok(Arc::from("(degraded: empty generator output)"));
+        }
         validate_generator_output(self, &stdout)?;
 
         // Output-format invariant by generator:
@@ -255,7 +270,7 @@ impl CodeGenerator {
             CodeGenerator::Opencode => first_non_empty_line(&stdout),
         };
 
-        Ok(summary)
+        Ok(Arc::from(summary))
     }
 }
 
@@ -308,62 +323,133 @@ struct GeneratorOutput {
     stderr: Vec<u8>,
 }
 
+struct ChildCleanup {
+    child: Option<tokio::process::Child>,
+}
+
+impl ChildCleanup {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut tokio::process::Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("child process handle missing"))
+    }
+
+    async fn kill_and_reap(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        self.child = None;
+    }
+
+    fn disarm(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+        }
+    }
+}
+
+async fn read_stream_bounded<R>(mut reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if out.len().saturating_add(n) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("generator output exceeds {max_bytes} bytes"),
+            ));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+fn classify_non_success_exit(generator_name: &str, status: std::process::ExitStatus) -> anyhow::Error {
+    match status.code() {
+        Some(127) => anyhow::anyhow!("{generator_name} command not found (exit 127)")
+            .context("codegen_fatal"),
+        Some(1) => anyhow::anyhow!("{generator_name} exited with retryable CLI error (exit 1)")
+            .context("codegen_retryable"),
+        Some(code) => anyhow::anyhow!("{generator_name} exited with code {code}")
+            .context("codegen_retryable"),
+        None => anyhow::anyhow!("{generator_name} terminated by signal").context("codegen_retryable"),
+    }
+}
+
 async fn run_generator_process_with_timeout(
     mut cmd: tokio::process::Command,
     generator_name: &str,
     timeout_duration: Duration,
 ) -> Result<GeneratorOutput> {
-    let mut child = cmd.spawn().with_context(|| {
+    let child = cmd.spawn().with_context(|| {
         format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
     })?;
+    let mut child = ChildCleanup::new(child);
 
-    let stdout = match child.stdout.take() {
+    let stdout = match child.child_mut()?.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            child.kill_and_reap().await;
             anyhow::bail!("failed to capture generator stdout");
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.child_mut()?.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            child.kill_and_reap().await;
             anyhow::bail!("failed to capture generator stderr");
         }
     };
 
     let stdout_task = tokio::spawn(async move {
-        let mut reader = stdout;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
+        read_stream_bounded(stdout, MAX_RESULT_BYTES)
+            .await
+            .map_err(anyhow::Error::from)
     });
     let stderr_task = tokio::spawn(async move {
-        let mut reader = stderr;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
+        read_stream_bounded(stderr, MAX_RESULT_BYTES)
+            .await
+            .map_err(anyhow::Error::from)
     });
 
-    let status = match timeout(timeout_duration, child.wait()).await {
+    let status = match timeout(timeout_duration, child.child_mut()?.wait()).await {
         Ok(wait_result) => match wait_result {
             Ok(status) => status,
             Err(error) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                child.kill_and_reap().await;
                 return Err(error).with_context(|| format!("Failed to run {generator_name}"));
             }
         },
         Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            child.kill_and_reap().await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             anyhow::bail!("{generator_name} timed out after {timeout_duration:?}");
         }
     };
+    child.disarm();
 
     let stdout = stdout_task
         .await
@@ -404,7 +490,7 @@ async fn run_claude(
     work_dir: &Path,
     question: &str,
     iteration: usize,
-) -> Result<String> {
+) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
     let run = async {
@@ -424,13 +510,6 @@ async fn run_claude(
 
         let output = run_generator_process_with_timeout(cmd, "claude", CLAUDE_TIMEOUT).await?;
 
-        anyhow::ensure!(
-            output.stdout.len() <= MAX_RESULT_BYTES,
-            "claude output exceeds {} bytes",
-            MAX_RESULT_BYTES
-        );
-
-        let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
         let stdout = std::str::from_utf8(&output.stdout)
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
 
@@ -442,8 +521,10 @@ async fn run_claude(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
-            anyhow::bail!("claude execution failed");
+            return Err(classify_non_success_exit("claude", output.status));
         }
+
+        let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
 
         Ok(summary)
     }
@@ -464,7 +545,7 @@ async fn run_opencode(
     work_dir: &Path,
     question: &str,
     iteration: usize,
-) -> Result<String> {
+) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
     let run = async {
@@ -486,13 +567,6 @@ async fn run_opencode(
 
         let output = run_generator_process_with_timeout(cmd, "opencode", OPENCODE_TIMEOUT).await?;
 
-        anyhow::ensure!(
-            output.stdout.len() <= MAX_RESULT_BYTES,
-            "opencode output exceeds {} bytes",
-            MAX_RESULT_BYTES
-        );
-
-        let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
         let stdout = std::str::from_utf8(&output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;
 
@@ -503,8 +577,10 @@ async fn run_opencode(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
-            anyhow::bail!("opencode execution failed");
+            return Err(classify_non_success_exit("opencode", output.status));
         }
+
+        let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
 
         Ok(summary)
     }
@@ -574,7 +650,7 @@ mod tests {
         let summary = CodeGenerator::Claude
             .extract_result(output)
             .expect("summary");
-        assert_eq!(summary, "fix done");
+        assert_eq!(summary.as_ref(), "fix done");
     }
 
     #[test]
@@ -583,7 +659,36 @@ mod tests {
         let summary = CodeGenerator::Opencode
             .extract_result(output)
             .expect("summary");
-        assert_eq!(summary, "fix done");
+        assert_eq!(summary.as_ref(), "fix done");
+    }
+
+    #[test]
+    fn extract_result_treats_empty_stdout_as_degraded() {
+        let summary = CodeGenerator::Opencode.extract_result(b"   \n\n").expect("summary");
+        assert_eq!(summary.as_ref(), "(degraded: empty generator output)");
+    }
+
+    #[test]
+    fn classify_exit_codes_for_codegen_resilience() {
+        let retryable = classify_non_success_exit(
+            "opencode",
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .status()
+                .expect("status"),
+        );
+        let fatal = classify_non_success_exit(
+            "opencode",
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 127")
+                .status()
+                .expect("status"),
+        );
+
+        assert!(error_has_context(&retryable, "codegen_retryable"));
+        assert!(error_has_context(&fatal, "codegen_fatal"));
     }
 
     #[test]

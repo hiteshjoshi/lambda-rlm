@@ -38,6 +38,7 @@ use clap::{ArgGroup, Parser};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
@@ -455,7 +456,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
 // ── Analysis runner (reusable per iteration) ────────────────────
 
-async fn run_analysis(cli: &Cli, oracle: &Arc<Oracle>) -> Result<String> {
+async fn run_analysis(cli: &Cli, oracle: &Arc<Oracle>, shutdown_rx: watch::Receiver<bool>) -> Result<String> {
     let start = Instant::now();
 
     // ── Phase 1: REPL Initialization ──
@@ -542,48 +543,6 @@ async fn run_analysis(cli: &Cli, oracle: &Arc<Oracle>) -> Result<String> {
 
     let keywords = extract_keywords(&cli.question);
     let verifier = Verifier::new(task.clone(), keywords.clone());
-
-    // Shutdown channel for cooperative cancellation.
-    // shutdown_tx is held by the signal handler installed in main().
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    // Leak-safe: clone into a background task that listens for SIGINT/SIGTERM.
-    // When signalled, it broadcasts shutdown to all phi() recursions.
-    {
-        let tx = shutdown_tx.clone();
-        let oracle_shutdown = Arc::clone(&oracle);
-        tokio::spawn(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm =
-                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-                // SIGHUP: allows systemd/kubernetes to trigger clean restart
-                // with new env vars (config reload) without SIGKILL. phi()
-                // drains in-flight work via the shutdown channel before exit.
-                let mut sighup =
-                    signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-                tokio::select! {
-                    _ = ctrl_c => {},
-                    _ = sigterm.recv() => {},
-                    _ = sighup.recv() => {
-                        eprintln!("\n>>> SIGHUP received — reloading requires restart. Draining in-flight work...");
-                    },
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = ctrl_c.await;
-            }
-            eprintln!("\n>>> Signal received, initiating graceful shutdown (30s drain)...");
-            // Signal Oracle to stop accepting new API calls (prevents billing waste)
-            oracle_shutdown.trigger_shutdown();
-            let _ = tx.send(true);
-        });
-    }
-    // Drop our copy of shutdown_tx — only the signal task holds it now.
-    // When all receivers see `true`, phi() trees will abort cooperatively.
-    drop(shutdown_tx);
 
     // Bounded concurrency: prevents OOM on wide/deep recursion trees.
     // Default 100 permits limits total in-flight phi() calls across all depths.
@@ -727,6 +686,39 @@ async fn run() -> Result<()> {
     eprintln!("  config fingerprint: {}", cli.config_fingerprint());
     eprintln!("================================================================\n");
 
+    let oracle = build_oracle(&cli)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    {
+        let tx = shutdown_tx.clone();
+        let oracle_shutdown = Arc::clone(&oracle);
+        tokio::spawn(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+                let mut sighup =
+                    signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                    _ = sighup.recv() => {
+                        eprintln!("\n>>> SIGHUP received — draining in-flight work before restart...");
+                    },
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = ctrl_c.await;
+            }
+            eprintln!("\n>>> Signal received, initiating graceful shutdown...");
+            oracle_shutdown.trigger_shutdown();
+            let _ = tx.send(true);
+        });
+    }
+    drop(shutdown_tx);
+
     // Resolve effective code generator from --claude / --opencode flags
     let generator = if cli.claude {
         Some(types::CodeGenerator::Claude)
@@ -738,8 +730,7 @@ async fn run() -> Result<()> {
 
     if generator.is_none() {
         // Single-shot mode: analyze and print
-        let oracle = build_oracle(&cli)?;
-        let result = run_analysis(&cli, &oracle).await?;
+        let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
         println!("{result}");
         return Ok(());
     }
@@ -753,25 +744,36 @@ async fn run() -> Result<()> {
         std::fs::canonicalize(&cli.path)?
     };
 
-    let max_iter = if cli.max_iterations == 0 {
-        usize::MAX
-    } else {
-        cli.max_iterations
+    const FIX_LOOP_HARD_MAX_ITERATIONS: usize = 10;
+    let max_iter = match cli.max_iterations {
+        0 => {
+            eprintln!(
+                ">>> --max-iterations=0 requested; clamping to safe cap {}",
+                FIX_LOOP_HARD_MAX_ITERATIONS
+            );
+            FIX_LOOP_HARD_MAX_ITERATIONS
+        }
+        n => n.min(FIX_LOOP_HARD_MAX_ITERATIONS),
     };
+    if cli.max_iterations > FIX_LOOP_HARD_MAX_ITERATIONS {
+        eprintln!(
+            ">>> --max-iterations={} exceeds safe cap {}; clamping",
+            cli.max_iterations, FIX_LOOP_HARD_MAX_ITERATIONS
+        );
+    }
 
     for iteration in 1..=max_iter {
-        eprintln!("\n================================================================");
-        if cli.max_iterations == 0 {
-            eprintln!("  ITERATION {iteration} (unlimited)");
-        } else {
-            eprintln!("  ITERATION {iteration}/{}", cli.max_iterations);
+        if *shutdown_rx.borrow() {
+            eprintln!("\n>>> Shutdown requested; stopping fix loop.");
+            break;
         }
+
+        eprintln!("\n================================================================");
+        eprintln!("  ITERATION {iteration}/{max_iter}");
         eprintln!("================================================================\n");
 
-        let oracle = build_oracle(&cli)?;
-
         // 1. Analyze
-        let result = run_analysis(&cli, &oracle).await?;
+        let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
 
         // 2. Check if clean (heuristic: very short output or known "no issues" patterns)
         let lower = result.trim().to_lowercase();
@@ -807,11 +809,16 @@ async fn run() -> Result<()> {
             "    (full log: {})",
             codegen::log_file_name(&generator, iteration)
         );
+
+        if !oracle.budget_unlimited() && oracle.budget_remaining() == 0 {
+            eprintln!(">>> Budget exhausted. Terminating fix loop.");
+            break;
+        }
     }
 
     eprintln!(
         "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
-        cli.max_iterations, generator
+        max_iter, generator
     );
     eprintln!(">>> Run again to continue if needed.");
     Ok(())
