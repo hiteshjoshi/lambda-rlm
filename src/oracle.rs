@@ -157,13 +157,8 @@ pub struct Bulkhead {
 
 impl Bulkhead {
     pub fn new(llm_permits: usize) -> Self {
-        let effective_llm = std::env::var("LAMBDA_RLM_BULKHEAD_LLM_PERMITS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(llm_permits)
-            .clamp(1, MAX_BULKHEAD_PERMITS);
         Self {
-            llm: Arc::new(Semaphore::new(effective_llm)),
+            llm: Arc::new(Semaphore::new(llm_permits.clamp(1, MAX_BULKHEAD_PERMITS))),
         }
     }
 

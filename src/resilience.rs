@@ -130,20 +130,11 @@ impl CircuitBreaker {
             .store(monotonic_ms(), Ordering::Release);
         self.half_open_probe.store(false, Ordering::Release);
 
-        // Rejuvenation: periodically cap failure_count to prevent saturation.
+        // Rejuvenation: cap failure_count at 2× threshold to prevent
+        // unbounded growth. Fires every threshold failures for fast convergence.
         let cap = self.threshold.saturating_mul(2);
-        if new_failures > cap && new_failures % 10_000 == 0 {
-            let _ = self.consecutive_failures.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| {
-                    if current > cap {
-                        Some(cap)
-                    } else {
-                        Some(current)
-                    }
-                },
-            );
+        if new_failures > cap && new_failures % self.threshold == 0 {
+            self.consecutive_failures.store(cap, Ordering::Release);
         }
     }
 
@@ -203,7 +194,6 @@ impl CallBudget {
     /// Atomically try to acquire n budget units. All-or-nothing.
     /// Returns false if fewer than n units remain.
     /// Yields after 10 CAS failures to prevent CPU burn under contention.
-    #[allow(dead_code)] // Available for pre-reservation patterns
     pub fn try_acquire_n(&self, n: usize) -> bool {
         if self.unlimited || n == 0 {
             return true;
@@ -248,7 +238,6 @@ impl CallBudget {
 
     /// Restore n budget units (e.g., unused pre-reserved budget).
     /// Uses saturating add to prevent overflow past usize::MAX.
-    #[allow(dead_code)] // Available for pre-reservation patterns
     pub fn release_n(&self, n: usize) {
         if !self.unlimited && n > 0 {
             let _ = self.remaining.fetch_update(

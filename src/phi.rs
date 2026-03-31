@@ -55,19 +55,7 @@ pub struct PhiConfig {
 /// with a warning. Prevents OOM when a single massive file (e.g., 1GB minified
 /// JS) generates millions of chunks that exhaust memory before semaphore
 /// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
-/// Override via LAMBDA_RLM_MAX_INPUT_BYTES env var.
-const DEFAULT_MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
-
-fn max_phi_input_bytes() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("LAMBDA_RLM_MAX_INPUT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v >= 1024) // minimum 1KB
-            .unwrap_or(DEFAULT_MAX_PHI_INPUT_BYTES)
-    })
-}
+const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 
 /// PRE: cfg.task != Auto (resolved in Phase 2)
 /// PRE: text.len() > 0
@@ -93,7 +81,7 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
 
         // ── INPUT SIZE GUARD ──
         // Prevent OOM from pathologically large inputs generating unbounded chunks.
-        let max_input = max_phi_input_bytes();
+        let max_input = MAX_PHI_INPUT_BYTES;
         let text = if text.len() > max_input {
             tracing::warn!(
                 depth,

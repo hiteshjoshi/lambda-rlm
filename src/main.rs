@@ -724,26 +724,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.validate()?;
 
-    // Fail fast on unrecognized LAMBDA_RLM_* env vars to prevent silent config drift.
-    // A typo like LAMBDA_RLM_MA_INPUT_BYTES (missing X) would silently fall back to
-    // defaults, creating undebuggable production drift over 30-year operational life.
-    {
-        const KNOWN_VARS: &[&str] = &[
-            "LAMBDA_RLM_MAX_INPUT_BYTES",
-            "LAMBDA_RLM_BULKHEAD_LLM_PERMITS",
-        ];
-        for (key, _) in std::env::vars() {
-            if key.starts_with("LAMBDA_RLM_") && !KNOWN_VARS.contains(&key.as_str()) {
-                anyhow::bail!(
-                    "Unrecognized environment variable: {key}. \
-                     Known LAMBDA_RLM_* variables: {}. \
-                     Typo? Remove it or update KNOWN_VARS in main.rs.",
-                    KNOWN_VARS.join(", ")
-                );
-            }
-        }
-    }
-
     eprintln!("\n================================================================");
     eprintln!("  lambda-RLM v3: Hardened Functional Runtime for Long-Context Reasoning");
     eprintln!("  (arXiv:2603.20105 -- Roy et al., 2026)");

@@ -198,6 +198,19 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+### v3.4 — Env Var Purge & CB Rejuvenation (`COMMIT_ID`)
+
+**Removed:**
+- `LAMBDA_RLM_MAX_INPUT_BYTES` env var override: `phi()` input limit is now a compile-time constant (`MAX_PHI_INPUT_BYTES`). Eliminates `OnceLock` + env lookup on hot path.
+- `LAMBDA_RLM_BULKHEAD_LLM_PERMITS` env var override: bulkhead permits now come strictly from `--concurrency` CLI flag. No runtime env var bypass.
+- `KNOWN_VARS` env var validation block in `main()`: no longer needed with zero `LAMBDA_RLM_*` env vars.
+- `#[allow(dead_code)]` annotations on `try_acquire_n` and `release_n` — both are actively used by budget pre-flight reservation in `phi.rs` and `oracle.rs`.
+
+**Optimized:**
+- CircuitBreaker rejuvenation: replaced CAS fetch_update loop (fires every 10,000 failures) with a direct `store` (fires every `threshold` failures). Faster convergence, simpler code.
+
+**Net: -48 lines removed. 38/38 tests pass.**
+
 ### v3.3 — Dead Code & Dependency Purge (`efe9873`)
 
 **Removed:**
