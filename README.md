@@ -210,11 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `e664b57`
+Latest fix-loop hardening commit: `79f819b`
 
-- Isolated code generator circuit breakers in `src/codegen.rs` so Claude and OpenCode failures do not trip each other's availability windows.
-- Hardened subprocess orchestration in `src/codegen.rs` with shared safe command setup (`stdin` null, process group, kill-on-drop) and explicit timeout kill paths.
-- Added a design record at `docs/decisions/001-codegen-boundary.md` documenting why file-based IPC + process isolation was chosen and what trade-offs were accepted.
+- Centralized Claude/OpenCode summary extraction in `src/codegen.rs` with explicit per-generator output invariants and dedicated tests, reducing parser drift risk.
+- Added `CodegenBudgetGuard` drop-path telemetry in `src/codegen.rs` so cancelled/failed codegen runs visibly restore reserved budget units.
+- Added bounded JoinSet abort-drain cleanup in `src/phi.rs` to prevent semaphore/budget guard retention during cancellation and fatal child errors.
+- Reduced peak file collection memory in `src/main.rs` by streaming file content directly into the aggregate buffer instead of buffering per-file copies.
+- Added panic/abort chaos tests for `BudgetGuard` in `src/resilience.rs` to prove budget units are restored across unwind and task cancellation paths.
 
 See [CHANGELOG.md](CHANGELOG.md).
 
