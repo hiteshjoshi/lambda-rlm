@@ -6,6 +6,7 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 use std::{path::Path, process::Stdio, sync::OnceLock, time::SystemTime};
@@ -22,8 +23,10 @@ const OPENCODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 const CODEGEN_BUDGET_UNITS: usize = 50;
-const CODEGEN_CB_THRESHOLD: usize = 3;
-const CODEGEN_CB_COOLDOWN: Duration = Duration::from_secs(60);
+const CLAUDE_CB_THRESHOLD: usize = 3;
+const CLAUDE_CB_COOLDOWN: Duration = Duration::from_secs(60);
+const OPENCODE_CB_THRESHOLD: usize = 2;
+const OPENCODE_CB_COOLDOWN: Duration = Duration::from_secs(120);
 
 struct CodegenBudgetGuard<'a> {
     oracle: &'a Oracle,
@@ -57,9 +60,26 @@ impl Drop for CodegenBudgetGuard<'_> {
     }
 }
 
-fn codegen_circuit() -> &'static CircuitBreaker {
-    static CODEGEN_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
-    CODEGEN_CIRCUIT.get_or_init(|| CircuitBreaker::new(CODEGEN_CB_THRESHOLD, CODEGEN_CB_COOLDOWN))
+fn codegen_circuits() -> &'static HashMap<CodeGenerator, CircuitBreaker> {
+    static CODEGEN_CIRCUITS: OnceLock<HashMap<CodeGenerator, CircuitBreaker>> = OnceLock::new();
+    CODEGEN_CIRCUITS.get_or_init(|| {
+        let mut circuits = HashMap::new();
+        circuits.insert(
+            CodeGenerator::Claude,
+            CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN),
+        );
+        circuits.insert(
+            CodeGenerator::Opencode,
+            CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN),
+        );
+        circuits
+    })
+}
+
+fn codegen_circuit(generator: &CodeGenerator) -> Result<&'static CircuitBreaker> {
+    codegen_circuits()
+        .get(generator)
+        .context("generator circuit not initialized")
 }
 
 /// Build the fix-loop prompt shared by all code generators.
@@ -95,10 +115,10 @@ pub async fn run_code_generator(
     iteration: usize,
 ) -> Result<String> {
     let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
-    let circuit = codegen_circuit();
+    let circuit = codegen_circuit(generator)?;
     anyhow::ensure!(
         circuit.allow_request(),
-        "code generation circuit open (3 consecutive failures; cooling off 60s)"
+        "code generation temporarily unavailable"
     );
 
     let started = Instant::now();
@@ -117,7 +137,12 @@ pub async fn run_code_generator(
         Err(error) => {
             circuit.record_failure();
             tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
-            Err(anyhow::anyhow!("Code generation unavailable"))
+            Err(
+                anyhow::anyhow!("code generation unavailable").context(match generator {
+                    CodeGenerator::Claude => "claude_service_unavailable",
+                    CodeGenerator::Opencode => "opencode_service_unavailable",
+                }),
+            )
         }
     }
 }
@@ -175,10 +200,19 @@ async fn write_result_file_atomically(
                 work_dir.display()
             )
         })?;
-        tmp.write_all(result_owned.as_bytes())
-            .with_context(|| format!("Failed to write temporary result file in {}", work_dir.display()))?;
-        tmp.persist(&result_file_clone)
-            .map_err(|e| anyhow::anyhow!("Failed to move {}: {}", result_file_clone.display(), e.error))?;
+        tmp.write_all(result_owned.as_bytes()).with_context(|| {
+            format!(
+                "Failed to write temporary result file in {}",
+                work_dir.display()
+            )
+        })?;
+        tmp.persist(&result_file_clone).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to move {}: {}",
+                result_file_clone.display(),
+                e.error
+            )
+        })?;
         Ok(())
     })
     .await
@@ -265,9 +299,9 @@ async fn run_generator_process_with_timeout(
     generator_name: &str,
     timeout_duration: Duration,
 ) -> Result<GeneratorOutput> {
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn `{generator_name}` — is it installed and on PATH?"))?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
+    })?;
 
     let stdout = child
         .stdout
@@ -292,13 +326,15 @@ async fn run_generator_process_with_timeout(
     });
 
     let status = match timeout(timeout_duration, child.wait()).await {
-        Ok(wait_result) => wait_result.with_context(|| format!("Failed to run {generator_name}"))?,
+        Ok(wait_result) => {
+            wait_result.with_context(|| format!("Failed to run {generator_name}"))?
+        }
         Err(_) => {
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = child.wait().await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
-            anyhow::bail!("{generator_name} timed out");
+            anyhow::bail!("{generator_name} timed out after {timeout_duration:?}");
         }
     };
 
@@ -316,6 +352,19 @@ async fn run_generator_process_with_timeout(
         stdout,
         stderr,
     })
+}
+
+fn configure_generator_command(cmd: &mut tokio::process::Command, work_dir: &Path) {
+    cmd.current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
 }
 
 /// Spawn claude in print mode and wait for it to finish.
@@ -343,17 +392,8 @@ async fn run_claude(
         let mut cmd = tokio::process::Command::new("claude");
         cmd.arg("--dangerously-skip-permissions")
             .arg("-p")
-            .arg(&prompt)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
+            .arg(&prompt);
+        configure_generator_command(&mut cmd, work_dir);
 
         let output = run_generator_process_with_timeout(cmd, "claude", CLAUDE_TIMEOUT).await?;
 
@@ -421,17 +461,8 @@ async fn run_opencode(
             .arg("--file")
             .arg(".lambda-rlm-result.md")
             .arg("--")
-            .arg(&prompt)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
+            .arg(&prompt);
+        configure_generator_command(&mut cmd, work_dir);
 
         let output = run_generator_process_with_timeout(cmd, "opencode", OPENCODE_TIMEOUT).await?;
 
@@ -520,5 +551,24 @@ mod tests {
     fn last_non_empty_line_extracts_final_signal() {
         let output = "line one\n\nline two\n\n";
         assert_eq!(last_non_empty_line(output), "line two");
+    }
+
+    #[test]
+    fn codegen_circuits_are_isolated_by_generator() {
+        let claude = codegen_circuit(&CodeGenerator::Claude).expect("claude circuit");
+        let opencode = codegen_circuit(&CodeGenerator::Opencode).expect("opencode circuit");
+
+        claude.record_success();
+        opencode.record_success();
+
+        for _ in 0..OPENCODE_CB_THRESHOLD {
+            opencode.record_failure();
+        }
+
+        assert!(!opencode.allow_request());
+        assert!(claude.allow_request());
+
+        claude.record_success();
+        opencode.record_success();
     }
 }

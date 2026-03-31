@@ -255,7 +255,12 @@ impl Cli {
         hasher.update(&(self.max_calls as u64).to_le_bytes());
         hasher.update(&(self.max_retries as u64).to_le_bytes());
         hasher.update(&(self.max_cache_entries as u64).to_le_bytes());
-        hasher.update(&[self.no_cache as u8, self.dry_run as u8, self.opencode as u8]);
+        hasher.update(&[
+            self.no_cache as u8,
+            self.dry_run as u8,
+            self.claude as u8,
+            self.opencode as u8,
+        ]);
         let hash = hasher.finalize();
         format!("v{}:{}", CONFIG_SCHEMA_VERSION, &hash.to_hex()[..16])
     }

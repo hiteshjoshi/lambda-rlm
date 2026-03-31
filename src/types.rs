@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, ValueEnum, Debug, PartialEq)]
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq, Eq, Hash)]
 pub enum CodeGenerator {
     Claude,
     Opencode,
