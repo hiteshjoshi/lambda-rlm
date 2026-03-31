@@ -198,7 +198,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic
 
 ## Changelog
 
-### v3.1 — Resilience & Performance Hardening
+### v3.1 — Resilience & Performance Hardening (`4527ee1`)
 
 **Removed:**
 - Quorum consensus (`--quorum`, 3x LLM calls, trigram/token similarity voting) — correctness is cryptographic, not statistical. Saves 3x token cost and removes non-deterministic latency.
