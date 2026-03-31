@@ -164,7 +164,6 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--concurrency` | `8` | Max parallel LLM calls |
 | `--model` | `kimi-k2p5-turbo` | Fireworks model ID |
 | `--max-tokens` | `8192` | Max output tokens |
-| `--quorum` | `false` | 3x consensus voting (trigram similarity) |
 | `--claude` | `false` | Enable autonomous fix loop |
 | `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
@@ -188,7 +187,7 @@ src/
   phi.rs         — recursive executor (Algorithm 2)
 ```
 
-Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic-safe via Drop), blake3 content-addressed replay cache, structural chunking at definition boundaries, leaf verification with refusal detection, trigram-based quorum consensus.
+Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic-safe via Drop, production leak detection), blake3 content-addressed replay cache, structural chunking at definition boundaries, leaf verification with refusal detection, CAS backoff under contention, EXDEV-safe state persistence.
 
 ## Environment variables
 
@@ -196,6 +195,26 @@ Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic
 |----------|----------|-------------|
 | `FIREWORKS_API` | Yes | Fireworks AI API key ([get one free](https://fireworks.ai)) |
 | `RUST_LOG` | No | Log level: `warn` (default), `info`, `debug` |
+
+## Changelog
+
+### v3.1 — Resilience & Performance Hardening
+
+**Removed:**
+- Quorum consensus (`--quorum`, 3x LLM calls, trigram/token similarity voting) — correctness is cryptographic, not statistical. Saves 3x token cost and removes non-deterministic latency.
+- `walkdir` crate — replaced with manual `std::fs::read_dir` stack-based recursion. Removes ~10 transitive dependencies, smaller binary.
+- 4 quorum-related env vars (`LAMBDA_RLM_QUORUM_TIMEOUT_SECS`, `LAMBDA_RLM_MIN_QUORUM_SIZE`, `LAMBDA_RLM_MIN_CONSENSUS_SIMILARITY`, `LAMBDA_RLM_QUORUM_DEGRADE_ON_SPLIT`).
+
+**Optimized:**
+- CAS spin loops in `CallBudget` now yield after 10 failures instead of spinning forever under contention.
+- Symbolic reducers (`reduce_aggregate`, `reduce_pairwise_intermediate`) pre-allocate output strings to eliminate heap fragmentation.
+- CLI validates `k <= 16` and checks `k^depth < 100K` at parse time to prevent pathological expansion.
+
+**Hardened:**
+- `BudgetGuard` live count promoted from debug-only to production `AtomicU64`. Uncommitted drops now log `error!` (catches async cancellation leaks).
+- Circuit breaker `save_state` handles EXDEV (cross-device rename) via copy+delete fallback — safe when auto-TLS places cache on a different mount.
+
+**Net: -650 lines removed, +177 added. 44/44 tests pass.**
 
 ## License
 

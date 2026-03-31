@@ -39,7 +39,6 @@ pub struct PhiConfig {
     pub max_tokens: u32,
     pub keywords: Vec<String>,
     pub oracle: Arc<Oracle>,
-    pub use_quorum: bool,
     pub verifier: Verifier,
     /// Cooperative shutdown signal. When the sender drops or sends true,
     /// in-flight phi recursions abort gracefully, preserving budget.
@@ -389,7 +388,6 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
             cfg.max_depth,
             Arc::clone(&cfg.oracle),
             cfg.max_tokens,
-            cfg.use_quorum,
         )
         .await;
 

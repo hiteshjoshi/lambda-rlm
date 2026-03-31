@@ -8,7 +8,7 @@
 //! handled upstream by the Verifier at leaf level.
 
 use crate::combinator::{comb_cross, merge_dedup, parse_items};
-use crate::oracle::{quorum_call, Oracle};
+use crate::oracle::Oracle;
 use crate::types::TaskType;
 use anyhow::Result;
 use std::sync::Arc;
@@ -38,7 +38,6 @@ pub async fn reduce_for_task(
     max_depth: usize,
     oracle: Arc<Oracle>,
     max_tokens: u32,
-    use_quorum: bool,
 ) -> Result<String> {
     debug_assert!(!child_results.is_empty(), "PRE: child_results must be non-empty");
     debug_assert!(depth <= max_depth, "PRE: depth must not exceed max_depth");
@@ -49,7 +48,7 @@ pub async fn reduce_for_task(
         TaskType::Aggregate => Ok(reduce_aggregate(child_results)),
         TaskType::Pairwise => {
             if depth == 0 {
-                reduce_pairwise_top(child_results, question, oracle, max_tokens, use_quorum).await
+                reduce_pairwise_top(child_results, question, oracle, max_tokens).await
             } else {
                 Ok(reduce_pairwise_intermediate(child_results))
             }
@@ -65,7 +64,6 @@ pub async fn reduce_for_task(
                 max_depth,
                 oracle,
                 max_tokens,
-                use_quorum,
             )
             .await
         }
@@ -117,11 +115,16 @@ fn reduce_aggregate(child_results: Vec<String>) -> String {
         if deduped.is_empty() {
             "No items found.".into()
         } else {
-            deduped
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            // Pre-allocate: "- " (2) + item + "\n" (1) per item
+            let mut out = String::with_capacity(deduped.iter().map(|s| s.len() + 3).sum());
+            for (i, item) in deduped.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str("- ");
+                out.push_str(item);
+            }
+            out
         }
     }
 }
@@ -130,11 +133,16 @@ fn reduce_pairwise_intermediate(child_results: Vec<String>) -> String {
     let useful = filter_nonempty(child_results);
     let all_items: Vec<String> = useful.iter().flat_map(|r| parse_items(r)).collect();
     let deduped = merge_dedup(all_items);
-    deduped
-        .iter()
-        .map(|item| format!("- {item}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Pre-allocate: "- " (2) + item + "\n" (1) per item
+    let mut out = String::with_capacity(deduped.iter().map(|s| s.len() + 3).sum());
+    for (i, item) in deduped.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str("- ");
+        out.push_str(item);
+    }
+    out
 }
 
 // ── Neural/hybrid reducers (call M) ─────────────────────────────
@@ -144,7 +152,6 @@ async fn reduce_pairwise_top(
     question: &str,
     oracle: Arc<Oracle>,
     max_tokens: u32,
-    use_quorum: bool,
 ) -> Result<String> {
     let useful = filter_nonempty(child_results);
     if useful.is_empty() {
@@ -182,12 +189,7 @@ async fn reduce_pairwise_top(
         pairs.len().min(50)
     );
 
-    if use_quorum {
-        eprintln!("    Using quorum consensus (3x calls)");
-        quorum_call(oracle, system, &user, max_tokens).await
-    } else {
-        oracle.call(system, &user, max_tokens).await
-    }
+    oracle.call(system, &user, max_tokens).await
 }
 
 async fn reduce_summarise(
@@ -232,7 +234,6 @@ async fn reduce_multi_hop(
     max_depth: usize,
     oracle: Arc<Oracle>,
     max_tokens: u32,
-    use_quorum: bool,
 ) -> Result<String> {
     let useful = filter_nonempty(child_results);
     if useful.is_empty() {
@@ -253,12 +254,7 @@ async fn reduce_multi_hop(
                       which function calls which, how data flows, what depends on what.";
         let user =
             format!("=== Gathered evidence ===\n\n{combined}\n\n=== Question ===\n{question}");
-        if use_quorum {
-            eprintln!("    Using quorum consensus (3x calls)");
-            quorum_call(oracle, system, &user, max_tokens).await
-        } else {
-            oracle.call(system, &user, max_tokens).await
-        }
+        oracle.call(system, &user, max_tokens).await
     } else {
         let system = format!(
             "Synthesize these {} evidence fragments (depth {}/{}) into a coherent \

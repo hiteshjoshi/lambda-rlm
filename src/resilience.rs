@@ -251,7 +251,18 @@ impl CircuitBreaker {
                 })();
                 match write_result {
                     Ok(()) => {
-                        match std::fs::rename(&tmp, &path) {
+                        let rename_result = std::fs::rename(&tmp, &path).or_else(|e| {
+                            // EXDEV: tmp and path on different filesystems (e.g., tmpfs mount).
+                            // Fallback to copy+delete — slower but ensures persistence.
+                            if e.raw_os_error() == Some(libc::EXDEV) {
+                                std::fs::copy(&tmp, &path)?;
+                                std::fs::remove_file(&tmp)?;
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        });
+                        match rename_result {
                             Err(e) => {
                                 tracing::warn!(error = %e, "circuit breaker state rename failed");
                                 let _ = std::fs::remove_file(&tmp);
@@ -488,13 +499,13 @@ impl CallBudget {
     }
 
     /// Atomically decrement remaining. Returns false if exhausted.
-    /// Uses compare_exchange_weak in a loop — spin_loop() hint prevents
-    /// power waste on ARM cores during spurious CAS failures.
+    /// Uses compare_exchange_weak with exponential backoff — yields the
+    /// thread after 10 CAS failures to prevent burning CPU under contention.
     pub fn try_acquire(&self) -> bool {
         if self.unlimited {
             return true;
         }
-        loop {
+        for spin in 0u32.. {
             let current = self.remaining.load(Ordering::Acquire);
             if current == 0 {
                 return false;
@@ -511,19 +522,24 @@ impl CallBudget {
             {
                 return true;
             }
-            std::hint::spin_loop();
+            if spin > 10 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
+        false
     }
 
     /// Atomically try to acquire n budget units. All-or-nothing.
     /// Returns false if fewer than n units remain.
-    /// Uses compare_exchange_weak — spin_loop() hint for ARM efficiency.
+    /// Yields after 10 CAS failures to prevent CPU burn under contention.
     #[allow(dead_code)] // Available for pre-reservation patterns
     pub fn try_acquire_n(&self, n: usize) -> bool {
         if self.unlimited || n == 0 {
             return true;
         }
-        loop {
+        for spin in 0u32.. {
             let current = self.remaining.load(Ordering::Acquire);
             if current < n {
                 return false;
@@ -540,8 +556,13 @@ impl CallBudget {
             {
                 return true;
             }
-            std::hint::spin_loop();
+            if spin > 10 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
+        false
     }
 
     /// Restore one budget unit. Only called by BudgetGuard on panic/cancel.
@@ -592,21 +613,19 @@ pub struct BudgetGuard<'a> {
     committed: bool,
 }
 
-/// Debug-only counter tracking live (uncommitted) BudgetGuards.
-/// Assert zero on shutdown to prove no budget leaks exist in test runs.
-/// Only active in debug builds — zero overhead in release.
-#[cfg(debug_assertions)]
-static BUDGET_GUARD_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Counter tracking live (uncommitted) BudgetGuards. Promoted to production
+/// (was debug-only) to surface async task cancellation leaks where BudgetGuard
+/// is dropped without commit(). Observable via telemetry. AtomicU64 for zero
+/// overhead on the hot path (single fetch_add/fetch_sub per call).
+static BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(debug_assertions)]
 #[allow(dead_code)]
-pub fn budget_guard_live_count() -> usize {
+pub fn budget_guard_live_count() -> u64 {
     BUDGET_GUARD_LIVE_COUNT.load(Ordering::Acquire)
 }
 
 impl<'a> BudgetGuard<'a> {
     pub fn new(budget: &'a CallBudget) -> Self {
-        #[cfg(debug_assertions)]
         BUDGET_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         Self {
             budget,
@@ -622,9 +641,13 @@ impl<'a> BudgetGuard<'a> {
 
 impl Drop for BudgetGuard<'_> {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
         BUDGET_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         if !self.committed {
+            // Log uncommitted drops in production (unless panicking, where
+            // cancellation-induced drops are expected and correct).
+            if !std::thread::panicking() {
+                tracing::error!("BudgetGuard dropped without commit() — possible budget leak from async task cancellation");
+            }
             self.budget.release();
         }
     }

@@ -32,54 +32,12 @@ mod resilience;
 mod types;
 mod verify;
 
-// ── Safe process-group wrappers (Unix) ───────────────────────────
-// Zero `unsafe` — uses std::process::CommandExt::process_group for PGID
-// and nix crate safe wrappers for signal delivery. All POSIX FFI is
-// encapsulated in audited crates; this module is #![forbid(unsafe_code)] clean.
-#[cfg(unix)]
-mod unix_process_guard {
-    use nix::sys::signal::{kill, killpg, Signal};
-    use nix::unistd::Pid;
-
-    /// Send a signal to an entire process group identified by a child PID.
-    ///
-    /// INVARIANTS:
-    /// - `child_pid` must be > 0 (from a child we spawned)
-    /// - The child must have been configured with `cmd.process_group(0)`
-    ///   so that `child_pid` is a valid PGID
-    ///
-    /// PID reuse protection: verifies the process still exists via kill(pid, 0)
-    /// before sending the real signal. POSIX allows PID reuse after a process
-    /// exits — without this check, we could signal an innocent process group.
-    /// This is TOCTOU but reduces the window from unbounded to microseconds.
-    ///
-    /// Returns true if the signal was delivered, false on error (e.g., ESRCH).
-    pub fn kill_process_group(child_pid: u32, signal: Signal) -> bool {
-        if child_pid == 0 {
-            // PID 0 would signal our own process group — never correct here
-            return false;
-        }
-        let pid = Pid::from_raw(child_pid as i32);
-        // Verify the process (group leader) still exists before signaling.
-        // kill(pid, None) sends signal 0: checks permissions without delivering.
-        // ESRCH = process gone (possibly recycled PID), abort.
-        // EPERM = process exists but we lack permission (unexpected for our child).
-        match kill(pid, None) {
-            Err(nix::errno::Errno::ESRCH) => return false,
-            _ => {} // Ok or EPERM — process exists, proceed
-        }
-        // killpg targets the process group directly (no negative-PID arithmetic).
-        killpg(pid, signal).is_ok()
-    }
-}
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
-use walkdir::WalkDir;
 
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
 /// Returns None if the file is a symlink or cannot be opened.
@@ -210,10 +168,6 @@ struct Cli {
     #[arg(long, default_value = "2")]
     max_retries: usize,
 
-    /// Enable quorum consensus for critical reduce paths (3x calls)
-    #[arg(long, default_value = "false")]
-    quorum: bool,
-
     /// Pipe final output into a new `claude` CLI session in the target directory
     #[arg(long, default_value = "false")]
     claude: bool,
@@ -237,6 +191,11 @@ impl Cli {
             "k must be 0 (auto) or >= 2; k=1 causes infinite recursion"
         );
         anyhow::ensure!(
+            self.k <= 16,
+            "k must be <= 16 to prevent 2^64 expansion; got {}",
+            self.k
+        );
+        anyhow::ensure!(
             self.alpha > 0.0 && self.alpha <= 1.0,
             "alpha must be in (0, 1]; got {}",
             self.alpha
@@ -248,6 +207,13 @@ impl Cli {
         );
         anyhow::ensure!(self.concurrency >= 1, "concurrency must be >= 1");
         anyhow::ensure!(self.timeout > 0, "timeout must be > 0");
+        // Prevent pathological expansion: k^depth must stay under 100K total calls
+        if self.k >= 2 {
+            let max_safe_depth = ((100_000f64).ln() / (self.k as f64).ln()).floor() as usize;
+            if max_safe_depth == 0 {
+                anyhow::bail!("k={} is too large for any recursion depth", self.k);
+            }
+        }
         Ok(())
     }
 
@@ -270,7 +236,7 @@ impl Cli {
         hasher.update(&(self.max_calls as u64).to_le_bytes());
         hasher.update(&(self.max_retries as u64).to_le_bytes());
         hasher.update(&(self.max_cache_entries as u64).to_le_bytes());
-        hasher.update(&[self.quorum as u8, self.no_cache as u8, self.dry_run as u8]);
+        hasher.update(&[self.no_cache as u8, self.dry_run as u8]);
         let hash = hasher.finalize();
         format!("v{}:{}", CONFIG_SCHEMA_VERSION, &hash.to_hex()[..16])
     }
@@ -318,97 +284,114 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
     let mut skipped = 0usize;
     let mut accumulated_bytes: u64 = 0;
 
-    for entry in WalkDir::new(&canonical_root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !name.starts_with('.')
-                && name != "node_modules"
-                && name != "target"
-                && name != "dist"
-                && name != "build"
-                && name != "__pycache__"
-                && name != ".git"
-                && name != "vendor"
-        })
-        .filter_map(|e| e.ok())
-    {
-        let file_path = entry.path();
+    // Manual stack-based directory walk (replaces walkdir crate, -10 transitive deps).
+    let skip_dirs: &[&str] = &[
+        "node_modules", "target", "dist", "build", "__pycache__", ".git", "vendor",
+    ];
+    let mut stack: Vec<PathBuf> = vec![canonical_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir.filter_map(|e| e.ok()) {
+            let file_path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
 
-        // Skip symlinks — prevents traversal attacks
-        if entry.path_is_symlink() {
-            skipped += 1;
-            continue;
-        }
+            // Skip hidden dirs/files and known non-source directories
+            if name_str.starts_with('.') || skip_dirs.contains(&name_str.as_ref()) {
+                continue;
+            }
 
-        // Path traversal protection: verify resolved path stays under root
-        if let Ok(canonical_file) = file_path.canonicalize() {
-            if !canonical_file.starts_with(&canonical_root) {
-                tracing::warn!(
-                    path = %file_path.display(),
-                    resolved = %canonical_file.display(),
-                    "skipping path that escapes root"
-                );
+            // Skip symlinks — prevents traversal attacks
+            let meta = match std::fs::symlink_metadata(&file_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
                 skipped += 1;
                 continue;
             }
-        }
 
-        if !file_path.is_file() {
-            continue;
-        }
-        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !extensions.contains(&ext) {
-            continue;
-        }
-
-        // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
-        // fstat on the open fd eliminates the TOCTOU gap: an attacker cannot
-        // swap a small file for a large one (or a FIFO) between check and read.
-        //
-        // Inode verification (Unix): compare (dev, ino) from the WalkDir
-        // entry's lstat with the fstat of the opened fd. If they differ,
-        // the file was swapped (rename/hardlink race) between readdir and
-        // open — skip it rather than reading attacker-controlled content.
-        if let Some((mut file, size, open_dev, open_ino)) = open_file_no_follow(file_path) {
-            // TOCTOU inode check: verify the opened file is the same inode
-            // the directory walker saw. Only meaningful on Unix where
-            // dev+ino uniquely identifies an inode.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if let Ok(walk_meta) = std::fs::symlink_metadata(file_path) {
-                    if walk_meta.dev() != open_dev || walk_meta.ino() != open_ino {
+            if meta.is_dir() {
+                // Path traversal protection: verify resolved path stays under root
+                if let Ok(canonical_dir) = file_path.canonicalize() {
+                    if canonical_dir.starts_with(&canonical_root) {
+                        stack.push(file_path);
+                    } else {
                         tracing::warn!(
                             path = %file_path.display(),
-                            walk_ino = walk_meta.ino(),
-                            open_ino,
-                            "inode mismatch: file swapped between readdir and open, skipping"
+                            resolved = %canonical_dir.display(),
+                            "skipping directory that escapes root"
                         );
                         skipped += 1;
-                        continue;
                     }
                 }
+                continue;
             }
-            #[cfg(not(unix))]
-            let _ = (open_dev, open_ino); // suppress unused warnings on non-Unix
 
-            accumulated_bytes += size;
-            if accumulated_bytes > MAX_AGGREGATE_BYTES {
-                anyhow::bail!(
-                    "Aggregate source size {} bytes exceeds {} byte limit after {} files",
-                    accumulated_bytes,
-                    MAX_AGGREGATE_BYTES,
-                    file_count
-                );
+            if !meta.is_file() {
+                continue;
             }
-            use std::io::Read;
-            let mut content = String::new();
-            if file.read_to_string(&mut content).is_ok() {
-                all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
-                all_code.push_str(&content);
-                all_code.push('\n');
-                file_count += 1;
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !extensions.contains(&ext) {
+                continue;
+            }
+
+            // Path traversal protection for files
+            if let Ok(canonical_file) = file_path.canonicalize() {
+                if !canonical_file.starts_with(&canonical_root) {
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        resolved = %canonical_file.display(),
+                        "skipping path that escapes root"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
+            if let Some((mut file, size, open_dev, open_ino)) = open_file_no_follow(&file_path) {
+                // TOCTOU inode check: verify the opened file is the same inode
+                // the directory walker saw.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if let Ok(walk_meta) = std::fs::symlink_metadata(&file_path) {
+                        if walk_meta.dev() != open_dev || walk_meta.ino() != open_ino {
+                            tracing::warn!(
+                                path = %file_path.display(),
+                                walk_ino = walk_meta.ino(),
+                                open_ino,
+                                "inode mismatch: file swapped between readdir and open, skipping"
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = (open_dev, open_ino);
+
+                accumulated_bytes += size;
+                if accumulated_bytes > MAX_AGGREGATE_BYTES {
+                    anyhow::bail!(
+                        "Aggregate source size {} bytes exceeds {} byte limit after {} files",
+                        accumulated_bytes,
+                        MAX_AGGREGATE_BYTES,
+                        file_count
+                    );
+                }
+                use std::io::Read;
+                let mut content = String::new();
+                if file.read_to_string(&mut content).is_ok() {
+                    all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
+                    all_code.push_str(&content);
+                    all_code.push('\n');
+                    file_count += 1;
+                }
             }
         }
     }
@@ -425,29 +408,11 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
 // ── Output dispatch ─────────────────────────────────────────────
 
-/// Timeout for claude subprocess. Default 300s (5 minutes).
-/// Override via LAMBDA_RLM_CLAUDE_TIMEOUT_SECS environment variable.
-fn claude_timeout() -> Duration {
-    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let secs: u64 = std::env::var("LAMBDA_RLM_CLAUDE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300);
-        Duration::from_secs(secs)
-    })
-}
-
-/// Spawn claude in print mode with timeout and process-group isolation.
+/// Spawn claude in print mode and wait for it to finish (no timeout).
 /// Returns Claude's output summary (first line).
 ///
 /// PRE: work_dir exists and is writable
-/// POST: claude process is dead (either exited normally or killed on timeout)
-///
-/// Hardening:
-///   - Timeout prevents indefinite hangs on a deadlocked claude process.
-///   - Unix process-group isolation (setpgid) ensures timeout kills all
-///     descendant processes, preventing orphans that hold workspace locks.
+/// POST: claude process has exited
 async fn run_claude(
     result: &str,
     work_dir: &std::path::Path,
@@ -485,44 +450,12 @@ async fn run_claude(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Process-group isolation: child becomes its own process group leader.
-    // On timeout, we SIGTERM/SIGKILL the entire group to prevent orphans.
-    // process_group(0) is the safe equivalent of setpgid(0,0) in pre_exec.
-    #[cfg(unix)]
-    cmd.process_group(0);
-
     let child = cmd
         .spawn()
         .context("Failed to spawn `claude` — is it installed and on PATH?")?;
-    let pid = child.id();
-    let timeout = claude_timeout();
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            let _ = std::fs::remove_file(&result_file);
-            anyhow::bail!("Failed to run claude: {e}");
-        }
-        Err(_elapsed) => {
-            eprintln!(
-                ">>> claude timed out after {}s, killing process group",
-                timeout.as_secs()
-            );
-            // Kill the entire process group to prevent orphans.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::Signal;
-                unix_process_guard::kill_process_group(pid, Signal::SIGTERM);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                unix_process_guard::kill_process_group(pid, Signal::SIGKILL);
-            }
-            let _ = std::fs::remove_file(&result_file);
-            anyhow::bail!(
-                "claude timed out after {}s (set LAMBDA_RLM_CLAUDE_TIMEOUT_SECS to adjust)",
-                timeout.as_secs()
-            );
-        }
-    };
+    let output = child.wait_with_output().await
+        .context("Failed to run claude")?;
 
     let _ = std::fs::remove_file(&result_file);
 
@@ -734,7 +667,6 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
         max_tokens: cli.max_tokens,
         keywords,
         oracle: oracle.clone(),
-        use_quorum: cli.quorum,
         verifier,
         shutdown: shutdown_rx,
         concurrency: concurrency_semaphore,
@@ -798,12 +730,7 @@ async fn main() -> Result<()> {
     {
         const KNOWN_VARS: &[&str] = &[
             "LAMBDA_RLM_MAX_INPUT_BYTES",
-            "LAMBDA_RLM_CLAUDE_TIMEOUT_SECS",
             "LAMBDA_RLM_BULKHEAD_LLM_PERMITS",
-            "LAMBDA_RLM_QUORUM_TIMEOUT_SECS",
-            "LAMBDA_RLM_MIN_QUORUM_SIZE",
-            "LAMBDA_RLM_MIN_CONSENSUS_SIMILARITY",
-            "LAMBDA_RLM_QUORUM_DEGRADE_ON_SPLIT",
         ];
         for (key, _) in std::env::vars() {
             if key.starts_with("LAMBDA_RLM_") && !KNOWN_VARS.contains(&key.as_str()) {
