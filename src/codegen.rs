@@ -6,9 +6,12 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
-use std::{path::Path, process::Stdio, time::SystemTime};
+use std::time::Instant;
+use std::{path::Path, process::Stdio, sync::OnceLock, time::SystemTime};
 use tokio::time::{timeout, Duration};
 
+use crate::oracle::Oracle;
+use crate::resilience::CircuitBreaker;
 use crate::types::CodeGenerator;
 
 const RESULT_FILE_NAME: &str = ".lambda-rlm-result.md";
@@ -16,6 +19,46 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const OPENCODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
+const CODEGEN_BUDGET_UNITS: usize = 50;
+const CODEGEN_CB_THRESHOLD: usize = 3;
+const CODEGEN_CB_COOLDOWN: Duration = Duration::from_secs(60);
+
+struct CodegenBudgetGuard<'a> {
+    oracle: &'a Oracle,
+    units: usize,
+    committed: bool,
+}
+
+impl<'a> CodegenBudgetGuard<'a> {
+    fn acquire(oracle: &'a Oracle, units: usize) -> Result<Self> {
+        anyhow::ensure!(
+            oracle.budget_try_reserve(units),
+            "code generation budget exhausted"
+        );
+        Ok(Self {
+            oracle,
+            units,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CodegenBudgetGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.oracle.budget_unreserve(self.units);
+        }
+    }
+}
+
+fn codegen_circuit() -> &'static CircuitBreaker {
+    static CODEGEN_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    CODEGEN_CIRCUIT.get_or_init(|| CircuitBreaker::new(CODEGEN_CB_THRESHOLD, CODEGEN_CB_COOLDOWN))
+}
 
 /// Build the fix-loop prompt shared by all code generators.
 ///
@@ -42,24 +85,42 @@ fn build_prompt(question: &str, iteration: usize) -> String {
 /// PRE: work_dir exists and is writable
 /// POST: generator process has exited, returns summary line
 pub async fn run_code_generator(
+    oracle: &Oracle,
     generator: &CodeGenerator,
     result: &str,
     work_dir: &Path,
     question: &str,
     iteration: usize,
 ) -> Result<String> {
+    let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
+    let circuit = codegen_circuit();
+    anyhow::ensure!(
+        circuit.allow_request(),
+        "code generation circuit open (3 consecutive failures; cooling off 60s)"
+    );
+
+    let started = Instant::now();
     let run = match generator {
         CodeGenerator::Claude => run_claude(result, work_dir, question, iteration).await,
         CodeGenerator::Opencode => run_opencode(result, work_dir, question, iteration).await,
     };
+    oracle.record_codegen_call(generator, started.elapsed());
 
-    run.map_err(|error| {
-        tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
-        anyhow::anyhow!("Code generation unavailable")
-    })
+    match run {
+        Ok(summary) => {
+            circuit.record_success();
+            budget_guard.commit();
+            Ok(summary)
+        }
+        Err(error) => {
+            circuit.record_failure();
+            tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
+            Err(anyhow::anyhow!("Code generation unavailable"))
+        }
+    }
 }
 
-fn validate_result_content(result: &str) -> Result<()> {
+fn validate_analysis_result_content(result: &str) -> Result<()> {
     anyhow::ensure!(!result.trim().is_empty(), "result is empty");
     anyhow::ensure!(
         result.len() <= MAX_RESULT_BYTES,
@@ -73,12 +134,26 @@ fn validate_result_content(result: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_generator_output(generator: &CodeGenerator, output: &str) -> Result<()> {
+    anyhow::ensure!(!output.trim().is_empty(), "{generator} output is empty");
+    anyhow::ensure!(
+        output.len() <= MAX_RESULT_BYTES,
+        "{generator} output exceeds {} bytes",
+        MAX_RESULT_BYTES
+    );
+    anyhow::ensure!(
+        !output.as_bytes().contains(&0),
+        "{generator} output contains invalid NUL byte"
+    );
+    Ok(())
+}
+
 async fn write_result_file_atomically(
     work_dir: &Path,
     result: &str,
     iteration: usize,
 ) -> Result<()> {
-    validate_result_content(result)?;
+    validate_analysis_result_content(result)?;
 
     let result_file = work_dir.join(RESULT_FILE_NAME);
     if let Ok(meta) = tokio::fs::symlink_metadata(&result_file).await {
@@ -216,16 +291,22 @@ async fn run_claude(
             Err(_) => anyhow::bail!("claude timed out"),
         };
 
+        anyhow::ensure!(
+            output.stdout.len() <= MAX_RESULT_BYTES,
+            "claude output exceeds {} bytes",
+            MAX_RESULT_BYTES
+        );
+
         // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
         // corrupting data that feeds downstream hashing and content analysis.
         let stdout = String::from_utf8(output.stdout)
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
+        validate_generator_output(&CodeGenerator::Claude, &stdout)?;
 
         // Save full output to log — warn on failure rather than swallowing
         if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
-        cleanup_old_logs(work_dir, &CodeGenerator::Claude);
 
         if !output.status.success() {
             tracing::error!(status = %output.status, "claude exited with failure status");
@@ -239,6 +320,7 @@ async fn run_claude(
     .await;
 
     remove_result_file(work_dir).await;
+    cleanup_old_logs(work_dir, &CodeGenerator::Claude);
     run
 }
 
@@ -290,13 +372,19 @@ async fn run_opencode(
             Err(_) => anyhow::bail!("opencode timed out"),
         };
 
+        anyhow::ensure!(
+            output.stdout.len() <= MAX_RESULT_BYTES,
+            "opencode output exceeds {} bytes",
+            MAX_RESULT_BYTES
+        );
+
         let stdout = String::from_utf8(output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;
+        validate_generator_output(&CodeGenerator::Opencode, &stdout)?;
 
         if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
-        cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
 
         if !output.status.success() {
             tracing::error!(status = %output.status, "opencode exited with failure status");
@@ -310,6 +398,7 @@ async fn run_opencode(
     .await;
 
     remove_result_file(work_dir).await;
+    cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
     run
 }
 
@@ -328,12 +417,30 @@ mod tests {
     #[test]
     fn result_validation_rejects_oversized_payload() {
         let huge = "x".repeat(MAX_RESULT_BYTES + 1);
-        assert!(validate_result_content(&huge).is_err());
+        assert!(validate_analysis_result_content(&huge).is_err());
     }
 
     #[test]
     fn result_validation_rejects_empty_payload() {
-        assert!(validate_result_content("   \n\n").is_err());
+        assert!(validate_analysis_result_content("   \n\n").is_err());
+    }
+
+    #[test]
+    fn generator_output_validation_rejects_nul_bytes() {
+        let out = "ok\0bad";
+        assert!(validate_generator_output(&CodeGenerator::Claude, out).is_err());
+    }
+
+    #[test]
+    fn log_file_name_is_stable_for_all_generators() {
+        assert_eq!(
+            log_file_name(&CodeGenerator::Claude, 7),
+            ".lambda-rlm-claude-7.log"
+        );
+        assert_eq!(
+            log_file_name(&CodeGenerator::Opencode, 7),
+            ".lambda-rlm-opencode-7.log"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! telemetry counters. All state is lock-free (atomics).
 //!
 use crate::resilience::{BudgetGuard, CallBudget, CircuitBreaker, ReplayCache};
+use crate::types::CodeGenerator;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,7 +62,6 @@ impl OracleError {
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::AuthFailed(_))
     }
-
 }
 
 // ── Cancellation safety note ──────────────────────────────────────
@@ -331,10 +331,7 @@ impl FireworksProvider {
                         retry_after: Duration::from_secs(5),
                     },
                     401 | 403 => OracleError::AuthFailed(body),
-                    _ => OracleError::ApiError {
-                        status: code,
-                        body,
-                    },
+                    _ => OracleError::ApiError { status: code, body },
                 });
             }
 
@@ -389,6 +386,10 @@ pub struct Oracle {
     total_input_chars: AtomicU64,
     total_output_chars: AtomicU64,
     total_latency_ms: AtomicU64,
+    codegen_claude_calls: AtomicU64,
+    codegen_opencode_calls: AtomicU64,
+    codegen_claude_latency_ms: AtomicU64,
+    codegen_opencode_latency_ms: AtomicU64,
 }
 
 impl Oracle {
@@ -422,6 +423,10 @@ impl Oracle {
             total_input_chars: AtomicU64::new(0),
             total_output_chars: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
+            codegen_claude_calls: AtomicU64::new(0),
+            codegen_opencode_calls: AtomicU64::new(0),
+            codegen_claude_latency_ms: AtomicU64::new(0),
+            codegen_opencode_latency_ms: AtomicU64::new(0),
         })
     }
 
@@ -456,6 +461,22 @@ impl Oracle {
     /// Called from the signal handler to stop billing when shutdown fires.
     pub fn trigger_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    pub fn record_codegen_call(&self, generator: &CodeGenerator, latency: Duration) {
+        let latency_ms = latency.as_millis() as u64;
+        match generator {
+            CodeGenerator::Claude => {
+                self.codegen_claude_calls.fetch_add(1, Ordering::AcqRel);
+                self.codegen_claude_latency_ms
+                    .fetch_add(latency_ms, Ordering::AcqRel);
+            }
+            CodeGenerator::Opencode => {
+                self.codegen_opencode_calls.fetch_add(1, Ordering::AcqRel);
+                self.codegen_opencode_latency_ms
+                    .fetch_add(latency_ms, Ordering::AcqRel);
+            }
+        }
     }
 
     /// Outer call: budget → cache → bulkhead semaphore → retry loop with circuit breaker.
@@ -582,11 +603,7 @@ impl Oracle {
             // Circuit breaker: use allow_request for half-open probe support
             if !self.circuit.allow_request() {
                 let failures = self.circuit.failures();
-                tracing::warn!(
-                    failures,
-                    cooldown_s = 30,
-                    "circuit breaker open"
-                );
+                tracing::warn!(failures, cooldown_s = 30, "circuit breaker open");
                 guard.commit(); // budget consumed: we tried
                 anyhow::bail!(
                     "Circuit breaker open -- {} consecutive failures, cooling off 30s",
@@ -610,10 +627,20 @@ impl Oracle {
                     raw % (cap + 1)
                 };
                 let backoff = Duration::from_millis(jitter);
-                tracing::debug!(call = n, attempt, max = self.max_retries, ?backoff, cap_ms = cap, idempotency_key, "retrying with deterministic jitter");
+                tracing::debug!(
+                    call = n,
+                    attempt,
+                    max = self.max_retries,
+                    ?backoff,
+                    cap_ms = cap,
+                    idempotency_key,
+                    "retrying with deterministic jitter"
+                );
                 eprintln!(
                     "    M #{n} retry {attempt}/{} (backoff {:?}, cap {:?})",
-                    self.max_retries, backoff, Duration::from_millis(cap)
+                    self.max_retries,
+                    backoff,
+                    Duration::from_millis(cap)
                 );
                 tokio::time::sleep(backoff).await;
             }
@@ -621,7 +648,9 @@ impl Oracle {
             let start = Instant::now();
             // No CbFailureGuard here: all error paths below call record_failure()
             // explicitly. Task cancellation (quorum abort) must NOT record failure.
-            let api_result = self.call_api(system, user_prompt, max_tokens, &idempotency_key).await;
+            let api_result = self
+                .call_api(system, user_prompt, max_tokens, &idempotency_key)
+                .await;
 
             match api_result {
                 Ok(text) => {
@@ -689,7 +718,9 @@ impl Oracle {
         max_tokens: u32,
         idempotency_key: &str,
     ) -> std::result::Result<String, OracleError> {
-        self.provider.invoke(system, user_prompt, max_tokens, idempotency_key).await
+        self.provider
+            .invoke(system, user_prompt, max_tokens, idempotency_key)
+            .await
     }
 
     /// Emit telemetry as a single atomic stderr write. Individual eprintln!
@@ -706,20 +737,34 @@ impl Oracle {
         let output_chars = self.total_output_chars.load(Ordering::Acquire);
         let latency_ms = self.total_latency_ms.load(Ordering::Acquire);
         let budget_remaining = self.budget.remaining();
+        let codegen_claude_calls = self.codegen_claude_calls.load(Ordering::Acquire);
+        let codegen_opencode_calls = self.codegen_opencode_calls.load(Ordering::Acquire);
+        let codegen_claude_latency_ms = self.codegen_claude_latency_ms.load(Ordering::Acquire);
+        let codegen_opencode_latency_ms = self.codegen_opencode_latency_ms.load(Ordering::Acquire);
 
         // fmt::Write for String is infallible (OOM panics, never returns Err),
         // but we propagate via a helper to satisfy zero-swallowing discipline.
         fn w(buf: &mut String, args: std::fmt::Arguments<'_>) {
-            buf.write_fmt(args).expect("String::write_fmt is infallible");
+            buf.write_fmt(args)
+                .expect("String::write_fmt is infallible");
         }
 
         let mut buf = String::with_capacity(512);
         w(&mut buf, format_args!("  Telemetry:\n"));
         w(&mut buf, format_args!("    Total M calls:    {calls}\n"));
-        w(&mut buf, format_args!("    Cache hits:       {cache_hits}\n"));
+        w(
+            &mut buf,
+            format_args!("    Cache hits:       {cache_hits}\n"),
+        );
         w(&mut buf, format_args!("    API errors:       {errors}\n"));
-        w(&mut buf, format_args!("    Input chars:      {input_chars}\n"));
-        w(&mut buf, format_args!("    Output chars:     {output_chars}\n"));
+        w(
+            &mut buf,
+            format_args!("    Input chars:      {input_chars}\n"),
+        );
+        w(
+            &mut buf,
+            format_args!("    Output chars:     {output_chars}\n"),
+        );
         if calls > cache_hits {
             let api_calls = calls - cache_hits;
             w(
@@ -731,11 +776,43 @@ impl Oracle {
             );
         }
         if !self.budget.is_unlimited() {
-            w(&mut buf, format_args!("    Budget remaining: {budget_remaining}\n"));
+            w(
+                &mut buf,
+                format_args!("    Budget remaining: {budget_remaining}\n"),
+            );
+        }
+        w(
+            &mut buf,
+            format_args!("    Codegen Claude:   {codegen_claude_calls} call(s)\n"),
+        );
+        if codegen_claude_calls > 0 {
+            w(
+                &mut buf,
+                format_args!(
+                    "    Claude avg lat.:  {:.1}ms/call\n",
+                    codegen_claude_latency_ms as f64 / codegen_claude_calls as f64
+                ),
+            );
+        }
+        w(
+            &mut buf,
+            format_args!("    Codegen OpenCode: {codegen_opencode_calls} call(s)\n"),
+        );
+        if codegen_opencode_calls > 0 {
+            w(
+                &mut buf,
+                format_args!(
+                    "    OpenCode avg lat.: {:.1}ms/call\n",
+                    codegen_opencode_latency_ms as f64 / codegen_opencode_calls as f64
+                ),
+            );
         }
         let corruptions = self.cache.corruption_count();
         if corruptions > 0 {
-            w(&mut buf, format_args!("    Cache corruptions: {corruptions} (bitrot detected)\n"));
+            w(
+                &mut buf,
+                format_args!("    Cache corruptions: {corruptions} (bitrot detected)\n"),
+            );
         }
 
         // Single atomic write under stderr lock — no interleaving possible.

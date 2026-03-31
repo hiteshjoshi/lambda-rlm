@@ -35,7 +35,7 @@ mod verify;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
@@ -429,32 +429,14 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
 // ── Analysis runner (reusable per iteration) ────────────────────
 
-async fn run_analysis(cli: &Cli) -> Result<String> {
+async fn run_analysis(cli: &Cli, oracle: &Arc<Oracle>) -> Result<String> {
     let start = Instant::now();
-
-    let api_key = if cli.dry_run {
-        "dry-run".into()
-    } else {
-        std::env::var("FIREWORKS_API").context("Set FIREWORKS_API env var")?
-    };
 
     // ── Phase 1: REPL Initialization ──
     let prompt = collect_source_files(&cli.path)?;
     if prompt.is_empty() {
         anyhow::bail!("No source files found in {}", cli.path.display());
     }
-    let oracle = Oracle::new(
-        api_key,
-        cli.model.clone(),
-        cli.dry_run,
-        cli.concurrency,
-        Duration::from_secs(cli.timeout),
-        cli.max_retries,
-        cli.max_calls,
-        cli.cache_dir.clone(),
-        !cli.no_cache,
-        cli.max_cache_entries,
-    );
     eprintln!(
         "Phase 1: P stored externally ({} chars), library L loaded",
         prompt.len()
@@ -464,7 +446,7 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
     let task = if cli.task == TaskType::Auto {
         eprintln!("Phase 2: Auto-detecting task type...");
         let preview = comb_peek(&prompt, 0, cli.peek_size);
-        auto_detect_task(preview, prompt.len(), &cli.question, &oracle).await?
+        auto_detect_task(preview, prompt.len(), &cli.question, oracle).await?
     } else {
         eprintln!("Phase 2: Task type = {} (user-specified)", cli.task);
         cli.task.clone()
@@ -610,7 +592,7 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
         overlap: cli.overlap,
         max_tokens: cli.max_tokens,
         keywords,
-        oracle: oracle.clone(),
+        oracle: Arc::clone(oracle),
         verifier,
         shutdown: shutdown_rx,
         concurrency: concurrency_semaphore,
@@ -646,6 +628,39 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
     );
     oracle.print_telemetry();
     Ok(result)
+}
+
+fn build_oracle(cli: &Cli) -> Result<Arc<Oracle>> {
+    let api_key = if cli.dry_run {
+        "dry-run".into()
+    } else {
+        std::env::var("FIREWORKS_API").context("Set FIREWORKS_API env var")?
+    };
+
+    Ok(Oracle::new(
+        api_key,
+        cli.model.clone(),
+        cli.dry_run,
+        cli.concurrency,
+        Duration::from_secs(cli.timeout),
+        cli.max_retries,
+        cli.max_calls,
+        cli.cache_dir.clone(),
+        !cli.no_cache,
+        cli.max_cache_entries,
+    ))
+}
+
+fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
+    let target = work_dir.join(".lambda-rlm-result.md");
+    if target.exists() {
+        anyhow::ensure!(
+            open_file_no_follow(&target).is_some(),
+            "refusing codegen result target symlink: {}",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
@@ -685,7 +700,8 @@ async fn main() -> Result<()> {
 
     if generator.is_none() {
         // Single-shot mode: analyze and print
-        let result = run_analysis(&cli).await?;
+        let oracle = build_oracle(&cli)?;
+        let result = run_analysis(&cli, &oracle).await?;
         println!("{result}");
         return Ok(());
     }
@@ -713,8 +729,10 @@ async fn main() -> Result<()> {
         }
         eprintln!("================================================================\n");
 
+        let oracle = build_oracle(&cli)?;
+
         // 1. Analyze
-        let result = run_analysis(&cli).await?;
+        let result = run_analysis(&cli, &oracle).await?;
 
         // 2. Check if clean (heuristic: very short output or known "no issues" patterns)
         let lower = result.trim().to_lowercase();
@@ -731,9 +749,18 @@ async fn main() -> Result<()> {
         }
 
         // 3. Hand to code generator
-        let summary =
-            codegen::run_code_generator(&generator, &result, &work_dir, &cli.question, iteration)
-                .await?;
+        validate_codegen_result_target(&work_dir)?;
+        let summary = codegen::run_code_generator(
+            oracle.as_ref(),
+            &generator,
+            &result,
+            &work_dir,
+            &cli.question,
+            iteration,
+        )
+        .await?;
+
+        oracle.print_telemetry();
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");
