@@ -313,9 +313,12 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
             });
         }
 
-        // Collect results with cooperative shutdown check
+        // Collect results with cooperative shutdown check.
+        // On depth-0 fatal errors, drain remaining tasks before returning
+        // to ensure RAII guards (SemaphorePermit, BudgetGuard) fire cleanly.
         let mut indexed_results: Vec<(usize, String)> = Vec::with_capacity(num_children);
         let mut shutdown_rx = cfg.shutdown.clone();
+        let mut fatal_error: Option<anyhow::Error> = None;
 
         loop {
             tokio::select! {
@@ -338,19 +341,34 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<Owned
                             tracing::warn!(depth, child = idx, error = %e, "child failed, degrading");
                             eprintln!("{indent}|  child {idx} failed, degrading: {e}");
                         }
-                        Some(Ok((_idx, Err(e)))) => return Err(e),
+                        Some(Ok((_idx, Err(e)))) => {
+                            // Depth 0: record error but drain remaining tasks
+                            // so their RAII guards drop cleanly.
+                            fatal_error.get_or_insert(e);
+                            set.abort_all();
+                            while set.join_next().await.is_some() {}
+                            break;
+                        }
                         Some(Err(join_err)) if join_err.is_cancelled() => {
-                            // Task was cancelled by shutdown — not an error
                             tracing::debug!(depth, "child task cancelled");
                         }
                         Some(Err(join_err)) if depth > 0 => {
                             tracing::error!(depth, error = %join_err, "child task panicked");
                             eprintln!("{indent}|  child task panicked, degrading: {join_err}");
                         }
-                        Some(Err(join_err)) => anyhow::bail!("Child task failed: {join_err}"),
+                        Some(Err(join_err)) => {
+                            fatal_error.get_or_insert_with(|| anyhow::anyhow!("Child task failed: {join_err}"));
+                            set.abort_all();
+                            while set.join_next().await.is_some() {}
+                            break;
+                        }
                     }
                 }
             }
+        }
+
+        if let Some(e) = fatal_error {
+            return Err(e);
         }
 
         indexed_results.sort_by_key(|(idx, _)| *idx);

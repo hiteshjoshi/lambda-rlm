@@ -466,19 +466,14 @@ impl Oracle {
         cache_enabled: bool,
         max_cache_entries: usize,
     ) -> Arc<Self> {
-        let cb_path = cache_dir.join(".circuit_breaker_state");
         let provider = FireworksProvider::new(api_key, model.clone(), timeout);
-        let oracle = Arc::new(Self {
+        Arc::new(Self {
             provider,
             model,
             call_count: AtomicU64::new(0),
             bulkhead: Bulkhead::new(concurrency),
             dry_run,
-            circuit: if cache_enabled {
-                CircuitBreaker::with_persistence(3, Duration::from_secs(30), cb_path)
-            } else {
-                CircuitBreaker::new(3, Duration::from_secs(30))
-            },
+            circuit: CircuitBreaker::new(3, Duration::from_secs(30)),
             cache: ReplayCache::new(cache_dir, cache_enabled, max_cache_entries),
             budget: CallBudget::new(max_calls),
             max_retries,
@@ -489,76 +484,7 @@ impl Oracle {
             total_input_chars: AtomicU64::new(0),
             total_output_chars: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
-        });
-
-        // Background cache scavenger: periodically scrubs cache integrity and
-        // bounds the quarantine directory. Prevents unbounded disk growth from
-        // bitrot over long-running deployments (corrupted/ dir, orphan temps).
-        // Also runs generational compaction every 24h to defragment the directory
-        // index — ext4/xfs degrade to linear scans after millions of entries.
-        if cache_enabled {
-            let weak = Arc::downgrade(&oracle);
-            tokio::spawn(async move {
-                let scrub_interval = Duration::from_secs(6 * 3600); // every 6 hours
-                let compact_interval = Duration::from_secs(24 * 3600); // every 24 hours
-                let mut scrub_tick = tokio::time::interval(scrub_interval);
-                let mut compact_tick = tokio::time::interval(compact_interval);
-                scrub_tick.tick().await; // consume initial immediate tick
-                compact_tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = scrub_tick.tick() => {
-                            let Some(oracle) = weak.upgrade() else { break; };
-                            if oracle.shutdown.load(Ordering::Acquire) { break; }
-                            let cache_ref = oracle.cache.clone_for_scrub();
-                            let result = tokio::task::spawn_blocking(move || {
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    cache_ref.scrub()
-                                }))
-                            }).await;
-                            match result {
-                                Ok(Ok((verified, quarantined))) => {
-                                    if quarantined > 0 {
-                                        tracing::info!(verified, quarantined, "periodic cache scrub completed");
-                                    }
-                                }
-                                Ok(Err(_)) => {
-                                    tracing::error!("cache scrub panicked in background task");
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "cache scrub task failed");
-                                }
-                            }
-                        }
-                        _ = compact_tick.tick() => {
-                            let Some(oracle) = weak.upgrade() else { break; };
-                            if oracle.shutdown.load(Ordering::Acquire) { break; }
-                            let cache_ref = oracle.cache.clone_for_scrub();
-                            let result = tokio::task::spawn_blocking(move || {
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    cache_ref.compact()
-                                }))
-                            }).await;
-                            match result {
-                                Ok(Ok((migrated, dropped))) => {
-                                    if migrated > 0 || dropped > 0 {
-                                        tracing::info!(migrated, dropped, "periodic cache compaction completed");
-                                    }
-                                }
-                                Ok(Err(_)) => {
-                                    tracing::error!("cache compaction panicked in background task");
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "cache compaction task failed");
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        oracle
+        })
     }
 
     pub fn calls(&self) -> u64 {
