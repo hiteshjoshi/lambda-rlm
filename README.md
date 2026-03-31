@@ -210,11 +210,11 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `d3e99d9`
+Latest fix-loop hardening commit: `e664b57`
 
-- Reworked codegen subprocess execution in `src/codegen.rs` to enforce timeout kill+wait reaping, preventing zombie processes on Unix and capturing stderr for failure diagnostics.
-- Switched result file writes in `src/codegen.rs` to `tempfile::NamedTempFile` RAII persistence so temp artifacts are cleaned automatically on panic/error paths.
-- Added fail-fast generator binary preflight in `src/main.rs`, strengthened single-flight ownership in `src/oracle.rs` to avoid inflight sender overwrite races, and surfaced live budget-guard leak telemetry via `src/resilience.rs`.
+- Isolated code generator circuit breakers in `src/codegen.rs` so Claude and OpenCode failures do not trip each other's availability windows.
+- Hardened subprocess orchestration in `src/codegen.rs` with shared safe command setup (`stdin` null, process group, kill-on-drop) and explicit timeout kill paths.
+- Added a design record at `docs/decisions/001-codegen-boundary.md` documenting why file-based IPC + process isolation was chosen and what trade-offs were accepted.
 
 See [CHANGELOG.md](CHANGELOG.md).
 
