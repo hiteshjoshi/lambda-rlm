@@ -210,7 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `0900834`
+Latest fix-loop hardening commit: `5057549`
+
+- Hardened `src/codegen.rs` with cancellation-safe child-process cleanup (`Drop` reaper + explicit kill/reap paths), bounded stdout/stderr readers, exit-code classification (retryable vs fatal), and degraded handling for empty generator output.
+- Switched codegen summary passing to `Arc<str>` in `src/codegen.rs` to avoid extra string copies across fix-loop boundaries.
+- Moved shutdown signal handler ownership out of per-iteration analysis in `src/main.rs` so the fix loop no longer spawns a new signal task each iteration.
+- Reused a single Oracle instance across fix-loop iterations in `src/main.rs`, preserving budget/telemetry continuity and preventing per-iteration state resets.
+- Enforced a hard safety cap of 10 fix-loop iterations in `src/main.rs` and added budget-exhaustion termination checks for bounded production behavior.
 
 - Hardened code-generator subprocess lifecycle in `src/codegen.rs` so spawned processes are explicitly killed and reaped on timeout and on stdout/stderr capture failures, eliminating zombie risk under repeated fix-loop iterations.
 - Switched codegen breaker initialization in `src/codegen.rs` to independent per-generator `OnceLock` instances, preserving Claude/OpenCode fault isolation.
