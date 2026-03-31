@@ -1,5 +1,22 @@
 # Changelog
 
+### v3.7 — Codegen Process Hardening (`f58f5b4`)
+
+**Hardened:**
+- Added bounded execution for both generators: Claude now has a 15-minute timeout and OpenCode keeps the 5-minute cap.
+- Enabled `kill_on_drop(true)` and Unix process-group isolation to prevent orphaned subprocesses in abrupt shutdown scenarios.
+- Switched to generic sanitized user-facing codegen errors while preserving full internal tracing details.
+
+**Secured:**
+- Added input validation for generated result payloads (non-empty, max size, no NUL bytes).
+- Added atomic write+rename flow for `.lambda-rlm-result.md` and symlink guardrails.
+
+**Operational:**
+- Added log rotation for `.lambda-rlm-claude-*.log` and `.lambda-rlm-opencode-*.log` with LRU-style retention (10 files/generator).
+- Added unit tests for result validation and summary-line parsing helpers.
+
+**Net: +185 / -35 in `src/codegen.rs`. 42/42 tests pass.**
+
 ### v3.6 — OpenCode Code Generator (`84b9bb5`)
 
 **Added:**
