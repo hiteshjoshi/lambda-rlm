@@ -58,7 +58,6 @@ pub fn process_nonce() -> &'static [u8; 16] {
 //
 // Uses monotonic clock for interval measurement — NTP jumps cannot
 // cause premature cooldown reset or infinite open state.
-// Optionally persists state across restarts via atomic file writes.
 
 pub struct CircuitBreaker {
     consecutive_failures: AtomicUsize,
@@ -603,10 +602,6 @@ impl ReplayCache {
     /// Move a corrupt cache entry to corrupted/ subdirectory for forensic analysis.
     /// If both move and delete fail (e.g., ENOSPC), disables the cache entirely
     /// to prevent reuse of corrupted data on subsequent lookups.
-    ///
-    /// Rate-limits quarantine operations: if >3 corruptions occur within 60s
-    /// (suspected hardware failure), disables cache writes with exponential
-    /// backoff (60s, 120s, 240s... up to 24h) to prevent disk/log exhaustion.
     fn quarantine(&self, key: &str) {
         let corrupt_dir = self.dir.join("corrupted");
         let _ = std::fs::create_dir_all(&corrupt_dir);
