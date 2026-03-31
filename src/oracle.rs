@@ -528,32 +528,38 @@ impl Oracle {
         // 2b. Single-flight: coalesce concurrent requests for the same cache key.
         // If another task is already fetching this key, wait for its result instead
         // of issuing a duplicate LLM call (thundering herd prevention).
-        // Lock is scoped to avoid holding MutexGuard across .await.
-        let inflight_rx = {
-            let map = self.inflight.lock().unwrap();
-            map.get(&cache_key).map(|tx| tx.subscribe())
-        };
-        if let Some(mut rx) = inflight_rx {
-            loop {
-                if let Some(ref result) = *rx.borrow() {
-                    self.cache_hits.fetch_add(1, Ordering::AcqRel);
-                    guard.commit();
-                    return Ok(result.clone());
+        // Claim ownership by inserting while holding the lock so two callers can
+        // never overwrite each other's sender and leak waiters.
+        let inflight_tx = loop {
+            let inflight_rx = {
+                let mut map = self.inflight.lock().unwrap();
+                if let Some(existing) = map.get(&cache_key) {
+                    Some(existing.subscribe())
+                } else {
+                    let (tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
+                    let tx = Arc::new(tx);
+                    map.insert(cache_key.clone(), Arc::clone(&tx));
+                    break tx;
                 }
-                if rx.changed().await.is_err() {
-                    // In-flight caller failed — fall through to try ourselves
-                    break;
+            };
+
+            if let Some(mut rx) = inflight_rx {
+                loop {
+                    if let Some(ref result) = *rx.borrow() {
+                        self.cache_hits.fetch_add(1, Ordering::AcqRel);
+                        guard.commit();
+                        return Ok(result.clone());
+                    }
+                    if rx.changed().await.is_err() {
+                        // In-flight caller failed — sender dropped.
+                        // Retry lock acquisition and attempt to claim leader.
+                        break;
+                    }
                 }
             }
-        }
-        // Register as the in-flight caller for this key.
+        };
+
         // RAII guard removes entry on all exit paths (success, error, panic).
-        let (inflight_tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
-        let inflight_tx = Arc::new(inflight_tx);
-        self.inflight
-            .lock()
-            .unwrap()
-            .insert(cache_key.clone(), Arc::clone(&inflight_tx));
         let _inflight_guard = InflightGuard {
             map: &self.inflight,
             key: cache_key.clone(),
@@ -737,6 +743,7 @@ impl Oracle {
         let output_chars = self.total_output_chars.load(Ordering::Acquire);
         let latency_ms = self.total_latency_ms.load(Ordering::Acquire);
         let budget_remaining = self.budget.remaining();
+        let leaked_budget_guards = self.budget.leaked_guards();
         let codegen_claude_calls = self.codegen_claude_calls.load(Ordering::Acquire);
         let codegen_opencode_calls = self.codegen_opencode_calls.load(Ordering::Acquire);
         let codegen_claude_latency_ms = self.codegen_claude_latency_ms.load(Ordering::Acquire);
@@ -779,6 +786,12 @@ impl Oracle {
             w(
                 &mut buf,
                 format_args!("    Budget remaining: {budget_remaining}\n"),
+            );
+        }
+        if leaked_budget_guards > 0 {
+            w(
+                &mut buf,
+                format_args!("    Budget guard leaks: {leaked_budget_guards}\n"),
             );
         }
         w(

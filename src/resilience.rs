@@ -120,11 +120,13 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         // Saturating add: prevents wrap-around at usize::MAX which would
         // reset the circuit to "closed" after 2^64 failures.
-        let new_failures = self.consecutive_failures.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_add(1)),
-        ).unwrap_or(0) + 1;
+        let new_failures = self
+            .consecutive_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(0)
+            + 1;
         self.last_failure_mono_ms
             .store(monotonic_ms(), Ordering::Release);
         self.half_open_probe.store(false, Ordering::Release);
@@ -136,7 +138,6 @@ impl CircuitBreaker {
             self.consecutive_failures.store(cap, Ordering::Release);
         }
     }
-
 }
 
 // ── Call Budget ──────────────────────────────────────────────────
@@ -171,12 +172,7 @@ impl CallBudget {
             }
             if self
                 .remaining
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return true;
@@ -204,12 +200,7 @@ impl CallBudget {
             }
             if self
                 .remaining
-                .compare_exchange_weak(
-                    current,
-                    current - n,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(current, current - n, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return true;
@@ -227,11 +218,11 @@ impl CallBudget {
     /// Uses saturating add to prevent overflow past usize::MAX.
     pub fn release(&self) {
         if !self.unlimited {
-            let _ = self.remaining.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| Some(current.saturating_add(1)),
-            );
+            let _ = self
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(1))
+                });
         }
     }
 
@@ -239,11 +230,11 @@ impl CallBudget {
     /// Uses saturating add to prevent overflow past usize::MAX.
     pub fn release_n(&self, n: usize) {
         if !self.unlimited && n > 0 {
-            let _ = self.remaining.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| Some(current.saturating_add(n)),
-            );
+            let _ = self
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(n))
+                });
         }
     }
 
@@ -253,6 +244,13 @@ impl CallBudget {
 
     pub fn is_unlimited(&self) -> bool {
         self.unlimited
+    }
+
+    /// Number of live (uncommitted) budget guards.
+    /// Non-zero values persisting over time indicate dropped/cancelled
+    /// call paths that did not commit cleanly.
+    pub fn leaked_guards(&self) -> u64 {
+        BUDGET_GUARD_LIVE_COUNT.load(Ordering::Acquire)
     }
 }
 
@@ -404,7 +402,11 @@ impl ReplayCache {
             }
         }
         if removed > 0 {
-            tracing::info!(removed, remaining = by_mtime.len() - removed, "scavenged old quarantined cache entries");
+            tracing::info!(
+                removed,
+                remaining = by_mtime.len() - removed,
+                "scavenged old quarantined cache entries"
+            );
         }
     }
 
@@ -475,7 +477,11 @@ impl ReplayCache {
         let computed = blake3::hash(content.as_bytes()).to_hex();
         if stored_hash != computed.as_str() {
             self.corruption_count.fetch_add(1, Ordering::AcqRel);
-            tracing::warn!(key, corruption_total = self.corruption_count.load(Ordering::Acquire), "cache integrity check failed, quarantining");
+            tracing::warn!(
+                key,
+                corruption_total = self.corruption_count.load(Ordering::Acquire),
+                "cache integrity check failed, quarantining"
+            );
             self.quarantine(key);
             return None;
         }
@@ -890,7 +896,9 @@ mod tests {
 
         // Write 8 entries — should trigger eviction on the later puts
         for i in 0..8 {
-            cache.put(&format!("key_{i}"), &format!("value_{i}")).unwrap();
+            cache
+                .put(&format!("key_{i}"), &format!("value_{i}"))
+                .unwrap();
             // Small sleep to ensure distinct mtimes for eviction ordering
             thread::sleep(Duration::from_millis(10));
         }
@@ -954,9 +962,15 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..1000 {
                     match i % 3 {
-                        0 => { cb.record_failure(); }
-                        1 => { cb.record_success(); }
-                        _ => { let _ = cb.allow_request(); }
+                        0 => {
+                            cb.record_failure();
+                        }
+                        1 => {
+                            cb.record_success();
+                        }
+                        _ => {
+                            let _ = cb.allow_request();
+                        }
                     }
                 }
             }));
@@ -1096,11 +1110,11 @@ mod loom_tests {
         }
 
         fn release(&self) {
-            let _ = self.remaining.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| Some(current.saturating_add(1)),
-            );
+            let _ = self
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(1))
+                });
         }
 
         fn remaining(&self) -> usize {
@@ -1171,9 +1185,7 @@ mod loom_tests {
             });
 
             let b2 = Arc::clone(&budget);
-            let t2 = thread::spawn(move || {
-                b2.try_acquire()
-            });
+            let t2 = thread::spawn(move || b2.try_acquire());
 
             t1.join().unwrap();
             let acquired = t2.join().unwrap();
@@ -1182,9 +1194,15 @@ mod loom_tests {
             // Budget started at 2, we acquired 1 before threads, released 1 in t1,
             // and t2 may or may not have acquired 1.
             if acquired {
-                assert!(remaining <= 2, "remaining {remaining} > 2 after release+acquire");
+                assert!(
+                    remaining <= 2,
+                    "remaining {remaining} > 2 after release+acquire"
+                );
             } else {
-                assert_eq!(remaining, 2, "remaining should be 2 after release without acquire");
+                assert_eq!(
+                    remaining, 2,
+                    "remaining should be 2 after release without acquire"
+                );
             }
         });
     }

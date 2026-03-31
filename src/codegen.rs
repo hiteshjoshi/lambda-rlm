@@ -6,8 +6,10 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::time::Instant;
 use std::{path::Path, process::Stdio, sync::OnceLock, time::SystemTime};
+use tokio::io::AsyncReadExt;
 use tokio::time::{timeout, Duration};
 
 use crate::oracle::Oracle;
@@ -151,7 +153,7 @@ fn validate_generator_output(generator: &CodeGenerator, output: &str) -> Result<
 async fn write_result_file_atomically(
     work_dir: &Path,
     result: &str,
-    iteration: usize,
+    _iteration: usize,
 ) -> Result<()> {
     validate_analysis_result_content(result)?;
 
@@ -163,18 +165,25 @@ async fn write_result_file_atomically(
         );
     }
 
-    let tmp_file = work_dir.join(format!(
-        "{RESULT_FILE_NAME}.tmp.{}.{}",
-        std::process::id(),
-        iteration
-    ));
-    tokio::fs::write(&tmp_file, result)
-        .await
-        .with_context(|| format!("Failed to write {}", tmp_file.display()))?;
+    let work_dir = work_dir.to_path_buf();
+    let result_file_clone = result_file.clone();
+    let result_owned = result.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut tmp = tempfile::NamedTempFile::new_in(&work_dir).with_context(|| {
+            format!(
+                "Failed to create temporary result file in {}",
+                work_dir.display()
+            )
+        })?;
+        tmp.write_all(result_owned.as_bytes())
+            .with_context(|| format!("Failed to write temporary result file in {}", work_dir.display()))?;
+        tmp.persist(&result_file_clone)
+            .map_err(|e| anyhow::anyhow!("Failed to move {}: {}", result_file_clone.display(), e.error))?;
+        Ok(())
+    })
+    .await
+    .context("Result file writer task failed")??;
 
-    tokio::fs::rename(&tmp_file, &result_file)
-        .await
-        .with_context(|| format!("Failed to move {}", result_file.display()))?;
     Ok(())
 }
 
@@ -245,8 +254,72 @@ fn cleanup_old_logs(work_dir: &Path, generator: &CodeGenerator) {
     }
 }
 
-/// Spawn claude in print mode and wait for it to finish (no timeout).
-/// Returns Claude's output summary (first line).
+struct GeneratorOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_generator_process_with_timeout(
+    mut cmd: tokio::process::Command,
+    generator_name: &str,
+    timeout_duration: Duration,
+) -> Result<GeneratorOutput> {
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn `{generator_name}` — is it installed and on PATH?"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture generator stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture generator stderr")?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut reader = stdout;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = stderr;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
+    let status = match timeout(timeout_duration, child.wait()).await {
+        Ok(wait_result) => wait_result.with_context(|| format!("Failed to run {generator_name}"))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            anyhow::bail!("{generator_name} timed out");
+        }
+    };
+
+    let stdout = stdout_task
+        .await
+        .context("stdout reader task panicked")?
+        .context("failed reading generator stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("stderr reader task panicked")?
+        .context("failed reading generator stderr")?;
+
+    Ok(GeneratorOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Spawn claude in print mode and wait for it to finish.
+/// Returns Claude's output summary (last non-empty line).
 ///
 /// PRE: work_dir exists and is writable
 /// POST: claude process has exited
@@ -282,14 +355,7 @@ async fn run_claude(
             cmd.process_group(0);
         }
 
-        let child = cmd
-            .spawn()
-            .context("Failed to spawn `claude` — is it installed and on PATH?")?;
-
-        let output = match timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
-            Ok(output) => output.context("Failed to run claude")?,
-            Err(_) => anyhow::bail!("claude timed out"),
-        };
+        let output = run_generator_process_with_timeout(cmd, "claude", CLAUDE_TIMEOUT).await?;
 
         anyhow::ensure!(
             output.stdout.len() <= MAX_RESULT_BYTES,
@@ -309,11 +375,15 @@ async fn run_claude(
         }
 
         if !output.status.success() {
-            tracing::error!(status = %output.status, "claude exited with failure status");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
             anyhow::bail!("claude execution failed");
         }
 
-        let summary = first_non_empty_line(&stdout);
+        // DESIGN DECISION: Claude prints the final actionable result at the end
+        // of stdout after intermediate progress output. We extract the last
+        // non-empty line to avoid coupling to unstable CLI formatting.
+        let summary = last_non_empty_line(&stdout);
 
         Ok(summary)
     }
@@ -325,7 +395,7 @@ async fn run_claude(
 }
 
 /// Spawn opencode in non-interactive mode and wait for it to finish.
-/// Returns OpenCode's output summary (last non-empty line).
+/// Returns OpenCode's output summary (first non-empty line).
 ///
 /// PRE: work_dir exists and is writable
 /// POST: opencode process has exited
@@ -363,14 +433,7 @@ async fn run_opencode(
             cmd.process_group(0);
         }
 
-        let child = cmd
-            .spawn()
-            .context("Failed to spawn `opencode` — is it installed and on PATH?")?;
-
-        let output = match timeout(OPENCODE_TIMEOUT, child.wait_with_output()).await {
-            Ok(output) => output.context("Failed to run opencode")?,
-            Err(_) => anyhow::bail!("opencode timed out"),
-        };
+        let output = run_generator_process_with_timeout(cmd, "opencode", OPENCODE_TIMEOUT).await?;
 
         anyhow::ensure!(
             output.stdout.len() <= MAX_RESULT_BYTES,
@@ -387,11 +450,15 @@ async fn run_opencode(
         }
 
         if !output.status.success() {
-            tracing::error!(status = %output.status, "opencode exited with failure status");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
             anyhow::bail!("opencode execution failed");
         }
 
-        let summary = last_non_empty_line(&stdout);
+        // DESIGN DECISION: OpenCode prints the final concise result first,
+        // then streams additional diagnostics. We extract the first non-empty
+        // line to keep the control loop stable across CLI format changes.
+        let summary = first_non_empty_line(&stdout);
 
         Ok(summary)
     }

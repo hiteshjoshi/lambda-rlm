@@ -81,6 +81,15 @@ use phi::{auto_detect_task, phi, PhiConfig};
 use types::TaskType;
 use verify::Verifier;
 
+fn validate_generator_access(generator: &types::CodeGenerator) -> Result<()> {
+    let binary = match generator {
+        types::CodeGenerator::Claude => "claude",
+        types::CodeGenerator::Opencode => "opencode",
+    };
+    which::which(binary).with_context(|| format!("{binary} binary not in PATH"))?;
+    Ok(())
+}
+
 // ── CLI ──────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -706,6 +715,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let generator = generator.unwrap();
+    validate_generator_access(&generator)?;
 
     // ── Fix loop mode ──
     let work_dir = if cli.path.is_file() {
