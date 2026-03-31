@@ -1,5 +1,19 @@
 # Changelog
 
+### v3.6 — OpenCode Code Generator (`84b9bb5`)
+
+**Added:**
+- `--opencode` CLI flag: enables fix loop using OpenCode CLI as an alternative to `--claude`.
+- `CodeGenerator` enum (`Claude | Opencode`) in `types.rs` for extensible code generator selection.
+- `codegen.rs` module: shared prompt builder, dispatch function, and per-generator subprocess runners.
+- Mutual exclusivity validation: `--claude` and `--opencode` cannot be used together.
+
+**Refactored:**
+- Extracted `run_claude()` from `main.rs` into `codegen.rs` with shared `build_prompt()`.
+- Config fingerprint now includes the `opencode` flag.
+
+**Net: +1 file (codegen.rs), -88 lines from main.rs refactor. 38/38 tests pass.**
+
 ### v3.5 — Stale Docstring Purge (`0c0c42f`)
 
 **Removed:**

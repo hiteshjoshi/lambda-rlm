@@ -38,15 +38,21 @@ export FIREWORKS_API="your-key-here"
 
 Why Fireworks and not OpenAI/Anthropic directly? Fireworks routes to the best available model behind their API, Kimi K2.5 Turbo is free via Fire Pass, and their endpoint handles streaming for large outputs. You can swap models with `--model` if you have access to others.
 
-### Claude Code CLI (optional)
+### Code generator CLI (optional)
 
-The `--claude` flag enables an autonomous fix loop where lambda-RLM analyzes your code, hands findings to Claude Code, Claude fixes the issues, and lambda-RLM re-analyzes until clean. This requires Claude Code installed:
+The fix loop uses a code generator (Claude Code or OpenCode) to act on lambda-RLM's analysis. Pick one:
 
+**Claude Code** (`--claude`):
 ```bash
 npm install -g @anthropic-ai/claude-code
 ```
 
-This uses your Anthropic API key / Claude subscription separately from Fireworks. The two systems work together: Fireworks does the cheap, parallelized analysis; Claude does the expensive, targeted code editing.
+**OpenCode** (`--opencode`):
+```bash
+# Install opencode per https://github.com/sst/opencode
+```
+
+Both work the same way: Fireworks does the cheap, parallelized analysis; the code generator does the targeted code editing. The two flags are mutually exclusive.
 
 ## Usage
 
@@ -75,12 +81,16 @@ lambda_rlm -p ./src -q "test" --dry-run
 
 Task type is auto-detected if you don't pass `-t`.
 
-## Claude fix loop
+## Fix loop
 
-This is the main thing. Point lambda-RLM at your code with a question, add `--claude`, and walk away:
+This is the main thing. Point lambda-RLM at your code with a question, add `--claude` or `--opencode`, and walk away:
 
 ```bash
+# Using Claude Code
 lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --claude
+
+# Using OpenCode
+lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --opencode
 ```
 
 What happens:
@@ -89,13 +99,13 @@ What happens:
  Iteration 1:
    lambda-RLM analyzes codebase (Fireworks, parallelized)
      → finds 5 issues
-   Claude Code reads findings, edits files, commits
+   Code generator reads findings, edits files, commits
      → fixes 5 issues
 
  Iteration 2:
    lambda-RLM re-analyzes (fresh scan of modified code)
      → finds 1 remaining issue
-   Claude Code fixes it, commits
+   Code generator fixes it, commits
 
  Iteration 3:
    lambda-RLM re-analyzes
@@ -113,7 +123,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Claude runs with `--dangerously-skip-permissions` in `-p` (print) mode — fully autonomous, no prompts. Logs for each iteration are saved to `.lambda-rlm-claude-{n}.log` in the target directory.
+Both generators run in print mode — fully autonomous, no prompts. Logs are saved to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory.
 
 ## How it works
 
@@ -164,7 +174,8 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--concurrency` | `8` | Max parallel LLM calls |
 | `--model` | `kimi-k2p5-turbo` | Fireworks model ID |
 | `--max-tokens` | `8192` | Max output tokens |
-| `--claude` | `false` | Enable autonomous fix loop |
+| `--claude` | `false` | Enable fix loop with Claude Code |
+| `--opencode` | `false` | Enable fix loop with OpenCode |
 | `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
 | `--no-cache` | `false` | Disable replay cache |
@@ -176,8 +187,9 @@ Six task types, each with specialized leaf prompts and reduce operators:
 
 ```
 src/
-  main.rs        — CLI, file collector, claude loop driver
-  types.rs       — TaskType enum (shared across modules)
+  main.rs        — CLI, file collector, fix loop driver
+  types.rs       — TaskType, CodeGenerator enums (shared across modules)
+  codegen.rs     — post-RLM code generation: Claude CLI / OpenCode CLI dispatch
   combinator.rs  — structural chunking, keyword extraction, text splitting
   oracle.rs      — Fireworks API client, semaphore, retries, streaming
   resilience.rs  — circuit breaker, RAII budget guard, replay cache (blake3)
