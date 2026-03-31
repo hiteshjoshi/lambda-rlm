@@ -210,11 +210,11 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `0044f18`
+Latest fix-loop hardening commit: `3c139ae`
 
-- Hardened code-generator lifecycle in `codegen.rs`: both Claude and OpenCode now always clean up `.lambda-rlm-result.md`, including timeout and spawn-failure paths, preventing stale state across fix-loop iterations.
-- Increased OpenCode timeout to match Claude's 15-minute budget to handle cold starts and large repos without premature timeout churn.
-- Added a clap `ArgGroup` for `--claude`/`--opencode` and switched aggregate-byte accounting to `checked_add` in `collect_source_files` to eliminate overflow risk under extreme inputs.
+- Added shared budget governance for codegen in `codegen.rs`: each Claude/OpenCode run reserves from the same call budget pool with RAII rollback on failure, preventing analysis starvation.
+- Added a dedicated codegen circuit breaker (3 failures, 60s cooldown) and stricter output validation for both generators (size/NUL/empty checks) to fail fast on broken or malformed CLI output.
+- Refactored `main.rs` to reuse one Oracle per fix-loop iteration and added symlink-safe result target validation before handoff; telemetry now includes per-generator call and latency counters from `oracle.rs`.
 
 See [CHANGELOG.md](CHANGELOG.md).
 
