@@ -210,11 +210,11 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `3c139ae`
+Latest fix-loop hardening commit: `d3e99d9`
 
-- Added shared budget governance for codegen in `codegen.rs`: each Claude/OpenCode run reserves from the same call budget pool with RAII rollback on failure, preventing analysis starvation.
-- Added a dedicated codegen circuit breaker (3 failures, 60s cooldown) and stricter output validation for both generators (size/NUL/empty checks) to fail fast on broken or malformed CLI output.
-- Refactored `main.rs` to reuse one Oracle per fix-loop iteration and added symlink-safe result target validation before handoff; telemetry now includes per-generator call and latency counters from `oracle.rs`.
+- Reworked codegen subprocess execution in `src/codegen.rs` to enforce timeout kill+wait reaping, preventing zombie processes on Unix and capturing stderr for failure diagnostics.
+- Switched result file writes in `src/codegen.rs` to `tempfile::NamedTempFile` RAII persistence so temp artifacts are cleaned automatically on panic/error paths.
+- Added fail-fast generator binary preflight in `src/main.rs`, strengthened single-flight ownership in `src/oracle.rs` to avoid inflight sender overwrite races, and surfaced live budget-guard leak telemetry via `src/resilience.rs`.
 
 See [CHANGELOG.md](CHANGELOG.md).
 
