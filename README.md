@@ -187,7 +187,7 @@ src/
   phi.rs         — recursive executor (Algorithm 2)
 ```
 
-Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic-safe via Drop, production leak detection), blake3 content-addressed replay cache, structural chunking at definition boundaries, leaf verification with refusal detection, CAS backoff under contention, EXDEV-safe state persistence.
+Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget guards (panic-safe via Drop, production leak detection), blake3 content-addressed replay cache, structural chunking at definition boundaries, leaf verification with refusal detection, CAS backoff under contention.
 
 ## Environment variables
 
@@ -197,6 +197,18 @@ Hardening: circuit breaker (3 failures / 30s cooloff), RAII budget guards (panic
 | `RUST_LOG` | No | Log level: `warn` (default), `info`, `debug` |
 
 ## Changelog
+
+### v3.2 — Subtractive Optimization (`327eacd`)
+
+**Removed:**
+- Circuit breaker disk persistence: `save_state`, `load_state`, V1/V2/V3 schema parsing, blake3 checksums, EXDEV fallback, read-after-write verification. In-memory CB is sufficient for CLI usage.
+- Background cache scavenger: 6h scrub / 24h compaction timers (never fire for a CLI tool). Removes `ScrubHandle`, `compact()`, and background `tokio::spawn` task.
+- Corruption rate-limiter: exponential backoff with 4 atomic fields and CAS spin loop. Quarantine still works, rate-limiting was over-engineered.
+
+**Fixed:**
+- JoinSet drain on depth-0 errors in `phi.rs`: remaining tasks are now `abort_all` + drained before returning, ensuring `SemaphorePermit` and `BudgetGuard` RAII guards drop cleanly.
+
+**Net: -894 lines removed, +26 added. 38/38 tests pass.**
 
 ### v3.1 — Resilience & Performance Hardening (`4527ee1`)
 
