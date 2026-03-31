@@ -210,7 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `ee822a3`
+Latest fix-loop hardening commit: `892138e`
+
+- Enforced Oracle resource acquisition as a typed RAII stack in `src/oracle.rs` (`Budget -> Cache -> Bulkhead`), added inflight leak gauges/invariants, and exposed production metrics (`cache hit rate`, `circuit state`, `budget guard live`, `inflight count`).
+- Switched SSE buffering in `src/oracle.rs` from `Vec<u8>` growth/drain patterns to `bytes::BytesMut` to reduce hot-path realloc/copy pressure during streamed token decoding.
+- Added JoinSet pooling to `src/phi.rs` and wired shared pool ownership from `src/main.rs` to reduce recursive task-allocation churn under deep decomposition.
+- Hardened `.lambda-rlm-result.md` write validation in `src/codegen.rs` with `O_NOFOLLOW`-style preflight and aligned Claude/OpenCode summary extraction to a single terminal-line contract.
+- Changed oversized source collection in `src/main.rs` from hard-fail to bounded truncation with explicit marker comments, preserving forward progress on large repositories.
 
 - Replaced Oracle single-flight dedup state in `src/oracle.rs` from a global `Mutex<HashMap<...>>` to sharded `DashMap`, removing the global lock bottleneck under concurrent same-key requests.
 - Added panic-safe `catch_unwind` protection in `BudgetGuard::drop` (`src/resilience.rs`) so budget restoration cannot trigger double-panic abort paths.
