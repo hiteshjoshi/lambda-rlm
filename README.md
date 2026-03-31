@@ -198,6 +198,14 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+### v3.5 — Stale Docstring Purge (`0c0c42f`)
+
+**Removed:**
+- CircuitBreaker header comment referencing disk persistence (removed in v3.2).
+- `quarantine()` docstring describing rate-limiting/exponential backoff (removed in v3.2).
+
+**Net: -5 lines removed. 38/38 tests pass.**
+
 ### v3.4 — Env Var Purge & CB Rejuvenation (`40c0188`)
 
 **Removed:**
