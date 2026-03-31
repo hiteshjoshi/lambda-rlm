@@ -210,7 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `79f819b`
+Latest fix-loop hardening commit: `0900834`
+
+- Hardened code-generator subprocess lifecycle in `src/codegen.rs` so spawned processes are explicitly killed and reaped on timeout and on stdout/stderr capture failures, eliminating zombie risk under repeated fix-loop iterations.
+- Switched codegen breaker initialization in `src/codegen.rs` to independent per-generator `OnceLock` instances, preserving Claude/OpenCode fault isolation.
+- Made `BudgetGuard` in `src/resilience.rs` atomic-commit safe to prevent double-release on unwind/cancellation edge paths, and added loom race coverage for half-open probe gating.
+- Updated `abort_and_drain` in `src/phi.rs` to `detach_all()` after bounded abort-drain timeout so lingering blocked tasks cannot accumulate join handles.
+- Added final top-level error sanitization in `src/main.rs` to return `Not Found` while logging full internal error chains, and documented/verified Oracle↔Phi single-flight ownership invariants with race-focused tests.
 
 - Centralized Claude/OpenCode summary extraction in `src/codegen.rs` with explicit per-generator output invariants and dedicated tests, reducing parser drift risk.
 - Added `CodegenBudgetGuard` drop-path telemetry in `src/codegen.rs` so cancelled/failed codegen runs visibly restore reserved budget units.
