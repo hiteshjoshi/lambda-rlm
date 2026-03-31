@@ -34,7 +34,7 @@ mod types;
 mod verify;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -86,7 +86,8 @@ use verify::Verifier;
 #[derive(Parser)]
 #[command(
     name = "lambda_rlm",
-    about = "lambda-RLM v3: Hardened functional runtime for long-context reasoning (arXiv:2603.20105)"
+    about = "lambda-RLM v3: Hardened functional runtime for long-context reasoning (arXiv:2603.20105)",
+    group = ArgGroup::new("code_generator").args(["claude", "opencode"]).multiple(false)
 )]
 struct Cli {
     /// Path to scan (file or directory)
@@ -295,7 +296,13 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
     // Manual stack-based directory walk (replaces walkdir crate, -10 transitive deps).
     let skip_dirs: &[&str] = &[
-        "node_modules", "target", "dist", "build", "__pycache__", ".git", "vendor",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "__pycache__",
+        ".git",
+        "vendor",
     ];
     let mut stack: Vec<PathBuf> = vec![canonical_root.clone()];
     while let Some(dir) = stack.pop() {
@@ -384,7 +391,12 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                 #[cfg(not(unix))]
                 let _ = (open_dev, open_ino);
 
-                accumulated_bytes += size;
+                accumulated_bytes = accumulated_bytes.checked_add(size).with_context(|| {
+                    format!(
+                        "Aggregate size overflow while scanning {}",
+                        file_path.display()
+                    )
+                })?;
                 if accumulated_bytes > MAX_AGGREGATE_BYTES {
                     anyhow::bail!(
                         "Aggregate source size {} bytes exceeds {} byte limit after {} files",
@@ -536,13 +548,13 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
                 // SIGHUP: allows systemd/kubernetes to trigger clean restart
                 // with new env vars (config reload) without SIGKILL. phi()
                 // drains in-flight work via the shutdown channel before exit.
-                let mut sighup = signal(SignalKind::hangup())
-                    .expect("failed to install SIGHUP handler");
+                let mut sighup =
+                    signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
                 tokio::select! {
                     _ = ctrl_c => {},
                     _ = sigterm.recv() => {},
@@ -574,11 +586,13 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
     let trace_id: [u8; 16] = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(cli.question.as_bytes());
-        hasher.update(&std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_le_bytes());
+        hasher.update(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes(),
+        );
         hasher.update(&(std::process::id() as u64).to_le_bytes());
         let hash = hasher.finalize();
         let mut id = [0u8; 16];
@@ -717,14 +731,9 @@ async fn main() -> Result<()> {
         }
 
         // 3. Hand to code generator
-        let summary = codegen::run_code_generator(
-            &generator,
-            &result,
-            &work_dir,
-            &cli.question,
-            iteration,
-        )
-        .await?;
+        let summary =
+            codegen::run_code_generator(&generator, &result, &work_dir, &cli.question, iteration)
+                .await?;
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");

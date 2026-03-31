@@ -13,7 +13,7 @@ use crate::types::CodeGenerator;
 
 const RESULT_FILE_NAME: &str = ".lambda-rlm-result.md";
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const OPENCODE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const OPENCODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 
@@ -183,59 +183,63 @@ async fn run_claude(
 ) -> Result<String> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
-    let log_file = work_dir.join(format!(".lambda-rlm-claude-{iteration}.log"));
+    let run = async {
+        let log_file = work_dir.join(format!(".lambda-rlm-claude-{iteration}.log"));
 
-    eprintln!(
-        ">>> Iteration {iteration}: launching claude in {} ...",
-        work_dir.display()
-    );
-    let prompt = build_prompt(question, iteration);
+        eprintln!(
+            ">>> Iteration {iteration}: launching claude in {} ...",
+            work_dir.display()
+        );
+        let prompt = build_prompt(question, iteration);
 
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("--dangerously-skip-permissions")
-        .arg("-p")
-        .arg(&prompt)
-        .current_dir(work_dir)
-        .stdin(Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        let mut cmd = tokio::process::Command::new("claude");
+        cmd.arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .arg(&prompt)
+            .current_dir(work_dir)
+            .stdin(Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        let child = cmd
+            .spawn()
+            .context("Failed to spawn `claude` — is it installed and on PATH?")?;
+
+        let output = match timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
+            Ok(output) => output.context("Failed to run claude")?,
+            Err(_) => anyhow::bail!("claude timed out"),
+        };
+
+        // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
+        // corrupting data that feeds downstream hashing and content analysis.
+        let stdout = String::from_utf8(output.stdout)
+            .context("claude subprocess produced invalid UTF-8 on stdout")?;
+
+        // Save full output to log — warn on failure rather than swallowing
+        if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
+            tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
+        }
+        cleanup_old_logs(work_dir, &CodeGenerator::Claude);
+
+        if !output.status.success() {
+            tracing::error!(status = %output.status, "claude exited with failure status");
+            anyhow::bail!("claude execution failed");
+        }
+
+        let summary = first_non_empty_line(&stdout);
+
+        Ok(summary)
     }
-
-    let child = cmd
-        .spawn()
-        .context("Failed to spawn `claude` — is it installed and on PATH?")?;
-
-    let output = timeout(CLAUDE_TIMEOUT, child.wait_with_output())
-        .await
-        .context("claude timed out")?
-        .context("Failed to run claude")?;
+    .await;
 
     remove_result_file(work_dir).await;
-
-    // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
-    // corrupting data that feeds downstream hashing and content analysis.
-    let stdout = String::from_utf8(output.stdout)
-        .context("claude subprocess produced invalid UTF-8 on stdout")?;
-
-    // Save full output to log — warn on failure rather than swallowing
-    if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
-        tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
-    }
-    cleanup_old_logs(work_dir, &CodeGenerator::Claude);
-
-    if !output.status.success() {
-        tracing::error!(status = %output.status, "claude exited with failure status");
-        anyhow::bail!("claude execution failed");
-    }
-
-    let summary = first_non_empty_line(&stdout);
-
-    Ok(summary)
+    run
 }
 
 /// Spawn opencode in non-interactive mode and wait for it to finish.
@@ -251,58 +255,62 @@ async fn run_opencode(
 ) -> Result<String> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
-    let log_file = work_dir.join(format!(".lambda-rlm-opencode-{iteration}.log"));
+    let run = async {
+        let log_file = work_dir.join(format!(".lambda-rlm-opencode-{iteration}.log"));
 
-    eprintln!(
-        ">>> Iteration {iteration}: launching opencode in {} ...",
-        work_dir.display()
-    );
-    let prompt = build_prompt(question, iteration);
+        eprintln!(
+            ">>> Iteration {iteration}: launching opencode in {} ...",
+            work_dir.display()
+        );
+        let prompt = build_prompt(question, iteration);
 
-    let mut cmd = tokio::process::Command::new("opencode");
-    cmd.arg("run")
-        .arg("--file")
-        .arg(".lambda-rlm-result.md")
-        .arg("--")
-        .arg(&prompt)
-        .current_dir(work_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        let mut cmd = tokio::process::Command::new("opencode");
+        cmd.arg("run")
+            .arg("--file")
+            .arg(".lambda-rlm-result.md")
+            .arg("--")
+            .arg(&prompt)
+            .current_dir(work_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        let child = cmd
+            .spawn()
+            .context("Failed to spawn `opencode` — is it installed and on PATH?")?;
+
+        let output = match timeout(OPENCODE_TIMEOUT, child.wait_with_output()).await {
+            Ok(output) => output.context("Failed to run opencode")?,
+            Err(_) => anyhow::bail!("opencode timed out"),
+        };
+
+        let stdout = String::from_utf8(output.stdout)
+            .context("opencode subprocess produced invalid UTF-8 on stdout")?;
+
+        if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
+            tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
+        }
+        cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
+
+        if !output.status.success() {
+            tracing::error!(status = %output.status, "opencode exited with failure status");
+            anyhow::bail!("opencode execution failed");
+        }
+
+        let summary = last_non_empty_line(&stdout);
+
+        Ok(summary)
     }
-
-    let child = cmd
-        .spawn()
-        .context("Failed to spawn `opencode` — is it installed and on PATH?")?;
-
-    let output = timeout(OPENCODE_TIMEOUT, child.wait_with_output())
-        .await
-        .context("opencode timed out")?
-        .context("Failed to run opencode")?;
+    .await;
 
     remove_result_file(work_dir).await;
-
-    let stdout = String::from_utf8(output.stdout)
-        .context("opencode subprocess produced invalid UTF-8 on stdout")?;
-
-    if let Err(e) = tokio::fs::write(&log_file, &stdout).await {
-        tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
-    }
-    cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
-
-    if !output.status.success() {
-        tracing::error!(status = %output.status, "opencode exited with failure status");
-        anyhow::bail!("opencode execution failed");
-    }
-
-    let summary = last_non_empty_line(&stdout);
-
-    Ok(summary)
+    run
 }
 
 /// Log file name for the given generator and iteration.
