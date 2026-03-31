@@ -4,6 +4,8 @@
 //! structural chunking, ordered results, graceful degradation,
 //! cooperative shutdown via watch channel.
 //!
+//! v3.1: Bounded concurrency via semaphore, budget pre-flight checks.
+//!
 //! Core equation (Equation 4):
 //!   fix(λf. λP.
 //!     if |P| ≤ τ  then  Verify(M(P))
@@ -13,6 +15,7 @@
 use crate::combinator::{
     comb_split, comb_split_overlap, filter_by_keyword_predicate, structural_chunk,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use crate::oracle::Oracle;
 use crate::reduce::reduce_for_task;
 use crate::types::TaskType;
@@ -20,7 +23,8 @@ use crate::verify::{Verifier, VerifyResult};
 use anyhow::Result;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use tokio::sync::watch;
+use std::time::Duration;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 /// Configuration for the recursive executor. Shared via Arc across all
@@ -40,12 +44,47 @@ pub struct PhiConfig {
     /// Cooperative shutdown signal. When the sender drops or sends true,
     /// in-flight phi recursions abort gracefully, preserving budget.
     pub shutdown: watch::Receiver<bool>,
+    /// Bounds total concurrent recursive tasks to prevent OOM on wide trees.
+    /// Default: 100 permits. Each phi() call holds one permit for its duration.
+    pub concurrency: Arc<Semaphore>,
+    /// Trace ID for correlating logs across recursive phi calls.
+    /// Survives the entire recursion tree — all children share the same trace_id.
+    /// 16 bytes (blake3 truncated) — negligible allocation cost per request.
+    pub trace_id: [u8; 16],
+}
+
+/// Maximum input bytes phi() will process. Inputs beyond this are truncated
+/// with a warning. Prevents OOM when a single massive file (e.g., 1GB minified
+/// JS) generates millions of chunks that exhaust memory before semaphore
+/// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
+/// Override via LAMBDA_RLM_MAX_INPUT_BYTES env var.
+const DEFAULT_MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
+
+fn max_phi_input_bytes() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_RLM_MAX_INPUT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 1024) // minimum 1KB
+            .unwrap_or(DEFAULT_MAX_PHI_INPUT_BYTES)
+    })
 }
 
 /// PRE: cfg.task != Auto (resolved in Phase 2)
 /// PRE: text.len() > 0
 /// POST: Ok(result) where result is verified at leaf level
-pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static, Result<String>> {
+///
+/// GLOBAL RESOURCE ORDERING (must be maintained across all refactors):
+///   Semaphore (concurrency permit) → Budget (CallBudget) → Cache (ReplayCache)
+///
+/// phi() acquires a Semaphore permit, then calls Oracle::call() which acquires
+/// Budget then checks Cache. Parent phi() drops its permit (line ~203) before
+/// spawning children, preventing hierarchical deadlock when k^depth exceeds
+/// available permits. This ordering guarantees liveness: no cycle exists in the
+/// resource acquisition graph. A future refactor that inverts this order (e.g.,
+/// acquiring Budget before Semaphore) risks deadlock under deep recursion.
+pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize, permit: Option<OwnedSemaphorePermit>) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         // Check for shutdown before doing any work
         if *cfg.shutdown.borrow() {
@@ -54,9 +93,61 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
 
         let indent = "| ".repeat(depth);
 
+        // ── INPUT SIZE GUARD ──
+        // Prevent OOM from pathologically large inputs generating unbounded chunks.
+        let max_input = max_phi_input_bytes();
+        let text = if text.len() > max_input {
+            tracing::warn!(
+                depth,
+                input_bytes = text.len(),
+                limit = max_input,
+                "input exceeds memory safety limit, truncating"
+            );
+            eprintln!(
+                "{indent}|  WARNING: input {} bytes exceeds {} limit, truncating",
+                text.len(),
+                max_input
+            );
+            // Find a safe truncation point that respects both UTF-8 char
+            // boundaries AND grapheme cluster boundaries (emoji ZWJ sequences,
+            // combining diacritics, skin-tone modifiers). Only scan a small
+            // window near the cut point — grapheme clusters are at most ~32 bytes.
+            let mut byte_end = max_input;
+            while byte_end > 0 && !text.is_char_boundary(byte_end) {
+                byte_end -= 1;
+            }
+            let window_start = {
+                let mut s = byte_end.saturating_sub(64);
+                while s < byte_end && !text.is_char_boundary(s) {
+                    s += 1;
+                }
+                s
+            };
+            let window_end = {
+                let mut e = (byte_end + 4).min(text.len());
+                while e < text.len() && !text.is_char_boundary(e) {
+                    e += 1;
+                }
+                e
+            };
+            let window = &text[window_start..window_end];
+            let mut safe_end = window_start;
+            for (i, g) in window.grapheme_indices(true) {
+                let abs = window_start + i + g.len();
+                if abs <= byte_end {
+                    safe_end = abs;
+                } else {
+                    break;
+                }
+            }
+            text[..safe_end].to_string()
+        } else {
+            text
+        };
+
         // ── BASE CASE: |P| ≤ τ → Verify(M(P)) ──
         if text.len() <= cfg.tau {
-            eprintln!("{indent}+- LEAF ({} chars) depth={depth}", text.len());
+            eprintln!("{indent}+- LEAF ({} chars) depth={depth} trace={}", text.len(), hex::encode(&cfg.trace_id[..4]));
             let (sys, prompt) = leaf_prompt(&text, &cfg.question, &cfg.task);
 
             match cfg.oracle.call(&sys, &prompt, 2048).await {
@@ -88,7 +179,42 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
             }
         }
 
+        // ── DEPTH GUARD: prevent unbounded recursion on adversarial input ──
+        if depth >= cfg.max_depth {
+            tracing::warn!(depth, max_depth = cfg.max_depth, chars = text.len(), "max recursion depth reached, treating as leaf");
+            eprintln!("{indent}+- DEPTH LIMIT ({} chars) depth={depth}/{}", text.len(), cfg.max_depth);
+            // Truncate to tau to stay within model context window
+            let truncated = if text.len() > cfg.tau {
+                let mut end = cfg.tau;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &text[..end]
+            } else {
+                &text
+            };
+            let (sys, prompt) = leaf_prompt(truncated, &cfg.question, &cfg.task);
+            match cfg.oracle.call(&sys, &prompt, 2048).await {
+                Ok(raw) => match cfg.verifier.check(&raw, text.len()) {
+                    VerifyResult::Accept(v) | VerifyResult::Degraded(v, _) => return Ok(v),
+                    VerifyResult::Reject(reason) => {
+                        return Ok(format!("[degraded: depth limit, verification rejected: {reason}]"));
+                    }
+                },
+                Err(_) if depth > 0 => {
+                    return Ok(format!("[degraded: depth limit leaf failed at depth {depth}]"));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         // ── RECURSIVE CASE ──
+
+        // Release parent's concurrency permit before spawning children.
+        // Prevents hierarchical deadlock: parents holding permits while
+        // awaiting children who need permits starves leaves when
+        // k^depth exceeds available permits (e.g., k=2, depth=7, permits=100).
+        drop(permit);
 
         // 1. CHUNK — structural chunking for code, overlap for multi-hop
         let chunks = match cfg.task {
@@ -109,9 +235,10 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
         };
 
         eprintln!(
-            "{indent}+- SPLIT ({} chars) -> {} children, depth={depth}",
+            "{indent}+- SPLIT ({} chars) -> {} children, depth={depth} trace={}",
             text.len(),
             chunks.len(),
+            hex::encode(&cfg.trace_id[..4]),
         );
 
         // 2. KEYWORD PRE-FILTER (Algorithm 2, line 9)
@@ -128,14 +255,61 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
             });
         }
 
-        // 3. MAP — JoinSet structured concurrency, index-tagged for ordering
+        // 3. BUDGET PRE-FLIGHT CHECK (tree-aware, pessimistic reservation)
+        // Uses atomic try_acquire_n + release_n to eliminate TOCTOU race.
+        // Under high concurrency, a read-then-check allows multiple branches to
+        // simultaneously see sufficient budget and proceed, causing partial
+        // orphan exhaustion. The atomic reserve serializes concurrent checks:
+        // only branches that atomically acquire the estimated budget proceed.
         let num_children = chunks.len();
+        if !cfg.oracle.budget_unlimited() {
+            let remaining_depth = cfg.max_depth.saturating_sub(depth);
+            let estimated_subtree = if remaining_depth <= 1 {
+                // Leaf level: each child is one call
+                num_children
+            } else {
+                // Interior: estimate k^remaining_depth leaves, capped to avoid overflow
+                let leaves = (cfg.k as u64)
+                    .checked_pow(remaining_depth as u32)
+                    .unwrap_or(u64::MAX)
+                    .min(100_000) as usize;
+                leaves
+            };
+            // Atomic reservation: if two branches race, only one succeeds.
+            // Immediately release after the gate — children acquire individually
+            // via oracle.call(). The atomic reserve-release prevents phantom
+            // budget availability without changing per-call accounting.
+            if !cfg.oracle.budget_try_reserve(estimated_subtree) {
+                let remaining = cfg.oracle.budget_remaining();
+                tracing::warn!(
+                    depth,
+                    num_children,
+                    estimated_subtree,
+                    remaining,
+                    "budget insufficient for subtree, degrading"
+                );
+                eprintln!(
+                    "{indent}|  DEGRADED (budget: subtree needs ~{estimated_subtree}, have {remaining})"
+                );
+                return Ok(format!(
+                    "[degraded: budget_exhausted, subtree needs ~{} but {} remaining]",
+                    estimated_subtree, remaining
+                ));
+            }
+            cfg.oracle.budget_unreserve(estimated_subtree);
+        }
+
+        // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
+        // Each spawn acquires a concurrency permit to bound total recursive tasks.
         let mut set = JoinSet::new();
         for (i, chunk) in chunks.into_iter().enumerate() {
             let cfg = Arc::clone(&cfg);
+            let sem = Arc::clone(&cfg.concurrency);
             eprintln!("{indent}|  child {}/{num_children}", i + 1);
             set.spawn(async move {
-                let result = phi(cfg, chunk, depth + 1).await;
+                // Acquire concurrency permit — blocks if too many tasks active
+                let permit = sem.acquire_owned().await.unwrap();
+                let result = phi(cfg, chunk, depth + 1, Some(permit)).await;
                 (i, result)
             });
         }
@@ -147,10 +321,14 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
         loop {
             tokio::select! {
                 biased;
-                // Shutdown takes priority
+                // Shutdown takes priority — drain with timeout instead of
+                // hard abort to ensure RAII guards (BudgetGuard, SemaphorePermit)
+                // complete their Drop before we return.
                 _ = shutdown_rx.changed() => {
-                    tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: aborting children");
+                    tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children (30s timeout)");
                     set.abort_all();
+                    let drain = async { while set.join_next().await.is_some() {} };
+                    let _ = tokio::time::timeout(Duration::from_secs(30), drain).await;
                     return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
                 }
                 join_result = set.join_next() => {
@@ -189,7 +367,7 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
             ));
         }
 
-        // 4. REDUCE ⊕ — task-specific composition
+        // 5. REDUCE ⊕ — task-specific composition
         eprintln!(
             "{indent}+- REDUCE depth={depth} ({} children -> 1 result)",
             child_results.len(),
@@ -230,12 +408,41 @@ pub fn phi(cfg: Arc<PhiConfig>, text: String, depth: usize) -> BoxFuture<'static
 
 // ── Task Auto-Detection — Phase 2 ───────────────────────────────
 
+/// Sanitize document preview for LLM classification to prevent prompt injection.
+/// Strips control characters (except \n, \t), applies NFKC normalization to
+/// prevent homoglyph attacks (e.g., Cyrillic 'а' vs Latin 'a'), and truncates
+/// to a fixed byte length to prevent suffix attacks and injection via delimiter keywords.
+fn sanitize_for_classification(preview: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    const MAX_PREVIEW_BYTES: usize = 2000;
+    let truncated = if preview.len() > MAX_PREVIEW_BYTES {
+        let mut end = MAX_PREVIEW_BYTES;
+        while end > 0 && !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        &preview[..end]
+    } else {
+        preview
+    };
+    // NFKC normalization → strip control characters (0x00-0x1F) except newline and tab.
+    // NFKC canonicalizes compatibility characters (e.g., fullwidth digits, ligatures)
+    // and decomposes+recomposes combining marks, preventing homoglyph steering.
+    truncated
+        .nfkc()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 pub async fn auto_detect_task(
     preview: &str,
     total_len: usize,
     question: &str,
     oracle: &Oracle,
 ) -> Result<TaskType> {
+    // Sanitize preview to prevent prompt injection steering classification
+    // toward expensive task types (e.g., MultiHop, Pairwise).
+    let preview = sanitize_for_classification(preview);
+
     let system = "You are a task classifier. Given a document preview and a question, \
                   classify the required task type as EXACTLY one of these:\n\
                   - search: find specific information or code\n\

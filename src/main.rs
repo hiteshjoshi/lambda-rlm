@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! λ-RLM v3: Hardened, modular implementation of the λ-RLM framework.
 //! Paper: "The Y-Combinator for LLMs: Solving Long-Context Rot with λ-Calculus"
 //! (Roy et al., arXiv:2603.20105, March 2026)
@@ -31,14 +32,88 @@ mod resilience;
 mod types;
 mod verify;
 
+// ── Safe process-group wrappers (Unix) ───────────────────────────
+// Zero `unsafe` — uses std::process::CommandExt::process_group for PGID
+// and nix crate safe wrappers for signal delivery. All POSIX FFI is
+// encapsulated in audited crates; this module is #![forbid(unsafe_code)] clean.
+#[cfg(unix)]
+mod unix_process_guard {
+    use nix::sys::signal::{kill, killpg, Signal};
+    use nix::unistd::Pid;
+
+    /// Send a signal to an entire process group identified by a child PID.
+    ///
+    /// INVARIANTS:
+    /// - `child_pid` must be > 0 (from a child we spawned)
+    /// - The child must have been configured with `cmd.process_group(0)`
+    ///   so that `child_pid` is a valid PGID
+    ///
+    /// PID reuse protection: verifies the process still exists via kill(pid, 0)
+    /// before sending the real signal. POSIX allows PID reuse after a process
+    /// exits — without this check, we could signal an innocent process group.
+    /// This is TOCTOU but reduces the window from unbounded to microseconds.
+    ///
+    /// Returns true if the signal was delivered, false on error (e.g., ESRCH).
+    pub fn kill_process_group(child_pid: u32, signal: Signal) -> bool {
+        if child_pid == 0 {
+            // PID 0 would signal our own process group — never correct here
+            return false;
+        }
+        let pid = Pid::from_raw(child_pid as i32);
+        // Verify the process (group leader) still exists before signaling.
+        // kill(pid, None) sends signal 0: checks permissions without delivering.
+        // ESRCH = process gone (possibly recycled PID), abort.
+        // EPERM = process exists but we lack permission (unexpected for our child).
+        match kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return false,
+            _ => {} // Ok or EPERM — process exists, proceed
+        }
+        // killpg targets the process group directly (no negative-PID arithmetic).
+        killpg(pid, signal).is_ok()
+    }
+}
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use walkdir::WalkDir;
+
+/// Open a file with atomic symlink protection and return (File, size_bytes, inode).
+/// Returns None if the file is a symlink or cannot be opened.
+/// On Unix, uses O_NOFOLLOW to atomically reject symlinks.
+/// Size is obtained via fstat on the open fd, eliminating the TOCTOU gap
+/// between size check and read (an attacker cannot swap a small file for
+/// a large one between check and open).
+/// Returns (dev, ino) from fstat for caller-side inode verification.
+#[cfg(unix)]
+fn open_file_no_follow(path: &std::path::Path) -> Option<(std::fs::File, u64, u64, u64)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    Some((file, meta.len(), meta.dev(), meta.ino()))
+}
+
+/// On non-Unix (Windows), check symlink_metadata before opening to reject
+/// symlinks/junctions. Not fully atomic like O_NOFOLLOW, but closes the
+/// common case and prevents directory traversal via reparse points.
+/// dev/ino returned as 0 — inode verification not available on Windows.
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &std::path::Path) -> Option<(std::fs::File, u64, u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    Some((file, size, 0, 0))
+}
 
 use combinator::{comb_peek, extract_keywords};
 use cost::{composition_desc, compute_plan, pipeline_desc, CostModel};
@@ -148,6 +223,12 @@ struct Cli {
     max_iterations: usize,
 }
 
+/// Schema version for CLI configuration. Bump when adding/removing/renaming
+/// parameters that change runtime behavior. Logged at startup alongside a
+/// blake3 hash of effective values — any config drift across deployments
+/// is observable in logs without requiring code changes.
+const CONFIG_SCHEMA_VERSION: u32 = 1;
+
 impl Cli {
     /// Fail fast on invalid parameter combinations before spending API budget.
     fn validate(&self) -> Result<()> {
@@ -169,6 +250,30 @@ impl Cli {
         anyhow::ensure!(self.timeout > 0, "timeout must be > 0");
         Ok(())
     }
+
+    /// Compute a blake3 fingerprint of the effective configuration.
+    /// Logged at startup so operators can detect config drift across
+    /// deployments without comparing individual env var values.
+    fn config_fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&CONFIG_SCHEMA_VERSION.to_le_bytes());
+        hasher.update(self.model.as_bytes());
+        hasher.update(&(self.window as u64).to_le_bytes());
+        hasher.update(&(self.k as u64).to_le_bytes());
+        hasher.update(&(self.concurrency as u64).to_le_bytes());
+        hasher.update(&self.rho.to_le_bytes());
+        hasher.update(&self.alpha.to_le_bytes());
+        hasher.update(&(self.overlap as u64).to_le_bytes());
+        hasher.update(&(self.context_window as u64).to_le_bytes());
+        hasher.update(&self.max_tokens.to_le_bytes());
+        hasher.update(&self.timeout.to_le_bytes());
+        hasher.update(&(self.max_calls as u64).to_le_bytes());
+        hasher.update(&(self.max_retries as u64).to_le_bytes());
+        hasher.update(&(self.max_cache_entries as u64).to_le_bytes());
+        hasher.update(&[self.quorum as u8, self.no_cache as u8, self.dry_run as u8]);
+        let hash = hasher.finalize();
+        format!("v{}:{}", CONFIG_SCHEMA_VERSION, &hash.to_hex()[..16])
+    }
 }
 
 // ── File Collector ───────────────────────────────────────────────
@@ -178,6 +283,11 @@ impl Cli {
 ///
 /// Security: canonicalizes the root path and verifies every entry stays
 /// within it. Symlinks that escape the root are skipped.
+/// Maximum aggregate bytes to collect. Prevents heap exhaustion from
+/// scanning enormous repositories or zip bombs before chunking begins.
+/// 1GB accommodates large monorepos while protecting against pathological inputs.
+const MAX_AGGREGATE_BYTES: u64 = 1024 * 1024 * 1024;
+
 fn collect_source_files(path: &PathBuf) -> Result<String> {
     let extensions = [
         "rs", "ts", "js", "py", "svelte", "toml", "yaml", "yml", "json", "go", "java", "c", "cpp",
@@ -189,6 +299,15 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         .with_context(|| format!("Cannot resolve path: {}", path.display()))?;
 
     if canonical_root.is_file() {
+        let meta = std::fs::metadata(&canonical_root)
+            .with_context(|| format!("Cannot stat {}", canonical_root.display()))?;
+        if meta.len() > MAX_AGGREGATE_BYTES {
+            anyhow::bail!(
+                "Single file {} bytes exceeds {} byte aggregate limit",
+                meta.len(),
+                MAX_AGGREGATE_BYTES
+            );
+        }
         let content = std::fs::read_to_string(&canonical_root)
             .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
         return Ok(format!("// === {} ===\n{}", path.display(), content));
@@ -197,6 +316,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
     let mut all_code = String::new();
     let mut file_count = 0usize;
     let mut skipped = 0usize;
+    let mut accumulated_bytes: u64 = 0;
 
     for entry in WalkDir::new(&canonical_root)
         .into_iter()
@@ -241,11 +361,55 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         if !extensions.contains(&ext) {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(file_path) {
-            all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
-            all_code.push_str(&content);
-            all_code.push('\n');
-            file_count += 1;
+
+        // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
+        // fstat on the open fd eliminates the TOCTOU gap: an attacker cannot
+        // swap a small file for a large one (or a FIFO) between check and read.
+        //
+        // Inode verification (Unix): compare (dev, ino) from the WalkDir
+        // entry's lstat with the fstat of the opened fd. If they differ,
+        // the file was swapped (rename/hardlink race) between readdir and
+        // open — skip it rather than reading attacker-controlled content.
+        if let Some((mut file, size, open_dev, open_ino)) = open_file_no_follow(file_path) {
+            // TOCTOU inode check: verify the opened file is the same inode
+            // the directory walker saw. Only meaningful on Unix where
+            // dev+ino uniquely identifies an inode.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(walk_meta) = std::fs::symlink_metadata(file_path) {
+                    if walk_meta.dev() != open_dev || walk_meta.ino() != open_ino {
+                        tracing::warn!(
+                            path = %file_path.display(),
+                            walk_ino = walk_meta.ino(),
+                            open_ino,
+                            "inode mismatch: file swapped between readdir and open, skipping"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = (open_dev, open_ino); // suppress unused warnings on non-Unix
+
+            accumulated_bytes += size;
+            if accumulated_bytes > MAX_AGGREGATE_BYTES {
+                anyhow::bail!(
+                    "Aggregate source size {} bytes exceeds {} byte limit after {} files",
+                    accumulated_bytes,
+                    MAX_AGGREGATE_BYTES,
+                    file_count
+                );
+            }
+            use std::io::Read;
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() {
+                all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
+                all_code.push_str(&content);
+                all_code.push('\n');
+                file_count += 1;
+            }
         }
     }
 
@@ -261,9 +425,30 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
 // ── Output dispatch ─────────────────────────────────────────────
 
-/// Spawn claude in print mode — it applies fixes and exits.
+/// Timeout for claude subprocess. Default 300s (5 minutes).
+/// Override via LAMBDA_RLM_CLAUDE_TIMEOUT_SECS environment variable.
+fn claude_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let secs: u64 = std::env::var("LAMBDA_RLM_CLAUDE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        Duration::from_secs(secs)
+    })
+}
+
+/// Spawn claude in print mode with timeout and process-group isolation.
 /// Returns Claude's output summary (first line).
-fn run_claude(
+///
+/// PRE: work_dir exists and is writable
+/// POST: claude process is dead (either exited normally or killed on timeout)
+///
+/// Hardening:
+///   - Timeout prevents indefinite hangs on a deadlocked claude process.
+///   - Unix process-group isolation (setpgid) ensures timeout kills all
+///     descendant processes, preventing orphans that hold workspace locks.
+async fn run_claude(
     result: &str,
     work_dir: &std::path::Path,
     question: &str,
@@ -291,20 +476,65 @@ fn run_claude(
             output exactly: CLEAN\n\n\
          Start by reading .lambda-rlm-result.md now.",
     );
-    let output = Command::new("claude")
-        .arg("--dangerously-skip-permissions")
+
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("--dangerously-skip-permissions")
         .arg("-p")
         .arg(&prompt)
         .current_dir(work_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Process-group isolation: child becomes its own process group leader.
+    // On timeout, we SIGTERM/SIGKILL the entire group to prevent orphans.
+    // process_group(0) is the safe equivalent of setpgid(0,0) in pre_exec.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd
+        .spawn()
         .context("Failed to spawn `claude` — is it installed and on PATH?")?;
+    let pid = child.id();
+    let timeout = claude_timeout();
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&result_file);
+            anyhow::bail!("Failed to run claude: {e}");
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                ">>> claude timed out after {}s, killing process group",
+                timeout.as_secs()
+            );
+            // Kill the entire process group to prevent orphans.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                use nix::sys::signal::Signal;
+                unix_process_guard::kill_process_group(pid, Signal::SIGTERM);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                unix_process_guard::kill_process_group(pid, Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&result_file);
+            anyhow::bail!(
+                "claude timed out after {}s (set LAMBDA_RLM_CLAUDE_TIMEOUT_SECS to adjust)",
+                timeout.as_secs()
+            );
+        }
+    };
 
     let _ = std::fs::remove_file(&result_file);
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
+    // corrupting data that feeds downstream hashing and content analysis.
+    let stdout = String::from_utf8(output.stdout)
+        .context("claude subprocess produced invalid UTF-8 on stdout")?;
 
-    // Save full output to log
-    let _ = std::fs::write(&log_file, &stdout);
+    // Save full output to log — warn on failure rather than swallowing
+    if let Err(e) = std::fs::write(&log_file, &stdout) {
+        tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -406,6 +636,8 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
         cli.k,
         cli.window,
         plan_cache,
+        &cli.model,
+        cli.context_window,
     );
 
     eprintln!("Phase 4: Execution Plan");
@@ -428,8 +660,69 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
     let keywords = extract_keywords(&cli.question);
     let verifier = Verifier::new(task.clone(), keywords.clone());
 
-    // Shutdown channel for cooperative cancellation
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Shutdown channel for cooperative cancellation.
+    // shutdown_tx is held by the signal handler installed in main().
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Leak-safe: clone into a background task that listens for SIGINT/SIGTERM.
+    // When signalled, it broadcasts shutdown to all phi() recursions.
+    {
+        let tx = shutdown_tx.clone();
+        let oracle_shutdown = Arc::clone(&oracle);
+        tokio::spawn(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+                // SIGHUP: allows systemd/kubernetes to trigger clean restart
+                // with new env vars (config reload) without SIGKILL. phi()
+                // drains in-flight work via the shutdown channel before exit.
+                let mut sighup = signal(SignalKind::hangup())
+                    .expect("failed to install SIGHUP handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                    _ = sighup.recv() => {
+                        eprintln!("\n>>> SIGHUP received — reloading requires restart. Draining in-flight work...");
+                    },
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = ctrl_c.await;
+            }
+            eprintln!("\n>>> Signal received, initiating graceful shutdown (30s drain)...");
+            // Signal Oracle to stop accepting new API calls (prevents billing waste)
+            oracle_shutdown.trigger_shutdown();
+            let _ = tx.send(true);
+        });
+    }
+    // Drop our copy of shutdown_tx — only the signal task holds it now.
+    // When all receivers see `true`, phi() trees will abort cooperatively.
+    drop(shutdown_tx);
+
+    // Bounded concurrency: prevents OOM on wide/deep recursion trees.
+    // Default 100 permits limits total in-flight phi() calls across all depths.
+    let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+
+    // Generate trace_id for correlating logs across the entire recursion tree.
+    // blake3(question + timestamp) truncated to 16 bytes — unique per invocation.
+    let trace_id: [u8; 16] = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(cli.question.as_bytes());
+        hasher.update(&std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes());
+        hasher.update(&(std::process::id() as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash.as_bytes()[..16]);
+        id
+    };
+    eprintln!("  Trace ID: {}", hex::encode(trace_id));
 
     let cfg = Arc::new(PhiConfig {
         question: cli.question.clone(),
@@ -444,11 +737,29 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
         use_quorum: cli.quorum,
         verifier,
         shutdown: shutdown_rx,
+        concurrency: concurrency_semaphore,
+        trace_id,
     });
 
     // ── Phase 5: Execute Φ ──
+    // Admission control: reject work that cannot complete given available budget.
+    // Calculate worst-case cost (all leaves at max depth) and compare to budget.
+    // This prevents spawning thousands of tasks that exhaust budget mid-tree,
+    // wasting CPU and leaving zombie tasks.
+    if !oracle.budget_unlimited() {
+        let worst_case = p.total_calls;
+        let available = oracle.budget_remaining();
+        if worst_case > available {
+            anyhow::bail!(
+                "Admission declined: worst-case execution needs {} calls but only {} budget remaining. \
+                 Reduce input size, increase --max-calls, or use a smaller k/depth.",
+                worst_case, available
+            );
+        }
+    }
+
     eprintln!("Phase 5: Executing Phi...\n");
-    let result = phi(cfg, prompt, 0).await?;
+    let result = phi(cfg, prompt, 0, None).await?;
 
     let elapsed = start.elapsed();
     eprintln!(
@@ -465,21 +776,51 @@ async fn run_analysis(cli: &Cli) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging (controlled by RUST_LOG env var)
+    // Initialize structured logging with non-blocking writer.
+    // Non-blocking prevents disk-full or slow disks from stalling the async
+    // runtime — logs are dropped (with a counter) rather than blocking tasks.
+    // The _guard must live for the duration of main() to flush on exit.
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
         .init();
 
     let cli = Cli::parse();
     cli.validate()?;
 
+    // Fail fast on unrecognized LAMBDA_RLM_* env vars to prevent silent config drift.
+    // A typo like LAMBDA_RLM_MA_INPUT_BYTES (missing X) would silently fall back to
+    // defaults, creating undebuggable production drift over 30-year operational life.
+    {
+        const KNOWN_VARS: &[&str] = &[
+            "LAMBDA_RLM_MAX_INPUT_BYTES",
+            "LAMBDA_RLM_CLAUDE_TIMEOUT_SECS",
+            "LAMBDA_RLM_BULKHEAD_LLM_PERMITS",
+            "LAMBDA_RLM_QUORUM_TIMEOUT_SECS",
+            "LAMBDA_RLM_MIN_QUORUM_SIZE",
+            "LAMBDA_RLM_MIN_CONSENSUS_SIMILARITY",
+            "LAMBDA_RLM_QUORUM_DEGRADE_ON_SPLIT",
+        ];
+        for (key, _) in std::env::vars() {
+            if key.starts_with("LAMBDA_RLM_") && !KNOWN_VARS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "Unrecognized environment variable: {key}. \
+                     Known LAMBDA_RLM_* variables: {}. \
+                     Typo? Remove it or update KNOWN_VARS in main.rs.",
+                    KNOWN_VARS.join(", ")
+                );
+            }
+        }
+    }
+
     eprintln!("\n================================================================");
     eprintln!("  lambda-RLM v3: Hardened Functional Runtime for Long-Context Reasoning");
     eprintln!("  (arXiv:2603.20105 -- Roy et al., 2026)");
+    eprintln!("  config fingerprint: {}", cli.config_fingerprint());
     eprintln!("================================================================\n");
 
     if !cli.claude {
@@ -529,7 +870,7 @@ async fn main() -> Result<()> {
         }
 
         // 3. Hand to claude
-        let summary = run_claude(&result, &work_dir, &cli.question, iteration)?;
+        let summary = run_claude(&result, &work_dir, &cli.question, iteration).await?;
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");

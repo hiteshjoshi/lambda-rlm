@@ -79,10 +79,50 @@ pub fn comb_peek(text: &str, start: usize, end: usize) -> &str {
     &text[s..e]
 }
 
+/// Max combinatorial product to prevent OOM on large aggregate results.
+/// Pre-calculated before allocation to fail fast on pathological input.
+const MAX_COMBINATORIAL_PRODUCT: usize = 1_000_000;
+
+// Compile-time validation: zero causes logic errors in comb_cross,
+// overflow causes silent truncation in pre-calculation.
+const _: () = assert!(MAX_COMBINATORIAL_PRODUCT > 0);
+const _: () = assert!(MAX_COMBINATORIAL_PRODUCT < usize::MAX / 2);
+
 /// Cross: [α] × [α] → [(α, α)]
 /// Pairs from DIFFERENT groups only. Purely symbolic, zero neural cost.
+/// Returns empty Vec if the product would exceed MAX_COMBINATORIAL_PRODUCT.
 pub fn comb_cross(groups: &[Vec<String>]) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
+    // Pre-calculate total pairs to fail fast on combinatorial explosion
+    let total_pairs: Option<usize> = {
+        let mut count: usize = 0;
+        for i in 0..groups.len() {
+            for j in (i + 1)..groups.len() {
+                let product = groups[i].len().checked_mul(groups[j].len());
+                match product {
+                    Some(p) => {
+                        count = match count.checked_add(p) {
+                            Some(c) => c,
+                            None => return Vec::new(),
+                        };
+                    }
+                    None => return Vec::new(),
+                }
+            }
+        }
+        Some(count)
+    };
+    let total = match total_pairs {
+        Some(t) if t <= MAX_COMBINATORIAL_PRODUCT => t,
+        _ => {
+            tracing::warn!(
+                limit = MAX_COMBINATORIAL_PRODUCT,
+                "combinatorial product too large, returning empty"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut pairs = Vec::with_capacity(total);
     for i in 0..groups.len() {
         for j in (i + 1)..groups.len() {
             for a in &groups[i] {
@@ -115,17 +155,34 @@ pub fn extract_keywords(question: &str) -> Vec<String> {
 }
 
 pub fn keyword_matches(text: &str, keywords: &[String]) -> bool {
-    let lower = text.to_lowercase();
+    use unicode_normalization::UnicodeNormalization;
+    // NFKC normalization prevents homoglyph attacks from bypassing keyword filters
+    // (e.g., Cyrillic 'а' in "аuth" would not match "auth" without normalization).
+    let lower: String = text.nfkc().collect::<String>().to_lowercase();
     keywords.iter().any(|kw| lower.contains(kw.as_str()))
 }
+
+/// Max input size for parse_items to prevent pathological processing time.
+const MAX_PARSE_INPUT_BYTES: usize = 100 * 1024 * 1024; // 100MB
+
+/// Max items returned from parse_items to prevent unbounded Vec growth.
+const MAX_ITEMS_COUNT: usize = 100_000;
 
 /// Parse markdown-style list items from LLM output.
 /// Handles: `- item`, `* item`, `• item`, `1. item`, `  - nested`, and plain lines.
 /// Strips leading list markers and numbering, then filters short/empty lines.
 ///
-/// PRE: text is UTF-8 LLM output (may contain any Unicode)
-/// POST: each item is trimmed, non-empty, len > 3
+/// PRE: text is UTF-8 LLM output (may contain any Unicode), len <= MAX_PARSE_INPUT_BYTES
+/// POST: each item is trimmed, non-empty, len > 3, count <= MAX_ITEMS_COUNT
 pub fn parse_items(text: &str) -> Vec<String> {
+    if text.len() > MAX_PARSE_INPUT_BYTES {
+        tracing::warn!(
+            len = text.len(),
+            limit = MAX_PARSE_INPUT_BYTES,
+            "parse_items input exceeds size limit, returning empty"
+        );
+        return vec![];
+    }
     text.lines()
         .map(|l| {
             let t = l.trim();
@@ -164,19 +221,26 @@ pub fn parse_items(text: &str) -> Vec<String> {
             t.trim().to_string()
         })
         .filter(|l| !l.is_empty() && l.len() > 3)
+        .take(MAX_ITEMS_COUNT)
         .collect()
 }
 
 pub fn merge_dedup(items: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    use unicode_normalization::UnicodeNormalization;
+    let mut seen = std::collections::BTreeSet::new();
     items
         .into_iter()
         .filter(|item| {
+            // NFKC normalization before dedup key generation ensures that
+            // homoglyphs (Cyrillic 'а' vs Latin 'a'), fullwidth characters,
+            // and compatibility forms are canonicalized. Without this,
+            // semantically identical items with different Unicode representations
+            // would survive deduplication.
             let key: String = item
-                .to_lowercase()
-                .chars()
+                .nfkc()
                 .filter(|c| c.is_alphanumeric())
-                .collect();
+                .collect::<String>()
+                .to_lowercase();
             seen.insert(key)
         })
         .collect()
@@ -222,12 +286,31 @@ pub fn filter_by_keyword_predicate(
 // Replaces raw line-count splitting with definition-boundary splitting.
 // Preserves semantic integrity: never cuts a function/struct/class in half.
 
+/// Max line length before falling back to size-based chunking.
+/// Minified JS or single-line 100MB files would cause unbounded processing time
+/// in structural detection. Fall back to safe O(n) character splitting instead.
+const MAX_LINE_LENGTH: usize = 16384;
+
+/// Max chunks to prevent Vec allocation OOM before semaphore backpressure kicks in.
+const MAX_CHUNK_COUNT: usize = 10_000;
+
 /// PRE: text contains source files with "// === path ===" markers
 /// POST: each chunk contains complete definitions, approx ≤ tau chars
 pub fn structural_chunk(text: &str, tau: usize) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return vec![];
+    }
+
+    // Pathological input guard: if any line exceeds MAX_LINE_LENGTH,
+    // bypass structural detection (minified JS, single-line files, etc.)
+    if lines.iter().any(|l| l.len() > MAX_LINE_LENGTH) {
+        tracing::warn!(
+            max_line = lines.iter().map(|l| l.len()).max().unwrap_or(0),
+            threshold = MAX_LINE_LENGTH,
+            "pathological input detected, falling back to size-based chunking"
+        );
+        return comb_split(text, (text.len() / tau).max(2));
     }
 
     // 1. Find structural boundaries
@@ -265,7 +348,23 @@ pub fn structural_chunk(text: &str, tau: usize) -> Vec<String> {
 
     // 3. Fall back to line-based split if structural detection found nothing useful
     if chunks.is_empty() || (chunks.len() == 1 && text.len() > tau * 2) {
+        tracing::warn!(
+            chunks = chunks.len(),
+            text_len = text.len(),
+            tau,
+            "structural chunking produced insufficient boundaries, degrading to line-based split"
+        );
         return comb_split(text, (text.len() / tau).max(2));
+    }
+
+    // 4. Cap chunk count to prevent OOM on pathologically fragmented input
+    if chunks.len() > MAX_CHUNK_COUNT {
+        tracing::warn!(
+            chunks = chunks.len(),
+            max = MAX_CHUNK_COUNT,
+            "chunk count exceeds limit, truncating"
+        );
+        chunks.truncate(MAX_CHUNK_COUNT);
     }
 
     chunks

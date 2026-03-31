@@ -40,7 +40,10 @@ pub async fn reduce_for_task(
     max_tokens: u32,
     use_quorum: bool,
 ) -> Result<String> {
-    match task {
+    debug_assert!(!child_results.is_empty(), "PRE: child_results must be non-empty");
+    debug_assert!(depth <= max_depth, "PRE: depth must not exceed max_depth");
+
+    let result = match task {
         TaskType::Search => Ok(reduce_search(child_results, depth)),
         TaskType::Classify => Ok(reduce_classify(child_results)),
         TaskType::Aggregate => Ok(reduce_aggregate(child_results)),
@@ -67,7 +70,14 @@ pub async fn reduce_for_task(
             .await
         }
         TaskType::Auto => unreachable!("Auto resolved in Phase 2"),
+    };
+
+    // POST: successful reduction must produce non-empty output
+    if let Ok(ref s) = result {
+        debug_assert!(!s.is_empty(), "POST: reduce output must be non-empty");
     }
+
+    result
 }
 
 // ── Symbolic reducers (zero neural cost) ─────────────────────────
