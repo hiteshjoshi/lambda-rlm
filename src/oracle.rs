@@ -7,11 +7,11 @@
 use crate::resilience::{BudgetGuard, CallBudget, CircuitBreaker, ReplayCache};
 use crate::types::CodeGenerator;
 use anyhow::Result;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -132,13 +132,13 @@ struct StreamDelta {
 // dropping the Sender signals waiters to fall through and try themselves.
 
 struct InflightGuard<'a> {
-    map: &'a Mutex<HashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>>,
+    map: &'a DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
     key: String,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.map.lock().unwrap().remove(&self.key);
+        self.map.remove(&self.key);
     }
 }
 
@@ -376,7 +376,7 @@ pub struct Oracle {
     /// Only one request proceeds to the LLM; others wait for its result.
     /// IMPORTANT: Oracle intentionally has no back-reference to PhiConfig.
     /// Keep ownership one-way (PhiConfig -> Oracle) to prevent Arc cycles.
-    inflight: Mutex<HashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>>,
+    inflight: DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
     /// Cooperative shutdown flag. When set, in-flight and future API calls
     /// fail fast instead of proceeding, preventing wasted billing after shutdown.
     shutdown: AtomicBool,
@@ -419,7 +419,7 @@ impl Oracle {
             budget: CallBudget::new(max_calls),
             max_retries,
             shutdown: AtomicBool::new(false),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: DashMap::new(),
             cache_hits: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             total_input_chars: AtomicU64::new(0),
@@ -533,30 +533,28 @@ impl Oracle {
         // Claim ownership by inserting while holding the lock so two callers can
         // never overwrite each other's sender and leak waiters.
         let inflight_tx = loop {
-            let inflight_rx = {
-                let mut map = self.inflight.lock().unwrap();
-                if let Some(existing) = map.get(&cache_key) {
-                    Some(existing.subscribe())
-                } else {
+            match self.inflight.entry(cache_key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => {
+                    let mut rx = existing.get().subscribe();
+                    drop(existing);
+                    loop {
+                        if let Some(ref result) = *rx.borrow() {
+                            self.cache_hits.fetch_add(1, Ordering::AcqRel);
+                            guard.commit();
+                            return Ok(result.clone());
+                        }
+                        if rx.changed().await.is_err() {
+                            // In-flight caller failed — sender dropped.
+                            // Retry entry acquisition and attempt to claim leader.
+                            break;
+                        }
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
                     let (tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
                     let tx = Arc::new(tx);
-                    map.insert(cache_key.clone(), Arc::clone(&tx));
+                    vacant.insert(Arc::clone(&tx));
                     break tx;
-                }
-            };
-
-            if let Some(mut rx) = inflight_rx {
-                loop {
-                    if let Some(ref result) = *rx.borrow() {
-                        self.cache_hits.fetch_add(1, Ordering::AcqRel);
-                        guard.commit();
-                        return Ok(result.clone());
-                    }
-                    if rx.changed().await.is_err() {
-                        // In-flight caller failed — sender dropped.
-                        // Retry lock acquisition and attempt to claim leader.
-                        break;
-                    }
                 }
             }
         };

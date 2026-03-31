@@ -303,7 +303,12 @@ impl Drop for BudgetGuard<'_> {
             if !std::thread::panicking() {
                 tracing::error!("BudgetGuard dropped without commit() — possible budget leak from async task cancellation");
             }
-            self.budget.release();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.budget.release()))
+                .is_err()
+                && !std::thread::panicking()
+            {
+                tracing::error!("BudgetGuard release panicked during Drop");
+            }
         }
     }
 }

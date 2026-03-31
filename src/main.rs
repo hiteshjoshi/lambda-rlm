@@ -33,6 +33,10 @@ mod resilience;
 mod types;
 mod verify;
 
+#[cfg(not(windows))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::path::{Path, PathBuf};
@@ -276,8 +280,8 @@ impl Cli {
 /// within it. Symlinks that escape the root are skipped.
 /// Maximum aggregate bytes to collect. Prevents heap exhaustion from
 /// scanning enormous repositories or zip bombs before chunking begins.
-/// 1GB accommodates large monorepos while protecting against pathological inputs.
-const MAX_AGGREGATE_BYTES: u64 = 1024 * 1024 * 1024;
+/// 256MB aligns with Phi's hard input limit and prevents oversized ingest.
+const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 
 fn collect_source_files(path: &PathBuf) -> Result<String> {
     let extensions = [
@@ -456,7 +460,11 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
 
 // ── Analysis runner (reusable per iteration) ────────────────────
 
-async fn run_analysis(cli: &Cli, oracle: &Arc<Oracle>, shutdown_rx: watch::Receiver<bool>) -> Result<String> {
+async fn run_analysis(
+    cli: &Cli,
+    oracle: &Arc<Oracle>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<String> {
     let start = Instant::now();
 
     // ── Phase 1: REPL Initialization ──

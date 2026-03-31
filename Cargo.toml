@@ -20,6 +20,10 @@ libc = "0.2"
 hex = "0.4"
 tempfile = "3"
 which = "7"
+dashmap = "6"
+
+[target.'cfg(not(windows))'.dependencies]
+jemallocator = "0.5"
 
 [dev-dependencies]
 loom = "0.7"
