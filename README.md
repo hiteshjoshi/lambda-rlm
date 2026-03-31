@@ -210,7 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-Latest fix-loop hardening commit: `5057549`
+Latest fix-loop hardening commit: `ee822a3`
+
+- Replaced Oracle single-flight dedup state in `src/oracle.rs` from a global `Mutex<HashMap<...>>` to sharded `DashMap`, removing the global lock bottleneck under concurrent same-key requests.
+- Added panic-safe `catch_unwind` protection in `BudgetGuard::drop` (`src/resilience.rs`) so budget restoration cannot trigger double-panic abort paths.
+- Added non-Windows `jemallocator` and wired it as the global allocator in `src/main.rs` to reduce long-run heap fragmentation in high-throughput deployments.
+- Aligned source collection ingress cap in `src/main.rs` to 256MB so file ingest now matches Phi's hard input safety boundary.
 
 - Hardened `src/codegen.rs` with cancellation-safe child-process cleanup (`Drop` reaper + explicit kill/reap paths), bounded stdout/stderr readers, exit-code classification (retryable vs fatal), and degraded handling for empty generator output.
 - Switched codegen summary passing to `Arc<str>` in `src/codegen.rs` to avoid extra string copies across fix-loop boundaries.
