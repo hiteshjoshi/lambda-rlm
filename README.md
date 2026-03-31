@@ -198,7 +198,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-### v3.3 — Dead Code & Dependency Purge (`COMMIT_ID`)
+### v3.3 — Dead Code & Dependency Purge (`efe9873`)
 
 **Removed:**
 - `unicode-normalization` crate: NFKC normalization removed from hot-path `keyword_matches()` and `merge_dedup()`. Source code is ASCII — simple `to_lowercase()` is sufficient and eliminates per-chunk String allocation from normalization.
