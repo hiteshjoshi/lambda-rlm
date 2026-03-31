@@ -198,7 +198,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
-### v3.4 — Env Var Purge & CB Rejuvenation (`COMMIT_ID`)
+### v3.4 — Env Var Purge & CB Rejuvenation (`40c0188`)
 
 **Removed:**
 - `LAMBDA_RLM_MAX_INPUT_BYTES` env var override: `phi()` input limit is now a compile-time constant (`MAX_PHI_INPUT_BYTES`). Eliminates `OnceLock` + env lookup on hot path.
