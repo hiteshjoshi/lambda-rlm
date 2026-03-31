@@ -23,6 +23,7 @@
 //!
 //! Set FIREWORKS_API in your environment.
 
+mod codegen;
 mod combinator;
 mod cost;
 mod oracle;
@@ -172,7 +173,11 @@ struct Cli {
     #[arg(long, default_value = "false")]
     claude: bool,
 
-    /// Max fix iterations when using --claude (0 = unlimited)
+    /// Pipe final output into a new `opencode` session in the target directory
+    #[arg(long, default_value = "false")]
+    opencode: bool,
+
+    /// Max fix iterations when using --claude or --opencode (0 = unlimited)
     #[arg(long, default_value = "10")]
     max_iterations: usize,
 }
@@ -207,6 +212,10 @@ impl Cli {
         );
         anyhow::ensure!(self.concurrency >= 1, "concurrency must be >= 1");
         anyhow::ensure!(self.timeout > 0, "timeout must be > 0");
+        anyhow::ensure!(
+            !(self.claude && self.opencode),
+            "--claude and --opencode are mutually exclusive; pick one code generator"
+        );
         // Prevent pathological expansion: k^depth must stay under 100K total calls
         if self.k >= 2 {
             let max_safe_depth = ((100_000f64).ln() / (self.k as f64).ln()).floor() as usize;
@@ -236,7 +245,7 @@ impl Cli {
         hasher.update(&(self.max_calls as u64).to_le_bytes());
         hasher.update(&(self.max_retries as u64).to_le_bytes());
         hasher.update(&(self.max_cache_entries as u64).to_le_bytes());
-        hasher.update(&[self.no_cache as u8, self.dry_run as u8]);
+        hasher.update(&[self.no_cache as u8, self.dry_run as u8, self.opencode as u8]);
         let hash = hasher.finalize();
         format!("v{}:{}", CONFIG_SCHEMA_VERSION, &hash.to_hex()[..16])
     }
@@ -404,85 +413,6 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
     }
     eprintln!("Collected {file_count} files ({} chars)", all_code.len());
     Ok(all_code)
-}
-
-// ── Output dispatch ─────────────────────────────────────────────
-
-/// Spawn claude in print mode and wait for it to finish (no timeout).
-/// Returns Claude's output summary (first line).
-///
-/// PRE: work_dir exists and is writable
-/// POST: claude process has exited
-async fn run_claude(
-    result: &str,
-    work_dir: &std::path::Path,
-    question: &str,
-    iteration: usize,
-) -> Result<String> {
-    let result_file = work_dir.join(".lambda-rlm-result.md");
-    let log_file = work_dir.join(format!(".lambda-rlm-claude-{iteration}.log"));
-    std::fs::write(&result_file, result)
-        .with_context(|| format!("Failed to write {}", result_file.display()))?;
-
-    eprintln!(
-        ">>> Iteration {iteration}: launching claude in {} ...",
-        work_dir.display()
-    );
-    let prompt = format!(
-        "Read the analysis in .lambda-rlm-result.md — it's iteration {iteration} of a λ-RLM \
-         fix loop for the question: \"{question}\".\n\n\
-         Your job:\n\
-         1. Read the findings carefully.\n\
-         2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
-         3. When done, output a single line summary of what you changed.\n\
-         4. Do a proper git commit(non-signed)
-         5. Update readme with commit id and change-log
-         5. If there is nothing actionable (only informational notes or the analysis is clean), \
-            output exactly: CLEAN\n\n\
-         Start by reading .lambda-rlm-result.md now.",
-    );
-
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("--dangerously-skip-permissions")
-        .arg("-p")
-        .arg(&prompt)
-        .current_dir(work_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let child = cmd
-        .spawn()
-        .context("Failed to spawn `claude` — is it installed and on PATH?")?;
-
-    let output = child.wait_with_output().await
-        .context("Failed to run claude")?;
-
-    let _ = std::fs::remove_file(&result_file);
-
-    // Strict UTF-8: lossy conversion silently replaces invalid bytes with U+FFFD,
-    // corrupting data that feeds downstream hashing and content analysis.
-    let stdout = String::from_utf8(output.stdout)
-        .context("claude subprocess produced invalid UTF-8 on stdout")?;
-
-    // Save full output to log — warn on failure rather than swallowing
-    if let Err(e) = std::fs::write(&log_file, &stdout) {
-        tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
-    }
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("    claude stderr: {stderr}");
-        anyhow::bail!("claude exited with {}", output.status);
-    }
-
-    // Print first meaningful line as confirmation
-    let summary = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("(no output)")
-        .to_string();
-
-    Ok(summary)
 }
 
 // ── Analysis runner (reusable per iteration) ────────────────────
@@ -730,14 +660,24 @@ async fn main() -> Result<()> {
     eprintln!("  config fingerprint: {}", cli.config_fingerprint());
     eprintln!("================================================================\n");
 
-    if !cli.claude {
+    // Resolve effective code generator from --claude / --opencode flags
+    let generator = if cli.claude {
+        Some(types::CodeGenerator::Claude)
+    } else if cli.opencode {
+        Some(types::CodeGenerator::Opencode)
+    } else {
+        None
+    };
+
+    if generator.is_none() {
         // Single-shot mode: analyze and print
         let result = run_analysis(&cli).await?;
         println!("{result}");
         return Ok(());
     }
+    let generator = generator.unwrap();
 
-    // ── Claude loop mode ──
+    // ── Fix loop mode ──
     let work_dir = if cli.path.is_file() {
         std::fs::canonicalize(cli.path.parent().unwrap_or(&cli.path))?
     } else {
@@ -776,17 +716,27 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        // 3. Hand to claude
-        let summary = run_claude(&result, &work_dir, &cli.question, iteration).await?;
+        // 3. Hand to code generator
+        let summary = codegen::run_code_generator(
+            &generator,
+            &result,
+            &work_dir,
+            &cli.question,
+            iteration,
+        )
+        .await?;
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");
-        eprintln!("    (full log: .lambda-rlm-claude-{iteration}.log)");
+        eprintln!(
+            "    (full log: {})",
+            codegen::log_file_name(&generator, iteration)
+        );
     }
 
     eprintln!(
-        "\n>>> Reached max iterations ({}). Stopping loop.",
-        cli.max_iterations
+        "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
+        cli.max_iterations, generator
     );
     eprintln!(">>> Run again to continue if needed.");
     Ok(())

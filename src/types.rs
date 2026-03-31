@@ -2,6 +2,21 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[derive(Clone, ValueEnum, Debug, PartialEq)]
+pub enum CodeGenerator {
+    Claude,
+    Opencode,
+}
+
+impl fmt::Display for CodeGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Claude => write!(f, "claude"),
+            Self::Opencode => write!(f, "opencode"),
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TaskType {
     Auto,
