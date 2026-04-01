@@ -64,6 +64,7 @@ const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
 const MAX_JOINSET_POOL: usize = 100;
 const AUTO_DETECT_MAX_TOKENS: u32 = 256;
+const RESOURCE_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 
 fn is_budget_exhausted_error(error: &anyhow::Error) -> bool {
     error
@@ -376,10 +377,21 @@ pub fn phi(
         // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
         // Each spawn acquires a concurrency permit to bound total recursive tasks.
         let mut set_guard = JoinSetReturnGuard::new(&cfg);
-        let mut permit_pool = Arc::clone(&cfg.concurrency)
-            .acquire_many_owned(num_children as u32)
-            .await
-            .map_err(|_| anyhow::anyhow!("phi concurrency semaphore closed"))?;
+        let mut permit_pool = tokio::time::timeout(
+            Duration::from_secs(RESOURCE_ACQUIRE_TIMEOUT_SECS),
+            Arc::clone(&cfg.concurrency).acquire_many_owned(num_children as u32),
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                depth,
+                children = num_children,
+                timeout_secs = RESOURCE_ACQUIRE_TIMEOUT_SECS,
+                "timed out acquiring phi child permits"
+            );
+            anyhow::anyhow!("timed out acquiring phi child permits")
+        })?
+        .map_err(|_| anyhow::anyhow!("phi concurrency semaphore closed"))?;
         for (i, chunk) in chunks.into_iter().enumerate() {
             let cfg = Arc::clone(&cfg);
             let permit = permit_pool

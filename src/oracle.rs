@@ -31,6 +31,7 @@ const MAX_SSE_EVENTS: usize = 100_000;
 /// Maximum continuation rounds when provider reports finish_reason="length".
 /// Prevents unbounded continuation loops while still recovering long outputs.
 const MAX_TRUNCATION_CONTINUATIONS: usize = 4;
+const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CONTINUATION_PROMPT: &str = "Continue exactly from where your previous answer ended. Do not repeat prior text. Return only the continuation.";
 
@@ -662,7 +663,10 @@ impl Oracle {
         }
         let budget = BudgetGuard::new(&self.budget);
         let cache_permit = self.cache.reserve();
-        let bulkhead = self.bulkhead.llm().acquire().await?;
+        let bulkhead =
+            tokio::time::timeout(RESOURCE_ACQUIRE_TIMEOUT, self.bulkhead.llm().acquire())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for oracle bulkhead permit"))??;
         Ok(ResourceStack {
             _budget: budget,
             _cache_permit: cache_permit,

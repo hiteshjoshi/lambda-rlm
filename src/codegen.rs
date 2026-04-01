@@ -49,6 +49,7 @@ const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -463,17 +464,21 @@ async fn run_code_generator_once(
         };
     }
 
-    let _bulkhead = codegen_bulkhead(generator)
-        .acquire_owned()
-        .await
-        .with_context(|| format!("{generator} bulkhead saturated"))?;
     let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
+    let _bulkhead = tokio::time::timeout(
+        RESOURCE_ACQUIRE_TIMEOUT,
+        codegen_bulkhead(generator).acquire_owned(),
+    )
+    .await
+    .with_context(|| format!("{generator} bulkhead acquisition timed out"))?
+    .with_context(|| format!("{generator} bulkhead saturated"))?;
     let started = Instant::now();
     let run = match generator {
         CodeGenerator::Claude => run_claude(result, work_dir, question, iteration).await,
         CodeGenerator::Opencode => run_opencode(result, work_dir, question, iteration).await,
     };
     oracle.record_codegen_call(generator, started.elapsed());
+    budget_guard.commit();
 
     match run {
         Ok(summary) => {
@@ -483,7 +488,6 @@ async fn run_code_generator_once(
                 }
             }
             circuit.record_success();
-            budget_guard.commit();
             Ok(summary)
         }
         Err(error) => {

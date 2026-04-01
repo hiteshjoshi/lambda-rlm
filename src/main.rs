@@ -49,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 
 static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+const INTERACTIVE_SESSION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[must_use = "interactive session permit must be held for session lifetime"]
 struct InteractiveSessionPermit(Option<OwnedSemaphorePermit>);
@@ -74,12 +75,16 @@ async fn acquire_interactive_session_permit(interactive: bool) -> Result<Interac
         return Ok(InteractiveSessionPermit::none());
     }
 
-    let permit = INTERACTIVE_SESSION_SEMAPHORE
+    let semaphore = INTERACTIVE_SESSION_SEMAPHORE
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .context("interactive session already in progress")?;
+        .clone();
+    let permit = tokio::time::timeout(
+        INTERACTIVE_SESSION_ACQUIRE_TIMEOUT,
+        semaphore.acquire_owned(),
+    )
+    .await
+    .context("timed out waiting for interactive session permit")?
+    .context("interactive session already in progress")?;
 
     INTERACTIVE_SESSION_ACTIVE.store(true, Ordering::Release);
 
