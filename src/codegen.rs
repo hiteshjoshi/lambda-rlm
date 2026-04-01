@@ -10,15 +10,13 @@ use std::io::Write;
 use std::time::Instant;
 use std::{path::Path, process::Stdio, sync::Arc, sync::OnceLock, time::SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 use crate::oracle::Oracle;
 use crate::resilience::CircuitBreaker;
 use crate::types::CodeGenerator;
 
 const RESULT_FILE_NAME: &str = ".lambda-rlm-result.md";
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const OPENCODE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 const CODEGEN_BUDGET_UNITS: usize = 50;
@@ -367,12 +365,16 @@ impl ChildCleanup {
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
+                    let _ = child.start_kill();
                     let _ = child.wait().await;
                 });
+                return;
             }
+
+            let _ = child.start_kill();
+            let _ = child.try_wait();
         }
     }
 }
@@ -417,10 +419,9 @@ fn classify_non_success_exit(
     }
 }
 
-async fn run_generator_process_with_timeout(
+async fn run_generator_process(
     mut cmd: tokio::process::Command,
     generator_name: &str,
-    timeout_duration: Duration,
 ) -> Result<GeneratorOutput> {
     let child = cmd.spawn().with_context(|| {
         format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
@@ -453,19 +454,11 @@ async fn run_generator_process_with_timeout(
             .map_err(anyhow::Error::from)
     });
 
-    let status = match timeout(timeout_duration, child.child_mut()?.wait()).await {
-        Ok(wait_result) => match wait_result {
-            Ok(status) => status,
-            Err(error) => {
-                child.kill_and_reap().await;
-                return Err(error).with_context(|| format!("Failed to run {generator_name}"));
-            }
-        },
-        Err(_) => {
+    let status = match child.child_mut()?.wait().await {
+        Ok(status) => status,
+        Err(error) => {
             child.kill_and_reap().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            anyhow::bail!("{generator_name} timed out after {timeout_duration:?}");
+            return Err(error).with_context(|| format!("Failed to run {generator_name}"));
         }
     };
     child.disarm();
@@ -527,7 +520,7 @@ async fn run_claude(
             .arg(&prompt);
         configure_generator_command(&mut cmd, work_dir);
 
-        let output = run_generator_process_with_timeout(cmd, "claude", CLAUDE_TIMEOUT).await?;
+        let output = run_generator_process(cmd, "claude").await?;
 
         let stdout = std::str::from_utf8(&output.stdout)
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
@@ -584,7 +577,7 @@ async fn run_opencode(
             .arg(&prompt);
         configure_generator_command(&mut cmd, work_dir);
 
-        let output = run_generator_process_with_timeout(cmd, "opencode", OPENCODE_TIMEOUT).await?;
+        let output = run_generator_process(cmd, "opencode").await?;
 
         let stdout = std::str::from_utf8(&output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;

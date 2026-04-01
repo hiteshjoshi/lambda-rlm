@@ -138,10 +138,24 @@ struct InflightGuard<'a> {
     key: String,
 }
 
+static INFLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+impl<'a> InflightGuard<'a> {
+    fn new(
+        map: &'a DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
+        gauge: &'a AtomicUsize,
+        key: String,
+    ) -> Self {
+        INFLIGHT_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        Self { map, gauge, key }
+    }
+}
+
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         self.map.remove(&self.key);
         self.gauge.fetch_sub(1, Ordering::AcqRel);
+        INFLIGHT_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         if self.map.is_empty() {
             self.map.shrink_to_fit();
         }
@@ -162,6 +176,7 @@ impl ResourceStack<'_> {
 
 pub struct OracleMetrics {
     pub budget_guards_live: u64,
+    pub inflight_guards_live: u64,
     pub inflight_requests: usize,
     pub cache_hit_rate: f64,
     pub circuit_breaker_state: &'static str,
@@ -517,6 +532,7 @@ impl Oracle {
         };
         OracleMetrics {
             budget_guards_live: self.budget.leaked_guards(),
+            inflight_guards_live: INFLIGHT_GUARD_LIVE_COUNT.load(Ordering::Acquire),
             inflight_requests: self.inflight.len(),
             cache_hit_rate,
             circuit_breaker_state: self.circuit.state(),
@@ -619,11 +635,8 @@ impl Oracle {
         };
 
         // RAII guard removes entry on all exit paths (success, error, panic).
-        let _inflight_guard = InflightGuard {
-            map: &self.inflight,
-            gauge: &self.inflight_gauge,
-            key: cache_key.clone(),
-        };
+        let _inflight_guard =
+            InflightGuard::new(&self.inflight, &self.inflight_gauge, cache_key.clone());
 
         // 3. Bulkhead permit is now held by ResourceStack.
         let n = self.call_count.fetch_add(1, Ordering::AcqRel) + 1;
@@ -804,6 +817,7 @@ impl Oracle {
         let budget_remaining = self.budget.remaining();
         let metrics = self.metrics();
         let leaked_budget_guards = metrics.budget_guards_live;
+        let live_inflight_guards = metrics.inflight_guards_live;
         let inflight_requests = metrics.inflight_requests;
         let inflight_gauge = self.inflight_gauge.load(Ordering::Acquire);
         let inflight_consistent = self.check_inflight_leak();
@@ -851,12 +865,14 @@ impl Oracle {
                 format_args!("    Budget remaining: {budget_remaining}\n"),
             );
         }
-        if leaked_budget_guards > 0 {
-            w(
-                &mut buf,
-                format_args!("    Budget guard leaks: {leaked_budget_guards}\n"),
-            );
-        }
+        w(
+            &mut buf,
+            format_args!("    Budget guards live: {leaked_budget_guards}\n"),
+        );
+        w(
+            &mut buf,
+            format_args!("    Inflight guards live: {live_inflight_guards}\n"),
+        );
         w(
             &mut buf,
             format_args!("    Inflight entries: {inflight_requests}\n"),
@@ -1089,6 +1105,64 @@ mod tests {
             assert_eq!(leaders.load(LoomOrdering::Acquire), 1);
             let lock = map.lock().unwrap();
             assert_eq!(lock.len(), 1);
+        });
+    }
+
+    #[test]
+    fn inflight_guard_always_drops_under_race() {
+        struct LoomInflightGuard {
+            slot: LoomArc<AtomicUsize>,
+            live: LoomArc<AtomicUsize>,
+        }
+
+        impl Drop for LoomInflightGuard {
+            fn drop(&mut self) {
+                self.slot.store(0, LoomOrdering::Release);
+                self.live.fetch_sub(1, LoomOrdering::AcqRel);
+            }
+        }
+
+        loom::model(|| {
+            let slot = LoomArc::new(AtomicUsize::new(0));
+            let live = LoomArc::new(AtomicUsize::new(0));
+
+            let slot_a = LoomArc::clone(&slot);
+            let live_a = LoomArc::clone(&live);
+            let t1 = loom_thread::spawn(move || {
+                if slot_a
+                    .compare_exchange(0, 1, LoomOrdering::AcqRel, LoomOrdering::Acquire)
+                    .is_ok()
+                {
+                    live_a.fetch_add(1, LoomOrdering::AcqRel);
+                    let _guard = LoomInflightGuard {
+                        slot: LoomArc::clone(&slot_a),
+                        live: LoomArc::clone(&live_a),
+                    };
+                    loom_thread::yield_now();
+                }
+            });
+
+            let slot_b = LoomArc::clone(&slot);
+            let live_b = LoomArc::clone(&live);
+            let t2 = loom_thread::spawn(move || {
+                if slot_b
+                    .compare_exchange(0, 1, LoomOrdering::AcqRel, LoomOrdering::Acquire)
+                    .is_ok()
+                {
+                    live_b.fetch_add(1, LoomOrdering::AcqRel);
+                    let _guard = LoomInflightGuard {
+                        slot: LoomArc::clone(&slot_b),
+                        live: LoomArc::clone(&live_b),
+                    };
+                    loom_thread::yield_now();
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(live.load(LoomOrdering::Acquire), 0);
+            assert_eq!(slot.load(LoomOrdering::Acquire), 0);
         });
     }
 }
