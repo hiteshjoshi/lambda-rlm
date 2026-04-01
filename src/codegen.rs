@@ -37,8 +37,6 @@ const CLAUDE_CB_THRESHOLD: usize = 3;
 const CLAUDE_CB_COOLDOWN: Duration = Duration::from_secs(60);
 const OPENCODE_CB_THRESHOLD: usize = 2;
 const OPENCODE_CB_COOLDOWN: Duration = Duration::from_secs(120);
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(30);
-const OPENCODE_TIMEOUT: Duration = Duration::from_secs(45);
 const CLAUDE_MAX_CONCURRENT: usize = 4;
 const OPENCODE_MAX_CONCURRENT: usize = 2;
 const MAX_CODEGEN_BULKHEAD_PERMITS: usize = 64;
@@ -918,10 +916,6 @@ async fn run_generator_process(
         CodeGenerator::Claude => "claude",
         CodeGenerator::Opencode => "opencode",
     };
-    let timeout = match generator {
-        CodeGenerator::Claude => CLAUDE_TIMEOUT,
-        CodeGenerator::Opencode => OPENCODE_TIMEOUT,
-    };
     let child = cmd.spawn().with_context(|| {
         format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
     })?;
@@ -953,19 +947,11 @@ async fn run_generator_process(
             .map_err(anyhow::Error::from)
     });
 
-    let status = match tokio::time::timeout(timeout, child.child_mut()?.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
+    let status = match child.child_mut()?.wait().await {
+        Ok(status) => status,
+        Err(error) => {
             child.kill_and_reap().await;
             return Err(error).with_context(|| format!("Failed to run {generator_name}"));
-        }
-        Err(_) => {
-            child.kill_and_reap().await;
-            return Err(anyhow::anyhow!(
-                "{generator_name} timed out after {}s",
-                timeout.as_secs()
-            ))
-            .context("codegen_retryable");
         }
     };
     child.disarm();
