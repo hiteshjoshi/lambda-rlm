@@ -6,6 +6,7 @@
 //! output a summary line (or "CLEAN" if nothing actionable).
 
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use std::io::Write;
 use std::time::Instant;
 use std::{
@@ -17,6 +18,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::watch;
 use tokio::time::Duration;
 
 use crate::oracle::Oracle;
@@ -37,6 +39,9 @@ const OPENCODE_CB_COOLDOWN: Duration = Duration::from_secs(120);
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENCODE_TIMEOUT: Duration = Duration::from_secs(45);
 static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
+type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
+static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightSender>> = OnceLock::new();
 
 pub fn codegen_guard_live_count() -> u64 {
     CODEGEN_GUARD_LIVE_COUNT.load(Ordering::Acquire)
@@ -157,6 +162,73 @@ pub async fn run_code_generator(
     question: &str,
     iteration: usize,
 ) -> Result<Arc<str>> {
+    let flight_key = codegen_flight_key(generator, work_dir, question, iteration, result);
+    let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
+
+    loop {
+        match flights.entry(flight_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let mut rx = entry.get().subscribe();
+                let existing = rx.borrow().clone();
+                drop(entry);
+
+                if let Some(outcome) = existing {
+                    return flight_outcome_to_result(outcome, generator);
+                }
+
+                if rx.changed().await.is_err() {
+                    return Err(anyhow::anyhow!("code generation unavailable").context(
+                        match generator {
+                            CodeGenerator::Claude => "claude_service_unavailable",
+                            CodeGenerator::Opencode => "opencode_service_unavailable",
+                        },
+                    ));
+                }
+
+                let resolved = { rx.borrow().clone() };
+                if let Some(outcome) = resolved {
+                    return flight_outcome_to_result(outcome, generator);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (tx, _rx) = watch::channel::<Option<CodegenFlightResult>>(None);
+                let tx: CodegenFlightSender = Arc::new(tx);
+                entry.insert(Arc::clone(&tx));
+
+                let _flight_guard = CodegenFlightGuard {
+                    flights,
+                    key: flight_key.clone(),
+                };
+
+                let outcome = run_code_generator_once(
+                    oracle,
+                    generator,
+                    result,
+                    work_dir,
+                    question,
+                    iteration,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(generator = %generator, iteration, error = ?error, "single-flight leader failed");
+                    Arc::<str>::from("code generation unavailable")
+                });
+
+                let _ = tx.send(Some(outcome.clone()));
+                return flight_outcome_to_result(outcome, generator);
+            }
+        }
+    }
+}
+
+async fn run_code_generator_once(
+    oracle: &Oracle,
+    generator: &CodeGenerator,
+    result: &str,
+    work_dir: &Path,
+    question: &str,
+    iteration: usize,
+) -> Result<Arc<str>> {
     let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
     let circuit = codegen_circuit(generator)?;
     anyhow::ensure!(
@@ -196,6 +268,48 @@ pub async fn run_code_generator(
                 }),
             )
         }
+    }
+}
+
+struct CodegenFlightGuard<'a> {
+    flights: &'a DashMap<String, CodegenFlightSender>,
+    key: String,
+}
+
+impl Drop for CodegenFlightGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.flights.remove(&self.key);
+    }
+}
+
+fn codegen_flight_key(
+    generator: &CodeGenerator,
+    work_dir: &Path,
+    question: &str,
+    iteration: usize,
+    result: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(generator.to_string().as_bytes());
+    hasher.update(work_dir.as_os_str().to_string_lossy().as_bytes());
+    hasher.update(question.as_bytes());
+    hasher.update(&iteration.to_le_bytes());
+    hasher.update(result.as_bytes());
+    format!("codegen:{}", hasher.finalize().to_hex())
+}
+
+fn flight_outcome_to_result(
+    outcome: CodegenFlightResult,
+    generator: &CodeGenerator,
+) -> Result<Arc<str>> {
+    match outcome {
+        Ok(summary) => Ok(summary),
+        Err(_) => Err(
+            anyhow::anyhow!("code generation unavailable").context(match generator {
+                CodeGenerator::Claude => "claude_service_unavailable",
+                CodeGenerator::Opencode => "opencode_service_unavailable",
+            }),
+        ),
     }
 }
 
@@ -845,6 +959,9 @@ pub fn log_file_name(generator: &CodeGenerator, iteration: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom::sync::atomic::{AtomicUsize as LoomAtomicUsize, Ordering as LoomOrdering};
+    use loom::sync::Arc as LoomArc;
+    use loom::thread as loom_thread;
     use std::time::Duration as StdDuration;
 
     fn pid_alive(pid: u32) -> bool {
@@ -1005,5 +1122,101 @@ mod tests {
         })
         .await
         .expect("child process should be reaped within timeout");
+    }
+
+    #[test]
+    #[ignore = "loom model test; run explicitly when validating lock-free invariants"]
+    fn loom_codegen_budget_guard_restores_budget_under_race() {
+        struct LoomBudget {
+            remaining: LoomAtomicUsize,
+        }
+
+        impl LoomBudget {
+            fn new(units: usize) -> Self {
+                Self {
+                    remaining: LoomAtomicUsize::new(units),
+                }
+            }
+
+            fn try_reserve(&self, units: usize) -> bool {
+                let current = self.remaining.load(LoomOrdering::Acquire);
+                if current < units {
+                    return false;
+                }
+                self.remaining
+                    .compare_exchange(
+                        current,
+                        current - units,
+                        LoomOrdering::AcqRel,
+                        LoomOrdering::Acquire,
+                    )
+                    .is_ok()
+            }
+
+            fn unreserve(&self, units: usize) {
+                let _ = self.remaining.fetch_update(
+                    LoomOrdering::AcqRel,
+                    LoomOrdering::Acquire,
+                    |current| Some(current.saturating_add(units)),
+                );
+            }
+        }
+
+        struct LoomCodegenGuard {
+            budget: LoomArc<LoomBudget>,
+            units: usize,
+            committed: bool,
+        }
+
+        impl LoomCodegenGuard {
+            fn commit(&mut self) {
+                self.committed = true;
+            }
+        }
+
+        impl Drop for LoomCodegenGuard {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.budget.unreserve(self.units);
+                }
+            }
+        }
+
+        loom::model(|| {
+            let budget = LoomArc::new(LoomBudget::new(50));
+
+            let b1 = LoomArc::clone(&budget);
+            let t1 = loom_thread::spawn(move || {
+                if b1.try_reserve(50) {
+                    let mut guard = LoomCodegenGuard {
+                        budget: LoomArc::clone(&b1),
+                        units: 50,
+                        committed: false,
+                    };
+                    guard.commit();
+                }
+            });
+
+            let b2 = LoomArc::clone(&budget);
+            let t2 = loom_thread::spawn(move || {
+                if b2.try_reserve(50) {
+                    let _guard = LoomCodegenGuard {
+                        budget: LoomArc::clone(&b2),
+                        units: 50,
+                        committed: false,
+                    };
+                    loom_thread::yield_now();
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let remaining = budget.remaining.load(LoomOrdering::Acquire);
+            assert!(
+                remaining == 0 || remaining == 50,
+                "remaining must be either fully committed (0) or fully restored (50), got {remaining}"
+            );
+        });
     }
 }
