@@ -2,6 +2,12 @@
 
 ## Recent fix-loop hardening commits (moved from README)
 
+### `ea8b71c`
+
+- Fixed the interactive codegen deadlock in `src/codegen.rs` by moving code-generator bulkhead/budget acquisition to the non-interactive path only, so long-lived TTY sessions no longer hold permits that block other runtime work.
+- Hardened interactive failure classification in `src/codegen.rs`: timeout/wait failures are tagged `codegen_retryable`, missing-binary spawn failures are tagged `codegen_fatal`, and regression tests now assert both markers.
+- Added post-cleanup invariants in `src/phi.rs` with `debug_assert!(set.is_empty())` after `abort_and_drain` and `return_joinset`, making JoinSet handle leaks fail fast in debug/test runs.
+
 ### `d860423`
 
 - Tightened leak detection at process exit in `src/main.rs` by extending `ensure_no_live_guards` to fail on non-zero `inflight_guards_live` in addition to budget/codegen guard counters.
