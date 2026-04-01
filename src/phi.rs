@@ -63,6 +63,7 @@ pub struct PhiConfig {
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
 const MAX_JOINSET_POOL: usize = 32;
+const AUTO_DETECT_MAX_TOKENS: u32 = 256;
 
 fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
     cfg.joinset_pool
@@ -507,7 +508,7 @@ pub async fn auto_detect_task(
         question
     );
 
-    let response = oracle.call(system, &user, 64).await?;
+    let response = oracle.call(system, &user, AUTO_DETECT_MAX_TOKENS).await?;
     let normalized = response.trim().to_lowercase().replace(['-', '_', ' '], "");
 
     let task = match normalized.as_str() {

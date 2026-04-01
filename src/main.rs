@@ -39,6 +39,7 @@ static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -111,8 +112,8 @@ struct Cli {
     #[arg(short, long)]
     path: PathBuf,
 
-    /// Question or task description
-    #[arg(short, long)]
+    /// Question or task prompt description
+    #[arg(short, long, visible_alias = "prompt")]
     question: String,
 
     /// Task type (auto-detected if omitted)
@@ -195,6 +196,19 @@ struct Cli {
     #[arg(long, default_value = "false")]
     opencode: bool,
 
+    /// Run code generator in interactive TUI mode (requires --claude or --opencode)
+    #[arg(long, default_value = "false", requires = "code_generator")]
+    interactive: bool,
+
+    /// Interactive session timeout in minutes (1..=120)
+    #[arg(
+        long,
+        default_value = "30",
+        requires = "interactive",
+        value_parser = parse_interactive_timeout_minutes
+    )]
+    interactive_timeout: u64,
+
     /// Max fix iterations when using --claude or --opencode (0 = unlimited)
     #[arg(long, default_value = "10")]
     max_iterations: usize,
@@ -234,6 +248,16 @@ impl Cli {
             !(self.claude && self.opencode),
             "--claude and --opencode are mutually exclusive; pick one code generator"
         );
+        if self.interactive {
+            anyhow::ensure!(
+                self.claude || self.opencode,
+                "--interactive requires one of --claude or --opencode"
+            );
+            anyhow::ensure!(
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+                "--interactive requires an attached TTY on stdin/stdout"
+            );
+        }
         if self.claude {
             validate_generator_access(&types::CodeGenerator::Claude)?;
         } else if self.opencode {
@@ -273,9 +297,22 @@ impl Cli {
             self.dry_run as u8,
             self.claude as u8,
             self.opencode as u8,
+            self.interactive as u8,
         ]);
+        hasher.update(&self.interactive_timeout.to_le_bytes());
         let hash = hasher.finalize();
         format!("v{}:{}", CONFIG_SCHEMA_VERSION, &hash.to_hex()[..16])
+    }
+}
+
+fn parse_interactive_timeout_minutes(raw: &str) -> std::result::Result<u64, String> {
+    let mins: u64 = raw
+        .parse()
+        .map_err(|_| "interactive timeout must be an integer".to_string())?;
+    if (1..=120).contains(&mins) {
+        Ok(mins)
+    } else {
+        Err("interactive timeout must be between 1 and 120 minutes".to_string())
     }
 }
 
@@ -543,7 +580,24 @@ async fn run_analysis(
     let task = if cli.task == TaskType::Auto {
         eprintln!("Phase 2: Auto-detecting task type...");
         let preview = comb_peek(&prompt, 0, cli.peek_size);
-        auto_detect_task(preview, prompt.len(), &cli.question, oracle).await?
+        match auto_detect_task(preview, prompt.len(), &cli.question, oracle).await {
+            Ok(task) => task,
+            Err(error) => {
+                if is_auto_detect_truncation_error(&error) {
+                    tracing::warn!(
+                        error = %error,
+                        "auto-detect truncated; defaulting to summarise"
+                    );
+                    eprintln!(
+                        "  Phase 2: auto-detect truncated at classifier budget; defaulting to summarise"
+                    );
+                } else {
+                    tracing::warn!(error = %error, "auto-detect failed; defaulting to summarise");
+                    eprintln!("  Phase 2: auto-detect failed; defaulting to summarise");
+                }
+                TaskType::Summarise
+            }
+        }
     } else {
         eprintln!("Phase 2: Task type = {} (user-specified)", cli.task);
         cli.task.clone()
@@ -744,6 +798,14 @@ fn sanitize_error(error: &anyhow::Error) -> String {
     "Not Found".to_string()
 }
 
+fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("response truncated at max_tokens=")
+    })
+}
+
 fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
     let metrics = oracle.metrics();
     let codegen_guards_live = codegen::codegen_guard_live_count();
@@ -848,32 +910,32 @@ async fn run() -> Result<()> {
         std::fs::canonicalize(&cli.path)?
     };
 
-    const FIX_LOOP_HARD_MAX_ITERATIONS: usize = 10;
-    let max_iter = match cli.max_iterations {
-        0 => {
-            eprintln!(
-                ">>> --max-iterations=0 requested; clamping to safe cap {}",
-                FIX_LOOP_HARD_MAX_ITERATIONS
-            );
-            FIX_LOOP_HARD_MAX_ITERATIONS
-        }
-        n => n.min(FIX_LOOP_HARD_MAX_ITERATIONS),
-    };
-    if cli.max_iterations > FIX_LOOP_HARD_MAX_ITERATIONS {
+    let unlimited_iterations = cli.max_iterations == 0;
+    if unlimited_iterations {
         eprintln!(
-            ">>> --max-iterations={} exceeds safe cap {}; clamping",
-            cli.max_iterations, FIX_LOOP_HARD_MAX_ITERATIONS
+            ">>> --max-iterations=0 requested; running until clean, shutdown, or budget exhaustion"
         );
     }
 
-    for iteration in 1..=max_iter {
+    let mut iteration: usize = 1;
+    let mut reached_iteration_limit = false;
+    loop {
+        if !unlimited_iterations && iteration > cli.max_iterations {
+            reached_iteration_limit = true;
+            break;
+        }
+
         if *shutdown_rx.borrow() {
             eprintln!("\n>>> Shutdown requested; stopping fix loop.");
             break;
         }
 
         eprintln!("\n================================================================");
-        eprintln!("  ITERATION {iteration}/{max_iter}");
+        if unlimited_iterations {
+            eprintln!("  ITERATION {iteration} (unbounded)");
+        } else {
+            eprintln!("  ITERATION {iteration}/{}", cli.max_iterations);
+        }
         eprintln!("================================================================\n");
 
         // 1. Analyze
@@ -903,6 +965,8 @@ async fn run() -> Result<()> {
             &work_dir,
             &cli.question,
             iteration,
+            cli.interactive,
+            Duration::from_secs(cli.interactive_timeout.saturating_mul(60)),
         )
         .await?;
 
@@ -919,13 +983,19 @@ async fn run() -> Result<()> {
             eprintln!(">>> Budget exhausted. Terminating fix loop.");
             break;
         }
+
+        iteration = iteration
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("iteration counter overflow"))?;
     }
 
-    eprintln!(
-        "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
-        max_iter, generator
-    );
-    eprintln!(">>> Run again to continue if needed.");
+    if reached_iteration_limit {
+        eprintln!(
+            "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
+            cli.max_iterations, generator
+        );
+        eprintln!(">>> Run again to continue if needed.");
+    }
     ensure_no_live_guards(&oracle)?;
     Ok(())
 }
@@ -976,6 +1046,46 @@ mod tests {
             format!("{err:#}").contains("opencode binary not in PATH"),
             "unexpected preflight error: {err:#}"
         );
+    }
+
+    #[test]
+    fn cli_accepts_prompt_alias_for_question() {
+        let cli = Cli::parse_from(["lambda_rlm", "--path", ".", "--prompt", "smoke"]);
+        assert_eq!(cli.question, "smoke");
+    }
+
+    #[test]
+    fn truncation_error_detection_matches_oracle_message() {
+        let err = anyhow::anyhow!(
+            "response truncated at max_tokens=64 after 5 segment(s); increase token budget"
+        );
+        assert!(is_auto_detect_truncation_error(&err));
+    }
+
+    #[test]
+    fn truncation_error_detection_ignores_other_errors() {
+        let err = anyhow::anyhow!("network timeout");
+        assert!(!is_auto_detect_truncation_error(&err));
+    }
+
+    #[test]
+    fn interactive_timeout_parser_enforces_bounds() {
+        assert!(parse_interactive_timeout_minutes("0").is_err());
+        assert!(parse_interactive_timeout_minutes("121").is_err());
+        assert_eq!(parse_interactive_timeout_minutes("30").expect("valid"), 30);
+    }
+
+    #[test]
+    fn cli_rejects_interactive_without_generator_flag() {
+        let parsed = Cli::try_parse_from([
+            "lambda_rlm",
+            "--path",
+            ".",
+            "--question",
+            "smoke",
+            "--interactive",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

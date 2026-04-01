@@ -91,6 +91,12 @@ lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --claude
 
 # Using OpenCode
 lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --opencode
+
+# Interactive Claude session (TTY required)
+lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --claude --interactive
+
+# Interactive OpenCode session (TTY required)
+lambda_rlm -p ./src -q "Find and fix security vulnerabilities" --opencode --interactive
 ```
 
 What happens:
@@ -123,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Both generators run in print mode — fully autonomous, no prompts. Logs are saved to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, enforces a hard timeout (`--interactive-timeout`, default 30 minutes), and requires an attached TTY.
 
 ## How it works
 
@@ -167,7 +173,7 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-p, --path` | required | File or directory to analyze |
-| `-q, --question` | required | Question or task description |
+| `-q, --question, --prompt` | required | Question or task prompt description |
 | `-t, --task` | `auto` | search, classify, aggregate, pairwise, summarise, multi-hop |
 | `-w, --window` | `6000` | Leaf chunk size (chars) |
 | `-k` | `0` (auto) | Split factor per recursion level |
@@ -176,6 +182,8 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--max-tokens` | `8192` | Max output tokens |
 | `--claude` | `false` | Enable fix loop with Claude Code |
 | `--opencode` | `false` | Enable fix loop with OpenCode |
+| `--interactive` | `false` | Run generator in interactive TTY mode |
+| `--interactive-timeout` | `30` | Interactive hard timeout in minutes (1..=120) |
 | `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
 | `--no-cache` | `false` | Disable replay cache |

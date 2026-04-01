@@ -172,9 +172,18 @@ pub async fn run_code_generator(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    interactive: bool,
+    interactive_timeout: Duration,
 ) -> Result<Arc<str>> {
     maybe_scavenge_codegen_single_flight();
-    let flight_key = codegen_flight_key(generator, work_dir, question, iteration, result);
+    let flight_key = codegen_flight_key(
+        generator,
+        work_dir,
+        question,
+        iteration,
+        result,
+        interactive,
+    );
     let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
 
     loop {
@@ -222,6 +231,8 @@ pub async fn run_code_generator(
                     work_dir,
                     question,
                     iteration,
+                    interactive,
+                    interactive_timeout,
                 )
                 .await
                 .map_err(|error| {
@@ -243,14 +254,18 @@ async fn run_code_generator_once(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    interactive: bool,
+    interactive_timeout: Duration,
 ) -> Result<Arc<str>> {
-    let cache_key = codegen_cache_key(generator, result);
-    if let Some(cached) = oracle
-        .cache()
-        .get_validated(&cache_key, |value| validate_codegen_summary(value).is_ok())
-    {
-        tracing::debug!(generator = %generator, iteration, "codegen replay cache hit");
-        return Ok(Arc::from(cached));
+    let cache_key = codegen_cache_key(generator, result, interactive);
+    if !interactive {
+        if let Some(cached) = oracle
+            .cache()
+            .get_validated(&cache_key, |value| validate_codegen_summary(value).is_ok())
+        {
+            tracing::debug!(generator = %generator, iteration, "codegen replay cache hit");
+            return Ok(Arc::from(cached));
+        }
     }
 
     let _bulkhead = codegen_bulkhead(generator)
@@ -265,16 +280,24 @@ async fn run_code_generator_once(
     );
 
     let started = Instant::now();
-    let run = match generator {
-        CodeGenerator::Claude => run_claude(result, work_dir, question, iteration).await,
-        CodeGenerator::Opencode => run_opencode(result, work_dir, question, iteration).await,
+    let run = match (generator, interactive) {
+        (CodeGenerator::Claude, true) => {
+            run_claude_interactive(result, work_dir, question, iteration, interactive_timeout).await
+        }
+        (CodeGenerator::Claude, false) => run_claude(result, work_dir, question, iteration).await,
+        (CodeGenerator::Opencode, true) => {
+            run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout).await
+        }
+        (CodeGenerator::Opencode, false) => run_opencode(result, work_dir, question, iteration).await,
     };
     oracle.record_codegen_call(generator, started.elapsed());
 
     match run {
         Ok(summary) => {
-            if let Err(error) = oracle.cache().put(&cache_key, summary.as_ref()) {
-                tracing::warn!(generator = %generator, iteration, error = %error, "failed to persist codegen replay cache entry");
+            if !interactive {
+                if let Err(error) = oracle.cache().put(&cache_key, summary.as_ref()) {
+                    tracing::warn!(generator = %generator, iteration, error = %error, "failed to persist codegen replay cache entry");
+                }
             }
             circuit.record_success();
             budget_guard.commit();
@@ -319,12 +342,14 @@ fn codegen_flight_key(
     question: &str,
     iteration: usize,
     result: &str,
+    interactive: bool,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(generator.to_string().as_bytes());
     hasher.update(work_dir.as_os_str().to_string_lossy().as_bytes());
     hasher.update(question.as_bytes());
     hasher.update(&iteration.to_le_bytes());
+    hasher.update(&[interactive as u8]);
     hasher.update(result.as_bytes());
     format!("{}:{}", generator, hasher.finalize().to_hex())
 }
@@ -407,13 +432,15 @@ fn codegen_bulkhead(generator: &CodeGenerator) -> Arc<Semaphore> {
     }
 }
 
-fn codegen_cache_key(generator: &CodeGenerator, result: &str) -> String {
+fn codegen_cache_key(generator: &CodeGenerator, result: &str, interactive: bool) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[CODEGEN_CACHE_SCHEMA_VERSION]);
     hasher.update(b"codegen\x00");
     hasher.update(generator.to_string().as_bytes());
     hasher.update(b"\x00");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(&[interactive as u8]);
     hasher.update(b"\x00");
     hasher.update(result.as_bytes());
     format!("b3-codegen_{}", hasher.finalize().to_hex())
@@ -682,12 +709,41 @@ pub fn validate_opencode_binary_version() -> Result<()> {
         output.status
     );
     let version = String::from_utf8_lossy(&output.stdout);
+    let major = parse_opencode_major_version(&version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unable to parse OpenCode version output: {}",
+            version.trim()
+        )
+    })?;
     anyhow::ensure!(
-        version.trim_start().starts_with("opencode 1."),
+        major == 1,
         "OpenCode v1.x required, found: {}",
         version.trim()
     );
     Ok(())
+}
+
+fn parse_opencode_major_version(version_output: &str) -> Option<u64> {
+    for raw_token in version_output.split_whitespace() {
+        let token = raw_token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+        if token.eq_ignore_ascii_case("opencode") {
+            continue;
+        }
+
+        let token = token.strip_prefix('v').unwrap_or(token);
+        let mut parts = token.split('.');
+        let major = parts.next()?;
+        let minor = parts.next();
+        if minor.is_none() {
+            continue;
+        }
+        if !major.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        return major.parse::<u64>().ok();
+    }
+    None
 }
 
 impl CodeGenerator {
@@ -960,6 +1016,59 @@ fn configure_generator_command(cmd: &mut tokio::process::Command, work_dir: &Pat
     }
 }
 
+fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, work_dir: &Path) {
+    cmd.current_dir(work_dir)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
+
+async fn run_generator_interactive_process(
+    mut cmd: tokio::process::Command,
+    generator: &CodeGenerator,
+    timeout: Duration,
+) -> Result<()> {
+    let generator_name = match generator {
+        CodeGenerator::Claude => "claude",
+        CodeGenerator::Opencode => "opencode",
+    };
+    let child = cmd.spawn().with_context(|| {
+        format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
+    })?;
+    let mut child = ChildCleanup::new(child);
+
+    let status = tokio::time::timeout(timeout, async {
+        child
+            .child_mut()?
+            .wait()
+            .await
+            .with_context(|| format!("Failed to run {generator_name}"))
+    })
+    .await
+    .with_context(|| format!("{generator_name} interactive session timed out after {timeout:?}"))??;
+
+    child.disarm();
+    if !status.success() {
+        return Err(classify_non_success_exit(generator_name, status));
+    }
+
+    Ok(())
+}
+
+fn interactive_prompt(question: &str, iteration: usize) -> String {
+    format!(
+        "You are running interactive mode for lambda-RLM iteration {iteration}.\n\
+         Read .lambda-rlm-result.md first, then execute fixes for: \"{question}\".\n\
+         Commit your changes when done and print a one-line summary (or CLEAN)."
+    )
+}
+
 /// Spawn claude in print mode and wait for it to finish.
 /// Returns Claude's output summary (last non-empty line).
 ///
@@ -1024,6 +1133,33 @@ async fn run_claude(
 
     remove_result_file(work_dir).await;
     cleanup_old_logs(work_dir, &CodeGenerator::Claude);
+    run
+}
+
+async fn run_claude_interactive(
+    result: &str,
+    work_dir: &Path,
+    question: &str,
+    iteration: usize,
+    timeout: Duration,
+) -> Result<Arc<str>> {
+    write_result_file_atomically(work_dir, result, iteration).await?;
+
+    let run = async {
+        eprintln!(
+            ">>> Iteration {iteration}: launching interactive claude in {} ...",
+            work_dir.display()
+        );
+        let mut cmd = tokio::process::Command::new("claude");
+        cmd.arg("--dangerously-skip-permissions")
+            .arg(interactive_prompt(question, iteration));
+        configure_interactive_generator_command(&mut cmd, work_dir);
+        run_generator_interactive_process(cmd, &CodeGenerator::Claude, timeout).await?;
+        Ok(Arc::<str>::from("interactive session completed"))
+    }
+    .await;
+
+    remove_result_file(work_dir).await;
     run
 }
 
@@ -1092,6 +1228,34 @@ async fn run_opencode(
 
     remove_result_file(work_dir).await;
     cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
+    run
+}
+
+async fn run_opencode_interactive(
+    result: &str,
+    work_dir: &Path,
+    question: &str,
+    iteration: usize,
+    timeout: Duration,
+) -> Result<Arc<str>> {
+    write_result_file_atomically(work_dir, result, iteration).await?;
+
+    let run = async {
+        eprintln!(
+            ">>> Iteration {iteration}: launching interactive opencode in {} ...",
+            work_dir.display()
+        );
+        eprintln!(
+            ">>> Start by opening .lambda-rlm-result.md, then apply fixes for: \"{question}\""
+        );
+        let mut cmd = tokio::process::Command::new("opencode");
+        configure_interactive_generator_command(&mut cmd, work_dir);
+        run_generator_interactive_process(cmd, &CodeGenerator::Opencode, timeout).await?;
+        Ok(Arc::<str>::from("interactive session completed"))
+    }
+    .await;
+
+    remove_result_file(work_dir).await;
     run
 }
 
@@ -1176,6 +1340,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_opencode_major_version_accepts_prefixed_output() {
+        assert_eq!(parse_opencode_major_version("opencode 1.3.13"), Some(1));
+    }
+
+    #[test]
+    fn parse_opencode_major_version_accepts_plain_semver_output() {
+        assert_eq!(parse_opencode_major_version("1.3.13"), Some(1));
+    }
+
+    #[test]
+    fn parse_opencode_major_version_rejects_unparseable_output() {
+        assert_eq!(
+            parse_opencode_major_version("opencode version unknown"),
+            None
+        );
+    }
+
+    #[test]
     fn extract_result_skips_opencode_headers() {
         let output =
             b"OpenCode v0.6.0\nModel: gpt-5\nStatus: done\nFixed input validation and added tests\n";
@@ -1204,16 +1386,31 @@ mod tests {
     #[test]
     fn codegen_cache_key_changes_with_generator() {
         let result = "fix critical issue";
-        let claude = codegen_cache_key(&CodeGenerator::Claude, result);
-        let opencode = codegen_cache_key(&CodeGenerator::Opencode, result);
+        let claude = codegen_cache_key(&CodeGenerator::Claude, result, false);
+        let opencode = codegen_cache_key(&CodeGenerator::Opencode, result, false);
         assert_ne!(claude, opencode);
         assert!(claude.starts_with("b3-codegen_"));
         assert!(opencode.starts_with("b3-codegen_"));
     }
 
     #[test]
+    fn codegen_cache_key_differs_for_interactive_mode() {
+        let result = "fix critical issue";
+        let headless = codegen_cache_key(&CodeGenerator::Claude, result, false);
+        let interactive = codegen_cache_key(&CodeGenerator::Claude, result, true);
+        assert_ne!(headless, interactive);
+    }
+
+    #[test]
     fn codegen_flight_key_is_generator_prefixed() {
-        let key = codegen_flight_key(&CodeGenerator::Opencode, Path::new("/tmp"), "q", 1, "r");
+        let key = codegen_flight_key(
+            &CodeGenerator::Opencode,
+            Path::new("/tmp"),
+            "q",
+            1,
+            "r",
+            false,
+        );
         assert!(key.starts_with("opencode:"));
     }
 
