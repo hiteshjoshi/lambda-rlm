@@ -52,6 +52,7 @@ const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_CODEGEN_CHILDREN: OnceLock<DashMap<u32, ()>> = OnceLock::new();
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
 static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightEntry>> = OnceLock::new();
@@ -74,6 +75,42 @@ pub fn codegen_guard_live_counts() -> CodegenGuardLiveCounts {
         flight: CODEGEN_FLIGHT_GUARD_LIVE_COUNT.load(Ordering::Acquire),
         child_cleanup: CHILD_CLEANUP_GUARD_LIVE_COUNT.load(Ordering::Acquire),
     }
+}
+
+fn tracked_codegen_children() -> &'static DashMap<u32, ()> {
+    LIVE_CODEGEN_CHILDREN.get_or_init(DashMap::new)
+}
+
+fn track_codegen_child_pid(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        tracked_codegen_children().insert(pid, ());
+    }
+}
+
+fn untrack_codegen_child_pid(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = tracked_codegen_children().remove(&pid);
+    }
+}
+
+pub fn force_kill_tracked_codegen_children() -> usize {
+    let pids: Vec<u32> = tracked_codegen_children()
+        .iter()
+        .map(|entry| *entry.key())
+        .collect();
+
+    for pid in &pids {
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+        }
+        untrack_codegen_child_pid(Some(*pid));
+    }
+
+    pids.len()
 }
 
 #[must_use = "dropping CodegenBudgetGuard without commit() restores budget"]
@@ -347,32 +384,36 @@ async fn run_code_generator_once(
     if interactive {
         let interactive_timeout = clamp_interactive_startup_timeout(interactive_timeout);
         let started = Instant::now();
-        let run = match generator {
-            CodeGenerator::Claude => {
-                run_claude_interactive(
-                    result,
-                    work_dir,
-                    question,
-                    iteration,
-                    interactive_timeout,
-                    INTERACTIVE_SESSION_TIMEOUT,
-                    shutdown,
-                )
-                .await
+        let run = tokio::time::timeout(INTERACTIVE_SESSION_TIMEOUT, async {
+            match generator {
+                CodeGenerator::Claude => {
+                    run_claude_interactive(
+                        result,
+                        work_dir,
+                        question,
+                        iteration,
+                        interactive_timeout,
+                        INTERACTIVE_SESSION_TIMEOUT,
+                        shutdown,
+                    )
+                    .await
+                }
+                CodeGenerator::Opencode => {
+                    run_opencode_interactive(
+                        result,
+                        work_dir,
+                        question,
+                        iteration,
+                        interactive_timeout,
+                        INTERACTIVE_SESSION_TIMEOUT,
+                        shutdown,
+                    )
+                    .await
+                }
             }
-            CodeGenerator::Opencode => {
-                run_opencode_interactive(
-                    result,
-                    work_dir,
-                    question,
-                    iteration,
-                    interactive_timeout,
-                    INTERACTIVE_SESSION_TIMEOUT,
-                    shutdown,
-                )
-                .await
-            }
-        };
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))?;
         oracle.record_codegen_call(generator, started.elapsed());
 
         return match run {
@@ -973,6 +1014,7 @@ struct ChildCleanup {
 impl ChildCleanup {
     fn new(child: tokio::process::Child) -> Self {
         CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        track_codegen_child_pid(child.id());
         Self { child: Some(child) }
     }
 
@@ -984,13 +1026,17 @@ impl ChildCleanup {
 
     async fn kill_and_reap(&mut self, wait_timeout: Duration) {
         if let Some(child) = self.child.as_mut() {
+            let pid = child.id();
             let _ = child.start_kill();
             let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
+            untrack_codegen_child_pid(pid);
         }
         self.child = None;
     }
 
     fn disarm(&mut self) {
+        let pid = self.child.as_ref().and_then(tokio::process::Child::id);
+        untrack_codegen_child_pid(pid);
         self.child = None;
     }
 }
@@ -1000,6 +1046,7 @@ impl Drop for ChildCleanup {
         CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(child) = self.child.take() {
+                untrack_codegen_child_pid(child.id());
                 spawn_background_child_reap(child);
             }
         }));
@@ -1007,8 +1054,10 @@ impl Drop for ChildCleanup {
 }
 
 async fn kill_and_reap_owned(mut child: tokio::process::Child, wait_timeout: Duration) {
+    let pid = child.id();
     let _ = child.start_kill();
     let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
+    untrack_codegen_child_pid(pid);
 }
 
 fn spawn_background_child_reap(mut child: tokio::process::Child) {

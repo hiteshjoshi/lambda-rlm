@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tracing_subscriber::EnvFilter;
 
-static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
 /// Returns None if the file is a symlink or cannot be opened.
@@ -871,6 +871,23 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    let codegen_guards = codegen::codegen_guard_live_counts();
+    if codegen_guards.child_cleanup > 0 {
+        let attempted = codegen::force_kill_tracked_codegen_children();
+        if attempted > 0 {
+            tracing::error!(
+                attempted,
+                "forced kill for lingering codegen children during shutdown"
+            );
+            for _ in 0..20 {
+                if codegen::codegen_guard_live_counts().child_cleanup == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
     let metrics = oracle.metrics();
     let codegen_guards = codegen::codegen_guard_live_counts();
     debug_assert_eq!(metrics.budget_guards_live, 0, "BudgetGuard leak detected");
@@ -1057,8 +1074,9 @@ async fn run() -> Result<()> {
         let _interactive_permit = if cli.interactive {
             Some(
                 INTERACTIVE_SESSION_SEMAPHORE
-                    .get_or_init(|| tokio::sync::Semaphore::new(1))
-                    .acquire()
+                    .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                    .clone()
+                    .acquire_owned()
                     .await
                     .context("interactive session already in progress")?,
             )
