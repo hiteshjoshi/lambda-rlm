@@ -104,15 +104,21 @@ impl Drop for CodegenBudgetGuard<'_> {
     }
 }
 
-fn codegen_circuit(generator: &CodeGenerator) -> Result<&'static CircuitBreaker> {
+fn codegen_circuit(generator: &CodeGenerator, interactive: bool) -> Result<&'static CircuitBreaker> {
     static CLAUDE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    static CLAUDE_INTERACTIVE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     // OpenCode is still less stable under sustained load in our testing, so it
     // uses a stricter threshold/longer cooldown to isolate faults faster.
     static OPENCODE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
-    let circuit = match generator {
-        CodeGenerator::Claude => CLAUDE_CIRCUIT
+    static OPENCODE_INTERACTIVE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    let circuit = match (generator, interactive) {
+        (CodeGenerator::Claude, false) => CLAUDE_CIRCUIT
             .get_or_init(|| CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN)),
-        CodeGenerator::Opencode => OPENCODE_CIRCUIT
+        (CodeGenerator::Claude, true) => CLAUDE_INTERACTIVE_CIRCUIT
+            .get_or_init(|| CircuitBreaker::new(CLAUDE_CB_THRESHOLD, CLAUDE_CB_COOLDOWN)),
+        (CodeGenerator::Opencode, false) => OPENCODE_CIRCUIT
+            .get_or_init(|| CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN)),
+        (CodeGenerator::Opencode, true) => OPENCODE_INTERACTIVE_CIRCUIT
             .get_or_init(|| CircuitBreaker::new(OPENCODE_CB_THRESHOLD, OPENCODE_CB_COOLDOWN)),
     };
     Ok(circuit)
@@ -274,7 +280,7 @@ async fn run_code_generator_once(
         }
     }
 
-    let circuit = codegen_circuit(generator)?;
+    let circuit = codegen_circuit(generator, interactive)?;
     anyhow::ensure!(
         circuit.allow_request(),
         "code generation temporarily unavailable"
@@ -927,14 +933,6 @@ impl Drop for ChildCleanup {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(mut child) = self.child.take() {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                    });
-                    return;
-                }
-
                 let _ = std::thread::Builder::new()
                     .name("codegen-child-reaper".to_owned())
                     .spawn(move || {
@@ -1099,7 +1097,7 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
 async fn run_generator_interactive_process(
     mut cmd: tokio::process::Command,
     generator: &CodeGenerator,
-    startup_timeout: Duration,
+    _startup_timeout: Duration,
     session_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1116,37 +1114,6 @@ async fn run_generator_interactive_process(
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
-    // Probe startup so immediate failures are surfaced quickly.
-    let startup_probe = tokio::time::timeout(startup_timeout, async {
-        loop {
-            let maybe_status = child
-                .child_mut()?
-                .try_wait()
-                .map_err(anyhow::Error::from)
-                .with_context(|| format!("Failed to probe {generator_name} startup"))?;
-            if let Some(status) = maybe_status {
-                return Ok::<std::process::ExitStatus, anyhow::Error>(status);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
-
-    match startup_probe {
-        Ok(Ok(status)) => {
-            child.disarm();
-            if !status.success() {
-                return Err(classify_non_success_exit(generator_name, status));
-            }
-            return Ok(());
-        }
-        Ok(Err(error)) => {
-            child.kill_and_reap().await;
-            return Err(error).context("codegen_retryable");
-        }
-        Err(_) => {}
-    }
-
     let wait_for_child = async {
         child
             .child_mut()?
@@ -1158,6 +1125,15 @@ async fn run_generator_interactive_process(
     };
 
     tokio::select! {
+        biased;
+
+        changed = shutdown_rx.changed() => {
+            if changed.is_ok() || *shutdown_rx.borrow() {
+                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
+            }
+            child.kill_and_reap().await;
+            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
+        }
         status = wait_for_child => {
             let status = status?;
             child.disarm();
@@ -1174,13 +1150,6 @@ async fn run_generator_interactive_process(
             );
             child.kill_and_reap().await;
             Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))
-        }
-        changed = shutdown_rx.changed() => {
-            if changed.is_ok() || *shutdown_rx.borrow() {
-                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
-            }
-            child.kill_and_reap().await;
-            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
         }
     }
 }
@@ -1639,12 +1608,15 @@ mod tests {
     }
 
     #[test]
-    fn codegen_circuits_are_isolated_by_generator() {
-        let claude = codegen_circuit(&CodeGenerator::Claude).expect("claude circuit");
-        let opencode = codegen_circuit(&CodeGenerator::Opencode).expect("opencode circuit");
+    fn codegen_circuits_are_isolated_by_generator_and_mode() {
+        let claude = codegen_circuit(&CodeGenerator::Claude, false).expect("claude circuit");
+        let opencode = codegen_circuit(&CodeGenerator::Opencode, false).expect("opencode circuit");
+        let opencode_interactive =
+            codegen_circuit(&CodeGenerator::Opencode, true).expect("opencode interactive circuit");
 
         claude.record_success();
         opencode.record_success();
+        opencode_interactive.record_success();
 
         for _ in 0..OPENCODE_CB_THRESHOLD {
             opencode.record_failure();
@@ -1652,9 +1624,11 @@ mod tests {
 
         assert!(!opencode.allow_request());
         assert!(claude.allow_request());
+        assert!(opencode_interactive.allow_request());
 
         claude.record_success();
         opencode.record_success();
+        opencode_interactive.record_success();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1714,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn interactive_process_timeout_only_covers_startup() {
+    async fn interactive_process_startup_timeout_does_not_gate_session() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("1")
@@ -1730,7 +1704,7 @@ mod tests {
             shutdown_rx,
         )
         .await
-        .expect("startup timeout should not terminate interactive session");
+        .expect("interactive session should complete without startup probing");
     }
 
     #[tokio::test(flavor = "current_thread")]

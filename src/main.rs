@@ -46,6 +46,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tracing_subscriber::EnvFilter;
 
+static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
 /// Returns None if the file is a symlink or cannot be opened.
 /// On Unix, uses O_NOFOLLOW to atomically reject symlinks.
@@ -988,6 +990,17 @@ async fn run() -> Result<()> {
 
         // 3. Hand to code generator
         validate_codegen_result_target(&work_dir)?;
+        let _interactive_permit = if cli.interactive {
+            Some(
+                INTERACTIVE_SESSION_SEMAPHORE
+                    .get_or_init(|| tokio::sync::Semaphore::new(1))
+                    .acquire()
+                    .await
+                    .context("interactive session already in progress")?,
+            )
+        } else {
+            None
+        };
         let summary = codegen::run_code_generator(
             oracle.as_ref(),
             &generator,
@@ -1001,9 +1014,7 @@ async fn run() -> Result<()> {
         )
         .await?;
 
-        if cli.interactive {
-            ensure_no_live_guards(&oracle)?;
-        }
+        ensure_no_live_guards(&oracle)?;
 
         oracle.print_telemetry();
 
