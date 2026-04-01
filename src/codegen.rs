@@ -1356,11 +1356,6 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1416,23 +1411,6 @@ fn spawn_interactive_watchdog(
     });
 
     (handle, event_rx)
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
 }
 
 async fn stop_interactive_watchdog(
@@ -1501,16 +1479,9 @@ async fn run_generator_interactive_process(
         startup_ready_rx,
         watchdog_stop_rx,
     );
-    let mut startup_ready_tx = Some(startup_ready_tx);
+    let _ = startup_ready_tx.send(());
     let mut watchdog_guard = InteractiveWatchdogGuard::new(watchdog_stop_tx);
     let mut watchdog_handle = Some(watchdog_handle);
-    let mut startup_verified = child_pid.is_none();
-
-    if startup_verified {
-        if let Some(tx) = startup_ready_tx.take() {
-            let _ = tx.send(());
-        }
-    }
 
     loop {
         let status = child
@@ -1524,29 +1495,9 @@ async fn run_generator_interactive_process(
             stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
             if !status.success() {
                 let classified = classify_non_success_exit(generator_name, status);
-                if !startup_verified {
-                    return Err(classified.context("codegen_fatal"));
-                }
                 return Err(classified);
             }
-            if !startup_verified {
-                return Err(anyhow::anyhow!(
-                    "interactive generator exited before startup readiness"
-                )
-                .context("codegen_fatal"));
-            }
             return Ok(());
-        }
-
-        if !startup_verified {
-            if let Some(pid) = child_pid {
-                if pid_alive(pid) {
-                    startup_verified = true;
-                    if let Some(tx) = startup_ready_tx.take() {
-                        let _ = tx.send(());
-                    }
-                }
-            }
         }
 
         tokio::select! {
