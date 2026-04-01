@@ -54,8 +54,8 @@ fn opencode_preflight_fails_fast_when_binary_missing() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Not Found"),
-        "expected sanitized startup failure, got: {stderr}"
+        stderr.contains("[ERROR]"),
+        "expected [ERROR] in startup failure output, got: {stderr}"
     );
     assert!(
         !stderr.contains("ITERATION"),
@@ -92,8 +92,8 @@ fn interactive_fails_fast_without_tty() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Not Found"),
-        "expected sanitized failure output, got: {stderr}"
+        stderr.contains("[ERROR]"),
+        "expected [ERROR] in failure output, got: {stderr}"
     );
     assert!(
         !stderr.contains("launching interactive"),

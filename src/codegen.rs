@@ -7,13 +7,16 @@
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use regex::Regex;
+use std::io::IsTerminal;
+use std::io::Read;
 use std::io::Write;
 use std::time::Instant;
 use std::{
     path::Path,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::Arc,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
@@ -55,16 +58,19 @@ const CHILD_SHUTDOWN_REAP_TIMEOUT: Duration = Duration::from_millis(100);
 const CHILD_DROP_REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+const INTERACTIVE_IO_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PTY_SESSION_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_CODEGEN_CHILDREN: OnceLock<DashMap<u32, ()>> = OnceLock::new();
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
 static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightEntry>> = OnceLock::new();
 static CODEGEN_SINGLE_FLIGHT_LAST_SCAVENGE_SECS: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_SINGLE_FLIGHT_SCAVENGE_COUNT: AtomicU64 = AtomicU64::new(0);
-const CODEGEN_SINGLE_FLIGHT_SHRINK_EVERY: u64 = 16;
+const CODEGEN_SINGLE_FLIGHT_SHRINK_EVERY: u64 = 100;
+const INTERACTIVE_STDIN_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct CodegenFlightEntry {
     sender: CodegenFlightSender,
@@ -75,6 +81,7 @@ pub struct CodegenGuardLiveCounts {
     pub budget: u64,
     pub flight: u64,
     pub child_cleanup: u64,
+    pub pty_session: u64,
 }
 
 pub fn codegen_guard_live_counts() -> CodegenGuardLiveCounts {
@@ -82,7 +89,52 @@ pub fn codegen_guard_live_counts() -> CodegenGuardLiveCounts {
         budget: CODEGEN_BUDGET_GUARD_LIVE_COUNT.load(Ordering::Acquire),
         flight: CODEGEN_FLIGHT_GUARD_LIVE_COUNT.load(Ordering::Acquire),
         child_cleanup: CHILD_CLEANUP_GUARD_LIVE_COUNT.load(Ordering::Acquire),
+        pty_session: PTY_SESSION_GUARD_LIVE_COUNT.load(Ordering::Acquire),
     }
+}
+
+#[must_use = "PtySessionGuard tracks interactive PTY lifecycle"]
+struct PtySessionGuard;
+
+impl PtySessionGuard {
+    fn new() -> Self {
+        PTY_SESSION_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for PtySessionGuard {
+    fn drop(&mut self) {
+        PTY_SESSION_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn join_interactive_io_task(task: JoinHandle<()>, label: &'static str) {
+    let mut task = task;
+    match tokio::time::timeout(INTERACTIVE_IO_JOIN_TIMEOUT, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_error)) => {
+            tracing::warn!(label, error = ?join_error, "interactive I/O task join failed");
+        }
+        Err(_) => {
+            task.abort();
+            tracing::warn!(
+                label,
+                timeout_ms = INTERACTIVE_IO_JOIN_TIMEOUT.as_millis(),
+                "interactive I/O task did not stop before join timeout"
+            );
+        }
+    }
+}
+
+fn is_sensitive_env_var_name(name: &str) -> bool {
+    static SENSITIVE_ENV_NAME_RE: OnceLock<Regex> = OnceLock::new();
+    SENSITIVE_ENV_NAME_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)^[a-z_][a-z0-9_]*(?:key|token|secret|api)[a-z0-9_]*$")
+                .expect("valid sensitive env-name regex")
+        })
+        .is_match(name)
 }
 
 fn tracked_codegen_children() -> &'static DashMap<u32, ()> {
@@ -232,7 +284,7 @@ fn build_prompt(question: &str, iteration: usize) -> String {
          1. Read the findings carefully.\n\
          2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
          3. When done, output a single line summary of what you changed.\n\
-         4. Do a proper git commit(non-signed)\n\
+         4. Do a proper git commit(signed commit preferred)\n\
          5. Update readme with commit id and change-log\n\
          5. If there is nothing actionable (only informational notes or the analysis is clean), \
             output exactly: CLEAN\n\n\
@@ -259,7 +311,7 @@ fn build_prompt_with_inline_result(question: &str, iteration: usize, result: &st
          1. Read the findings carefully.\n\
          2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
          3. When done, output a single line summary of what you changed.\n\
-         4. Do a proper git commit(non-signed)\n\
+         4. Do a proper git commit(signed commit preferred)\n\
          5. Update readme with commit id and change-log\n\
          5. If there is nothing actionable (only informational notes or the analysis is clean), \
             output exactly: CLEAN"
@@ -312,6 +364,10 @@ pub async fn run_code_generator(
     loop {
         match flights.entry(flight_key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
+                if entry.get().inserted_at.elapsed() > CODEGEN_SINGLE_FLIGHT_TTL {
+                    let _ = flights.remove(&flight_key);
+                    continue;
+                }
                 let mut rx = entry.get().sender.subscribe();
                 let existing = rx.borrow().clone();
                 drop(entry);
@@ -399,7 +455,7 @@ fn validate_codegen_work_dir(work_dir: &Path) -> Result<()> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let _ = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(work_dir)
             .with_context(|| format!("refusing unsafe work directory {}", work_dir.display()))?;
 
@@ -477,12 +533,15 @@ async fn run_code_generator_once(
                         "interactive opencode global timeout ({}s)",
                         OPENCODE_INTERACTIVE_GLOBAL_TIMEOUT.as_secs()
                     )
-                    .context("codegen_retryable")
+                    .context(CodegenErrorMarker(CodegenErrorKind::Retryable))
                 })?,
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("interactive session timeout")
+                .context(CodegenErrorMarker(CodegenErrorKind::Retryable))
+        })?;
         oracle.record_codegen_call(generator, started.elapsed());
 
         return match run {
@@ -670,9 +729,45 @@ fn flight_outcome_to_result(
 }
 
 fn error_has_context(error: &anyhow::Error, marker: &str) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains(marker))
+    match marker {
+        "codegen_fatal" => {
+            codegen_error_kind(error).is_some_and(|kind| kind == CodegenErrorKind::Fatal)
+        }
+        "codegen_retryable" => {
+            codegen_error_kind(error).is_some_and(|kind| kind == CodegenErrorKind::Retryable)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodegenErrorKind {
+    Retryable,
+    Fatal,
+}
+
+#[derive(Debug)]
+struct CodegenErrorMarker(CodegenErrorKind);
+
+impl std::fmt::Display for CodegenErrorMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("code generation failed")
+    }
+}
+
+impl std::error::Error for CodegenErrorMarker {}
+
+fn codegen_error_kind(error: &anyhow::Error) -> Option<CodegenErrorKind> {
+    if let Some(marker) = error.downcast_ref::<CodegenErrorMarker>() {
+        return Some(marker.0);
+    }
+
+    for cause in error.chain() {
+        if let Some(marker) = cause.downcast_ref::<CodegenErrorMarker>() {
+            return Some(marker.0);
+        }
+    }
+    None
 }
 
 fn codegen_bulkhead(generator: &CodeGenerator) -> Arc<Semaphore> {
@@ -756,14 +851,33 @@ fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("refusing unsafe result path: {}", path.display()))?;
     let meta = file.metadata()?;
     Ok((file, meta.len(), meta.dev(), meta.ino()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("refusing unsafe result path: {}", path.display()))?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "refusing symlink result file"
+    );
+    Ok((file, meta.len(), 0, 0))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect result path: {}", path.display()))?;
@@ -1243,20 +1357,30 @@ where
     Ok(out)
 }
 
-fn classify_non_success_exit(
-    generator_name: &str,
-    status: std::process::ExitStatus,
-) -> anyhow::Error {
+fn classify_non_success_exit(generator_name: &str, status: &ProcessExitStatus) -> anyhow::Error {
     match status.code() {
         Some(127) => anyhow::anyhow!("{generator_name} command not found (exit 127)")
-            .context("codegen_fatal"),
+            .context(CodegenErrorMarker(CodegenErrorKind::Fatal)),
         Some(1) => anyhow::anyhow!("{generator_name} exited with retryable CLI error (exit 1)")
-            .context("codegen_retryable"),
-        Some(code) => {
-            anyhow::anyhow!("{generator_name} exited with code {code}").context("codegen_retryable")
-        }
-        None => {
-            anyhow::anyhow!("{generator_name} terminated by signal").context("codegen_retryable")
+            .context(CodegenErrorMarker(CodegenErrorKind::Retryable)),
+        Some(code) => anyhow::anyhow!("{generator_name} exited with code {code}")
+            .context(CodegenErrorMarker(CodegenErrorKind::Retryable)),
+        None => anyhow::anyhow!("{generator_name} terminated by signal")
+            .context(CodegenErrorMarker(CodegenErrorKind::Retryable)),
+    }
+}
+
+#[derive(Debug)]
+enum ProcessExitStatus {
+    Std(std::process::ExitStatus),
+    Pty(portable_pty::ExitStatus),
+}
+
+impl ProcessExitStatus {
+    fn code(&self) -> Option<i32> {
+        match self {
+            Self::Std(status) => status.code(),
+            Self::Pty(status) => i32::try_from(status.exit_code()).ok(),
         }
     }
 }
@@ -1264,13 +1388,27 @@ fn classify_non_success_exit(
 fn sanitize_generator_stderr(input: &str) -> String {
     let mut out = input.to_owned();
     for (name, value) in std::env::vars() {
-        let looks_sensitive =
-            name == "FIREWORKS_API" || name.starts_with("OPENCODE_") || name == "CLAUDE_API_KEY";
-        if looks_sensitive && !value.is_empty() {
+        if is_sensitive_env_var_name(&name) && !value.is_empty() {
             out = out.replace(&value, "[REDACTED]");
         }
     }
     out
+}
+
+async fn stop_interactive_pty_io(
+    stop_io: &Arc<AtomicBool>,
+    pty_master: &mut Option<Box<dyn portable_pty::MasterPty + Send>>,
+    output_task: JoinHandle<()>,
+    input_task: Option<JoinHandle<()>>,
+    child_pid: Option<u32>,
+) {
+    stop_io.store(true, Ordering::Release);
+    let _ = pty_master.take();
+    untrack_codegen_child_pid(child_pid);
+    join_interactive_io_task(output_task, "opencode-pty-output").await;
+    if let Some(task) = input_task {
+        join_interactive_io_task(task, "opencode-pty-input").await;
+    }
 }
 
 async fn run_generator_process(
@@ -1441,6 +1579,64 @@ impl Drop for InteractiveWatchdogGuard {
     }
 }
 
+#[must_use = "PtyChildCleanup must be kept until process exits or is explicitly reaped"]
+struct PtyChildCleanup {
+    child: Option<Box<dyn portable_pty::Child + Send>>,
+    pid: Option<u32>,
+}
+
+impl PtyChildCleanup {
+    fn new(child: Box<dyn portable_pty::Child + Send>) -> Self {
+        let pid = child.process_id();
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Box<dyn portable_pty::Child + Send>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("PTY child already reaped"))
+    }
+
+    fn disarm(&mut self) {
+        untrack_codegen_child_pid(self.pid);
+        self.child = None;
+    }
+}
+
+impl Drop for PtyChildCleanup {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(mut child) = self.child.take() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        #[cfg(unix)]
+                        kill_process_group_sigkill(self.pid);
+                        let _ = child.kill();
+                        let deadline = std::time::Instant::now() + CHILD_DROP_REAP_WAIT_TIMEOUT;
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) => break,
+                                Ok(None) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                untrack_codegen_child_pid(self.pid);
+            }
+        }));
+    }
+}
+
 async fn stop_interactive_watchdog_once(
     watchdog_guard: &mut InteractiveWatchdogGuard,
     handle: &mut Option<JoinHandle<()>>,
@@ -1467,7 +1663,7 @@ async fn run_generator_interactive_process(
         .with_context(|| {
             format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
         })
-        .context("codegen_fatal")?;
+        .context(CodegenErrorMarker(CodegenErrorKind::Fatal))?;
     let mut child = ChildCleanup::new(child);
     let child_pid = child.child_mut()?.id();
     let (startup_ready_tx, startup_ready_rx) = tokio::sync::oneshot::channel();
@@ -1489,12 +1685,13 @@ async fn run_generator_interactive_process(
             .try_wait()
             .map_err(anyhow::Error::from)
             .with_context(|| format!("Failed to poll {generator_name} status"))
-            .context("codegen_retryable")?;
+            .context(CodegenErrorMarker(CodegenErrorKind::Retryable))?;
         if let Some(status) = status {
             child.disarm();
             stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
             if !status.success() {
-                let classified = classify_non_success_exit(generator_name, status);
+                let classified =
+                    classify_non_success_exit(generator_name, &ProcessExitStatus::Std(status));
                 return Err(classified);
             }
             return Ok(());
@@ -1509,7 +1706,7 @@ async fn run_generator_interactive_process(
                     .terminate_with_escalation(CHILD_SHUTDOWN_REAP_TIMEOUT)
                     .await;
                 stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
-                return Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"));
+                return Err(anyhow::anyhow!("interactive session interrupted by shutdown").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
             }
             event = watchdog_events.recv() => {
                 match event {
@@ -1521,7 +1718,7 @@ async fn run_generator_interactive_process(
                         );
                         child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
                         stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
-                        return Err(anyhow::anyhow!("interactive startup timeout").context("codegen_retryable"));
+                        return Err(anyhow::anyhow!("interactive startup timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
                     }
                     Some(InteractiveWatchdogEvent::SessionTimeout) => {
                         tracing::warn!(
@@ -1531,7 +1728,7 @@ async fn run_generator_interactive_process(
                         );
                         child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
                         stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
-                        return Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"));
+                        return Err(anyhow::anyhow!("interactive session timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
                     }
                     Some(InteractiveWatchdogEvent::SessionHardTimeout) => {
                         tracing::error!(
@@ -1541,16 +1738,381 @@ async fn run_generator_interactive_process(
                         );
                         child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
                         stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
-                        return Err(anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable"));
+                        return Err(anyhow::anyhow!("interactive session hard timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
                     }
                     None => {
                         child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
                         stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
-                        return Err(anyhow::anyhow!("interactive watchdog terminated unexpectedly").context("codegen_retryable"));
+                        return Err(anyhow::anyhow!("interactive watchdog terminated unexpectedly").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
                     }
                 }
             }
             _ = tokio::time::sleep(INTERACTIVE_STARTUP_PROBE_INTERVAL) => {}
+        }
+    }
+}
+
+fn pty_size_from_terminal() -> PtySize {
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(24);
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+async fn wait_pty_child_exit(
+    child: &mut Box<dyn portable_pty::Child + Send>,
+    timeout: Duration,
+) -> Option<ProcessExitStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(ProcessExitStatus::Pty(status)),
+            Ok(None) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+async fn terminate_pty_child_with_escalation(
+    child: &mut Box<dyn portable_pty::Child + Send>,
+    pid: Option<u32>,
+) {
+    #[cfg(unix)]
+    kill_process_group_sigterm(pid);
+    let _ = child.kill();
+    if wait_pty_child_exit(child, CHILD_REAP_TIMEOUT)
+        .await
+        .is_some()
+    {
+        return;
+    }
+
+    #[cfg(unix)]
+    kill_process_group_sigkill(pid);
+    let _ = child.kill();
+    let _ = wait_pty_child_exit(child, CHILD_REAP_TIMEOUT).await;
+}
+
+async fn run_opencode_interactive_pty(
+    work_dir: &Path,
+    question: &str,
+    iteration: usize,
+    startup_timeout: Duration,
+    session_timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let _pty_session_guard = PtySessionGuard::new();
+    eprintln!(
+        ">>> Iteration {iteration}: launching interactive opencode in {} ...",
+        work_dir.display()
+    );
+    eprintln!(">>> Start by opening .lambda-rlm-result.md, then apply fixes for: \"{question}\"");
+
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system
+        .openpty(pty_size_from_terminal())
+        .context("failed to allocate pseudo-terminal for interactive opencode")
+        .context(CodegenErrorMarker(CodegenErrorKind::Retryable))?;
+    let mut pty_master = Some(pair.master);
+
+    let mut pty_cmd = CommandBuilder::new("opencode");
+    pty_cmd.cwd(work_dir);
+    pty_cmd.arg("run");
+    pty_cmd.arg("--file");
+    pty_cmd.arg(RESULT_FILE_NAME);
+    pty_cmd.arg("--");
+    pty_cmd.arg(interactive_prompt(question, iteration));
+    let child = pair
+        .slave
+        .spawn_command(pty_cmd)
+        .context("failed to spawn opencode inside pseudo-terminal")
+        .context(CodegenErrorMarker(CodegenErrorKind::Fatal))?;
+    let child_pid = child.process_id();
+    track_codegen_child_pid(child_pid);
+    let mut child = PtyChildCleanup::new(child);
+    drop(pair.slave);
+
+    let (startup_ready_tx, startup_ready_rx) = tokio::sync::oneshot::channel();
+    let (watchdog_stop_tx, watchdog_stop_rx) = tokio::sync::oneshot::channel();
+    let (watchdog_handle, mut watchdog_events) = spawn_interactive_watchdog(
+        child_pid,
+        startup_timeout,
+        session_timeout,
+        startup_ready_rx,
+        watchdog_stop_rx,
+    );
+    let mut watchdog_guard = InteractiveWatchdogGuard::new(watchdog_stop_tx);
+    let mut watchdog_handle = Some(watchdog_handle);
+
+    let stop_io = Arc::new(AtomicBool::new(false));
+
+    let mut pty_reader = pty_master
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("PTY master handle missing"))?
+        .try_clone_reader()
+        .context("failed to clone PTY reader")
+        .context(CodegenErrorMarker(CodegenErrorKind::Retryable))?;
+    let stop_output = Arc::clone(&stop_io);
+    let output_task = tokio::task::spawn_blocking(move || {
+        let mut stdout = std::io::stdout();
+        let mut buf = [0u8; 8192];
+        while !stop_output.load(Ordering::Acquire) {
+            match pty_reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    if stdout.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut input_task = None;
+    if std::io::stdin().is_terminal() {
+        let mut pty_writer = pty_master
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("PTY master handle missing"))?
+            .take_writer()
+            .context("failed to open PTY writer")?;
+        let stop_input = Arc::clone(&stop_io);
+        #[cfg(unix)]
+        {
+            input_task = Some(tokio::spawn(async move {
+                let stdin_file = match std::fs::File::open("/dev/stdin") {
+                    Ok(file) => file,
+                    Err(_) => return,
+                };
+                let async_stdin = match tokio::io::unix::AsyncFd::new(stdin_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 8192];
+                while !stop_input.load(Ordering::Acquire) {
+                    let mut ready = match tokio::time::timeout(
+                        INTERACTIVE_STDIN_POLL_TIMEOUT,
+                        async_stdin.readable(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ready)) => ready,
+                        Ok(Err(_)) => break,
+                        Err(_) => continue,
+                    };
+
+                    match ready.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                        Ok(Ok(0)) => {
+                            drop(pty_writer);
+                            break;
+                        }
+                        Ok(Ok(n)) => {
+                            if pty_writer.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_would_block) => continue,
+                    }
+                }
+            }));
+        }
+        #[cfg(not(unix))]
+        {
+            input_task = Some(tokio::task::spawn_blocking(move || {
+                let mut stdin = std::io::stdin();
+                let mut buf = [0u8; 8192];
+                while !stop_input.load(Ordering::Acquire) {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => {
+                            drop(pty_writer);
+                            break;
+                        }
+                        Ok(n) => {
+                            if pty_writer.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }));
+        }
+    }
+
+    let _ = startup_ready_tx.send(());
+
+    let deadline = tokio::time::Instant::now() + session_timeout;
+    loop {
+        match child.child_mut()?.try_wait() {
+            Ok(Some(status)) => {
+                stop_interactive_pty_io(
+                    &stop_io,
+                    &mut pty_master,
+                    output_task,
+                    input_task,
+                    child_pid,
+                )
+                .await;
+                stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                child.disarm();
+                if !status.success() {
+                    return Err(classify_non_success_exit(
+                        "opencode",
+                        &ProcessExitStatus::Pty(status),
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                stop_interactive_pty_io(
+                    &stop_io,
+                    &mut pty_master,
+                    output_task,
+                    input_task,
+                    child_pid,
+                )
+                .await;
+                stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                child.disarm();
+                return Err(anyhow::Error::from(error))
+                    .context("Failed to poll opencode interactive status")
+                    .context(CodegenErrorMarker(CodegenErrorKind::Retryable));
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                timeout_secs = session_timeout.as_secs(),
+                "interactive opencode session exceeded timeout; terminating process group"
+            );
+            terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+            stop_interactive_pty_io(
+                &stop_io,
+                &mut pty_master,
+                output_task,
+                input_task,
+                child_pid,
+            )
+            .await;
+            stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+            child.disarm();
+            return Err(anyhow::anyhow!("interactive session timeout")
+                .context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() || *shutdown_rx.borrow() {
+                    tracing::info!("shutdown received; terminating interactive opencode PTY process");
+                }
+                terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+                stop_interactive_pty_io(
+                    &stop_io,
+                    &mut pty_master,
+                    output_task,
+                    input_task,
+                    child_pid,
+                )
+                .await;
+                stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                child.disarm();
+                return Err(anyhow::anyhow!("interactive session interrupted by shutdown").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+            }
+            event = watchdog_events.recv() => {
+                match event {
+                    Some(InteractiveWatchdogEvent::StartupTimeout) => {
+                        tracing::warn!(
+                            startup_timeout_secs = startup_timeout.as_secs(),
+                            "interactive opencode PTY startup timed out"
+                        );
+                        terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+                        stop_interactive_pty_io(
+                            &stop_io,
+                            &mut pty_master,
+                            output_task,
+                            input_task,
+                            child_pid,
+                        )
+                        .await;
+                        stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                        child.disarm();
+                        return Err(anyhow::anyhow!("interactive startup timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+                    }
+                    Some(InteractiveWatchdogEvent::SessionTimeout) => {
+                        tracing::warn!(
+                            timeout_secs = session_timeout.as_secs(),
+                            "interactive opencode PTY session exceeded timeout; sending SIGTERM with SIGKILL escalation"
+                        );
+                        terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+                        stop_interactive_pty_io(
+                            &stop_io,
+                            &mut pty_master,
+                            output_task,
+                            input_task,
+                            child_pid,
+                        )
+                        .await;
+                        stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                        child.disarm();
+                        return Err(anyhow::anyhow!("interactive session timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+                    }
+                    Some(InteractiveWatchdogEvent::SessionHardTimeout) => {
+                        tracing::error!(
+                            hard_timeout_secs = session_timeout.saturating_add(Duration::from_secs(30)).as_secs(),
+                            "interactive opencode PTY exceeded hard deadline; force-killing child process group"
+                        );
+                        terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+                        stop_interactive_pty_io(
+                            &stop_io,
+                            &mut pty_master,
+                            output_task,
+                            input_task,
+                            child_pid,
+                        )
+                        .await;
+                        stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                        child.disarm();
+                        return Err(anyhow::anyhow!("interactive session hard timeout").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+                    }
+                    None => {
+                        terminate_pty_child_with_escalation(child.child_mut()?, child_pid).await;
+                        stop_interactive_pty_io(
+                            &stop_io,
+                            &mut pty_master,
+                            output_task,
+                            input_task,
+                            child_pid,
+                        )
+                        .await;
+                        stop_interactive_watchdog_once(&mut watchdog_guard, &mut watchdog_handle).await;
+                        child.disarm();
+                        return Err(anyhow::anyhow!("interactive watchdog terminated unexpectedly").context(CodegenErrorMarker(CodegenErrorKind::Retryable)));
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
         }
     }
 }
@@ -1616,7 +2178,10 @@ async fn run_claude(
         if !output.status.success() {
             let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
             tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
-            return Err(classify_non_success_exit("claude", output.status));
+            return Err(classify_non_success_exit(
+                "claude",
+                &ProcessExitStatus::Std(output.status),
+            ));
         }
 
         let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
@@ -1720,7 +2285,10 @@ async fn run_opencode(
         if !output.status.success() {
             let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
             tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
-            return Err(classify_non_success_exit("opencode", output.status));
+            return Err(classify_non_success_exit(
+                "opencode",
+                &ProcessExitStatus::Std(output.status),
+            ));
         }
 
         let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
@@ -1746,18 +2314,10 @@ async fn run_opencode_interactive(
     write_result_file_atomically(work_dir, result, iteration).await?;
 
     let run = async {
-        eprintln!(
-            ">>> Iteration {iteration}: launching interactive opencode in {} ...",
-            work_dir.display()
-        );
-        eprintln!(
-            ">>> Start by opening .lambda-rlm-result.md, then apply fixes for: \"{question}\""
-        );
-        let mut cmd = tokio::process::Command::new("opencode");
-        configure_interactive_generator_command(&mut cmd, work_dir);
-        run_generator_interactive_process(
-            cmd,
-            &CodeGenerator::Opencode,
+        run_opencode_interactive_pty(
+            work_dir,
+            question,
+            iteration,
             startup_timeout,
             session_timeout,
             shutdown_rx,
@@ -1971,19 +2531,23 @@ mod tests {
     fn classify_exit_codes_for_codegen_resilience() {
         let retryable = classify_non_success_exit(
             "opencode",
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("exit 1")
-                .status()
-                .expect("status"),
+            &ProcessExitStatus::Std(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 1")
+                    .status()
+                    .expect("status"),
+            ),
         );
         let fatal = classify_non_success_exit(
             "opencode",
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("exit 127")
-                .status()
-                .expect("status"),
+            &ProcessExitStatus::Std(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 127")
+                    .status()
+                    .expect("status"),
+            ),
         );
 
         assert!(error_has_context(&retryable, "codegen_retryable"));
@@ -1996,6 +2560,16 @@ mod tests {
         std::env::set_var("CLAUDE_API_KEY", needle);
         let sanitized = sanitize_generator_stderr(&format!("boom {needle}"));
         std::env::remove_var("CLAUDE_API_KEY");
+        assert!(!sanitized.contains(needle));
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_generator_stderr_redacts_pattern_matched_secret() {
+        let needle = "unit-test-custom-secret";
+        std::env::set_var("INTERNAL_DEPLOY_TOKEN", needle);
+        let sanitized = sanitize_generator_stderr(&format!("boom {needle}"));
+        std::env::remove_var("INTERNAL_DEPLOY_TOKEN");
         assert!(!sanitized.contains(needle));
         assert!(sanitized.contains("[REDACTED]"));
     }

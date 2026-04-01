@@ -4,11 +4,11 @@
 //! Atomic orderings: Release-Acquire on all cross-thread state to ensure
 //! correct visibility on ARM64 and other weakly-ordered architectures.
 
-use std::path::PathBuf;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Bump when prompt logic or cache format changes to invalidate stale entries.
 /// Any modification to leaf_prompt() or reduce prompts MUST bump this version.
@@ -24,25 +24,17 @@ fn monotonic_ms() -> u64 {
     boot.elapsed().as_millis() as u64
 }
 
-/// Process-unique nonce: 16 bytes of entropy generated once at startup.
-/// Prevents idempotency key collisions after PID wraparound (~65k restarts)
-/// where PID + boot_mono_ms could repeat if two processes start in the same
-/// millisecond with the same recycled PID. Uses wall-clock nanoseconds +
-/// PID + thread ID hashed through blake3 for cross-platform uniqueness.
-static PROCESS_NONCE: OnceLock<[u8; 16]> = OnceLock::new();
+/// Process-unique nonce: 32 bytes generated once at startup from OS CSPRNG.
+/// If entropy is unavailable, fall back to an all-zero nonce so behavior is
+/// deterministic and callers can continue gracefully.
+static PROCESS_NONCE: OnceLock<[u8; 32]> = OnceLock::new();
 
-pub fn process_nonce() -> &'static [u8; 16] {
+pub fn process_nonce() -> &'static [u8; 32] {
     PROCESS_NONCE.get_or_init(|| {
-        let mut hasher = blake3::Hasher::new();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        hasher.update(&now.as_nanos().to_le_bytes());
-        hasher.update(&(std::process::id() as u64).to_le_bytes());
-        hasher.update(format!("{:?}", std::thread::current().id()).as_bytes());
-        let hash = hasher.finalize();
-        let mut nonce = [0u8; 16];
-        nonce.copy_from_slice(&hash.as_bytes()[..16]);
+        let mut nonce = [0u8; 32];
+        if getrandom::getrandom(&mut nonce).is_err() {
+            tracing::warn!("CSPRNG unavailable for process nonce; using zeroed nonce");
+        }
         nonce
     })
 }
@@ -509,11 +501,8 @@ impl ReplayCache {
             return None;
         }
         let mut file = std::fs::File::open(self.dir.join(key)).ok()?;
-        #[cfg(unix)]
-        {
-            use fs4::FileExt;
-            FileExt::lock_shared(&file).ok()?;
-        }
+        use fs4::FileExt;
+        FileExt::lock_shared(&file).ok()?;
         let mut raw = String::new();
         file.read_to_string(&mut raw).ok()?;
         // Content integrity: first line is "blake3:{hex_hash}", rest is content

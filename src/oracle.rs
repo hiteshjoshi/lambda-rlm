@@ -9,6 +9,7 @@ use crate::types::CodeGenerator;
 use anyhow::Result;
 use bytes::BytesMut;
 use dashmap::DashMap;
+use memchr::memchr2;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -78,6 +79,12 @@ impl OracleError {
     /// Trip circuit breaker immediately rather than wasting retries.
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::AuthFailed(_))
+    }
+
+    /// Token budget errors: the model ran out of tokens but the API itself is healthy.
+    /// Should NOT trip the circuit breaker — this is a caller-side budget issue.
+    pub fn is_token_budget_error(&self) -> bool {
+        matches!(self, Self::OutputTruncated { .. })
     }
 }
 
@@ -199,16 +206,9 @@ impl<'a> InflightGuard<'a> {
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.map.remove(&self.key);
-            if self.map.is_empty() {
-                self.map.shrink_to_fit();
-            }
-        }))
-        .is_err()
-            && !std::thread::panicking()
-        {
-            tracing::error!("InflightGuard cleanup panicked during Drop");
+        self.map.remove(&self.key);
+        if self.map.is_empty() {
+            self.map.shrink_to_fit();
         }
         self.gauge.fetch_sub(1, Ordering::AcqRel);
         INFLIGHT_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
@@ -216,9 +216,9 @@ impl Drop for InflightGuard<'_> {
 }
 
 pub struct ResourceStack<'a> {
+    _bulkhead: SemaphorePermit<'a>,
     _budget: BudgetGuard<'a>,
     _cache_permit: CachePermit<'a>,
-    _bulkhead: SemaphorePermit<'a>,
 }
 
 impl ResourceStack<'_> {
@@ -297,14 +297,17 @@ impl FireworksProvider {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| OracleError::Network(e.to_string()))?;
-            buf.extend_from_slice(&chunk);
-
-            if result.len() + buf.len() > MAX_SSE_BUFFER_BYTES {
+            let projected_buf_len = buf.len().checked_add(chunk.len()).ok_or_else(|| {
+                OracleError::StreamCorrupted("SSE stream buffer length overflow".to_string())
+            })?;
+            if result.len().saturating_add(projected_buf_len) > MAX_SSE_BUFFER_BYTES {
                 return Err(OracleError::StreamCorrupted(format!(
                     "SSE stream exceeded maximum buffer size ({} bytes)",
                     MAX_SSE_BUFFER_BYTES
                 )));
             }
+            buf.reserve(chunk.len());
+            buf.extend_from_slice(&chunk);
 
             if !bom_stripped {
                 if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -513,6 +516,19 @@ impl FireworksProvider {
 
                 if let Some(reason) = finish_reason.as_deref() {
                     if is_truncation_finish_reason(reason) {
+                        // For small token budgets (e.g., classifiers), continuation
+                        // won't help — the model is just being verbose. Return what
+                        // we have instead of wasting 4 more API calls.
+                        if max_tokens <= 1024 {
+                            if !combined.is_empty() {
+                                return Ok(combined);
+                            }
+                            return Err(OracleError::OutputTruncated {
+                                max_tokens,
+                                segments: segment_idx + 1,
+                            });
+                        }
+
                         if segment_idx == MAX_TRUNCATION_CONTINUATIONS {
                             return Err(OracleError::OutputTruncated {
                                 max_tokens,
@@ -662,6 +678,10 @@ impl Oracle {
     }
 
     pub async fn acquire_resources(&self) -> Result<ResourceStack<'_>> {
+        let bulkhead =
+            tokio::time::timeout(RESOURCE_ACQUIRE_TIMEOUT, self.bulkhead.llm().acquire())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for oracle bulkhead permit"))??;
         if !self.budget.try_acquire() {
             anyhow::bail!(
                 "Call budget exhausted (remaining: {})",
@@ -670,14 +690,10 @@ impl Oracle {
         }
         let budget = BudgetGuard::new(&self.budget);
         let cache_permit = self.cache.reserve();
-        let bulkhead =
-            tokio::time::timeout(RESOURCE_ACQUIRE_TIMEOUT, self.bulkhead.llm().acquire())
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for oracle bulkhead permit"))??;
         Ok(ResourceStack {
+            _bulkhead: bulkhead,
             _budget: budget,
             _cache_permit: cache_permit,
-            _bulkhead: bulkhead,
         })
     }
 
@@ -724,7 +740,7 @@ impl Oracle {
         }
     }
 
-    /// Outer call: budget → cache → bulkhead semaphore → retry loop with circuit breaker.
+    /// Outer call: bulkhead semaphore → budget → cache → retry loop with circuit breaker.
     ///
     /// RESOURCE ORDERING: Budget → Cache → Bulkhead (LLM semaphore).
     /// Called from phi() which has already released its concurrency Semaphore.
@@ -760,7 +776,7 @@ impl Oracle {
                 output_len = cached.len(),
                 "cache hit"
             );
-            eprintln!(
+            verbose!(
                 "    M #{n} [CACHED] ({} in -> {} out)",
                 user_prompt.len(),
                 cached.len()
@@ -892,7 +908,7 @@ impl Oracle {
                     idempotency_key,
                     "retrying with deterministic jitter"
                 );
-                eprintln!(
+                verbose!(
                     "    M #{n} retry {attempt}/{} (backoff {:?}, cap {:?})",
                     self.max_retries,
                     backoff,
@@ -923,7 +939,7 @@ impl Oracle {
                         tracing::warn!(error = %sanitize_error_text(&e.to_string()), "cache write failed (non-fatal)");
                     }
 
-                    eprintln!(
+                    verbose!(
                         "    M #{n} ({} in -> {} out, {:.1}s)",
                         user_prompt.len(),
                         text.len(),
@@ -939,7 +955,16 @@ impl Oracle {
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
                     tracing::error!(call = n, error = %sanitize_error_text(&e.to_string()), "fatal API error, not retrying");
-                    eprintln!("    M #{n} FATAL: {e}");
+                    error_msg!("M #{n} FATAL: {e}");
+                    resources.commit_budget();
+                    anyhow::bail!("{e}");
+                }
+                Err(e) if e.is_token_budget_error() => {
+                    // Token budget: the model ran out of tokens. This is NOT an API failure —
+                    // do NOT trip the circuit breaker. Fail fast, let caller handle.
+                    self.errors.fetch_add(1, Ordering::AcqRel);
+                    tracing::warn!(call = n, error = %e, "output truncated (token budget exceeded)");
+                    warn_msg!("M #{n} output truncated: {e}");
                     resources.commit_budget();
                     anyhow::bail!("{e}");
                 }
@@ -947,7 +972,7 @@ impl Oracle {
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
                     tracing::error!(call = n, attempt = attempt + 1, error = %sanitize_error_text(&e.to_string()), "API call failed");
-                    eprintln!("    M #{n} ERROR (attempt {}): {e}", attempt + 1);
+                    error_msg!("M #{n} failed (attempt {}): {e}", attempt + 1);
 
                     if !e.is_retryable() {
                         // Non-retryable (e.g., 4xx client error): fail fast
@@ -983,6 +1008,9 @@ impl Oracle {
     /// calls interleave under concurrent async tasks, rendering logs
     /// unparseable during cascading failures when post-mortem analysis matters most.
     pub fn print_telemetry(&self) {
+        if !crate::is_verbose() {
+            return;
+        }
         use std::fmt::Write as FmtWrite;
         use std::io::Write as IoWrite;
 
@@ -1148,22 +1176,17 @@ impl Oracle {
 /// Returns (line_end_position, bytes_to_skip) for \n (1), \r\n (2), or bare \r (1).
 /// Returns None if no complete line boundary is available (need more data).
 fn sse_line_boundary(buf: &[u8]) -> Option<(usize, usize)> {
-    for (i, &b) in buf.iter().enumerate() {
-        if b == b'\n' {
-            return Some((i, 1));
-        }
-        if b == b'\r' {
-            if buf.get(i + 1) == Some(&b'\n') {
-                return Some((i, 2)); // \r\n
-            }
-            // Bare \r at end of buffer: could be \r\n, wait for more data
-            if i + 1 >= buf.len() {
-                return None;
-            }
-            return Some((i, 1)); // Bare \r followed by non-\n
-        }
+    let i = memchr2(b'\n', b'\r', buf)?;
+    if buf[i] == b'\n' {
+        return Some((i, 1));
     }
-    None
+    if buf.get(i + 1) == Some(&b'\n') {
+        return Some((i, 2));
+    }
+    if i + 1 >= buf.len() {
+        return None;
+    }
+    Some((i, 1))
 }
 
 #[cfg(test)]

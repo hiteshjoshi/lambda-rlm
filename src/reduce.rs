@@ -46,7 +46,13 @@ pub async fn reduce_for_task(
     debug_assert!(depth <= max_depth, "PRE: depth must not exceed max_depth");
 
     let result = match task {
-        TaskType::Search => Ok(reduce_search(child_results, depth)),
+        TaskType::Search => {
+            if depth == 0 && child_results.len() > 1 {
+                reduce_search_top(child_results, question, oracle, max_tokens).await
+            } else {
+                Ok(reduce_search(child_results))
+            }
+        }
         TaskType::Classify => Ok(reduce_classify(child_results)),
         TaskType::Aggregate => Ok(reduce_aggregate(child_results)),
         TaskType::Pairwise => {
@@ -91,20 +97,41 @@ pub async fn reduce_for_task(
 
 // ── Symbolic reducers (zero neural cost) ─────────────────────────
 
-fn reduce_search(child_results: Vec<String>, depth: usize) -> String {
+fn reduce_search(child_results: Vec<String>) -> String {
     let useful = filter_nonempty(child_results);
     if useful.is_empty() {
         "No relevant information found.".into()
-    } else if depth == 0 && useful.len() > 1 {
-        useful
-            .iter()
-            .enumerate()
-            .map(|(i, r)| format!("### Result {}\n{}", i + 1, r))
-            .collect::<Vec<_>>()
-            .join("\n\n")
     } else {
         useful.join("\n\n---\n\n")
     }
+}
+
+/// FilterBest for search at depth 0: LLM ranks and filters results by relevance.
+async fn reduce_search_top(
+    child_results: Vec<String>,
+    question: &str,
+    oracle: Arc<Oracle>,
+    max_tokens: u32,
+) -> Result<String> {
+    let useful = filter_nonempty(child_results);
+    if useful.is_empty() {
+        return Ok("No relevant information found.".into());
+    }
+    if useful.len() == 1 {
+        return Ok(useful.into_iter().next().unwrap());
+    }
+    let combined = useful
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("--- Result {} ---\n{}", i + 1, r))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let system = "You are ranking search results for relevance. Given search results \
+                  from different code sections, select and present ONLY the results that \
+                  directly answer the question. Discard irrelevant results. Preserve \
+                  exact file paths and line citations from the original results.";
+    let user = format!("Question: {question}\n\n{combined}");
+    oracle.call(system, &user, max_tokens).await
 }
 
 fn reduce_classify(child_results: Vec<String>) -> String {
@@ -177,7 +204,7 @@ async fn reduce_pairwise_top(
 
     let groups: Vec<Vec<String>> = useful.iter().map(|r| merge_dedup(parse_items(r))).collect();
     let pairs = comb_cross(&groups);
-    eprintln!(
+    verbose!(
         "    CROSS: {} groups -> {} pairs (symbolic)",
         groups.len(),
         pairs.len()
@@ -234,13 +261,15 @@ async fn reduce_summarise(
     } else {
         let system = format!(
             "You have summaries of {} adjacent code sections (depth {}/{} in recursion). \
-             Combine them into ONE concise summary. Preserve key details: \
-             modules, purpose, important functions, dependencies.",
+             Combine them into ONE concise summary focused on the question below. \
+             Preserve details relevant to the question: modules, purpose, \
+             important functions, dependencies.",
             child_results.len(),
             max_depth - depth,
             max_depth
         );
-        oracle.call(&system, &combined, 2048).await
+        let user = format!("Question: {question}\n\n{combined}");
+        oracle.call(&system, &user, max_tokens).await
     }
 }
 
@@ -274,13 +303,13 @@ async fn reduce_multi_hop(
         oracle.call(system, &user, max_tokens).await
     } else {
         let system = format!(
-            "Synthesize these {} evidence fragments (depth {}/{}) into a coherent \
-             summary of the relevant facts and relationships. Preserve specifics: \
-             function names, data flows, call chains.",
+            "Synthesize these {} evidence fragments (depth {}/{}) relevant to the question. \
+             Preserve specifics: function names, data flows, call chains.",
             useful.len(),
             max_depth - depth,
             max_depth
         );
-        oracle.call(&system, &combined, 2048).await
+        let user = format!("Question: {question}\n\n{combined}");
+        oracle.call(&system, &user, max_tokens).await
     }
 }

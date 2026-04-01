@@ -71,30 +71,26 @@ pub fn comb_split_overlap(text: &str, k: usize, delta_chars: usize) -> Vec<Strin
 /// Peek: Σ* × N² → Σ*
 /// Safe substring on char boundaries.
 pub fn comb_peek(text: &str, start: usize, end: usize) -> &str {
-    let s = start.min(text.len());
-    let e = end.min(text.len());
-    let s = if s == 0 {
-        0
-    } else {
-        let mut i = s;
-        while i < text.len() && !text.is_char_boundary(i) {
-            i += 1;
-        }
-        i
-    };
-    let e = {
-        let mut i = e;
-        while i > 0 && !text.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    };
+    let mut s = start.min(text.len());
+    while s < text.len() && !text.is_char_boundary(s) {
+        s += 1;
+    }
+    let mut e = end.min(text.len());
+    while e > 0 && !text.is_char_boundary(e) {
+        e -= 1;
+    }
+    if s > e {
+        s = e;
+    }
+    debug_assert!(text.is_char_boundary(s));
+    debug_assert!(text.is_char_boundary(e));
     &text[s..e]
 }
 
 /// Max combinatorial product to prevent OOM on large aggregate results.
 /// Pre-calculated before allocation to fail fast on pathological input.
 const MAX_COMBINATORIAL_PRODUCT: usize = 1_000_000;
+const MAX_CROSS_PRODUCT_BYTES: usize = 64 * 1024 * 1024;
 
 // Compile-time validation: zero causes logic errors in comb_cross,
 // overflow causes silent truncation in pre-calculation.
@@ -106,15 +102,31 @@ const _: () = assert!(MAX_COMBINATORIAL_PRODUCT < usize::MAX / 2);
 /// Returns empty Vec if the product would exceed MAX_COMBINATORIAL_PRODUCT.
 pub fn comb_cross(groups: &[Vec<String>]) -> Vec<(String, String)> {
     // Pre-calculate total pairs to fail fast on combinatorial explosion
-    let total_pairs: Option<usize> = {
+    let totals: Option<(usize, usize)> = {
         let mut count: usize = 0;
+        let mut bytes: usize = 0;
+        let group_lens: Vec<(usize, usize)> = groups
+            .iter()
+            .map(|g| (g.len(), g.iter().map(|s| s.len()).sum::<usize>()))
+            .collect();
         for i in 0..groups.len() {
             for j in (i + 1)..groups.len() {
-                let product = groups[i].len().checked_mul(groups[j].len());
+                let product = group_lens[i].0.checked_mul(group_lens[j].0);
                 match product {
                     Some(p) => {
                         count = match count.checked_add(p) {
                             Some(c) => c,
+                            None => return Vec::new(),
+                        };
+                        let ij_bytes = group_lens[i].1.checked_mul(group_lens[j].0).and_then(|a| {
+                            group_lens[j]
+                                .1
+                                .checked_mul(group_lens[i].0)
+                                .and_then(|b| a.checked_add(b))
+                        });
+                        bytes = match ij_bytes.and_then(|pair_bytes| bytes.checked_add(pair_bytes))
+                        {
+                            Some(v) => v,
                             None => return Vec::new(),
                         };
                     }
@@ -122,20 +134,25 @@ pub fn comb_cross(groups: &[Vec<String>]) -> Vec<(String, String)> {
                 }
             }
         }
-        Some(count)
+        Some((count, bytes))
     };
-    let total = match total_pairs {
-        Some(t) if t <= MAX_COMBINATORIAL_PRODUCT => t,
+    let total = match totals {
+        Some((t, b)) if t <= MAX_COMBINATORIAL_PRODUCT && b <= MAX_CROSS_PRODUCT_BYTES => t,
         _ => {
             tracing::warn!(
                 limit = MAX_COMBINATORIAL_PRODUCT,
+                byte_limit = MAX_CROSS_PRODUCT_BYTES,
                 "combinatorial product too large, returning empty"
             );
             return Vec::new();
         }
     };
 
-    let mut pairs = Vec::with_capacity(total);
+    let mut pairs = Vec::new();
+    if pairs.try_reserve(total).is_err() {
+        tracing::warn!(total, "failed to reserve memory for combinatorial product");
+        return Vec::new();
+    }
     for i in 0..groups.len() {
         for j in (i + 1)..groups.len() {
             for a in &groups[i] {
@@ -146,6 +163,26 @@ pub fn comb_cross(groups: &[Vec<String>]) -> Vec<(String, String)> {
         }
     }
     pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{comb_cross, comb_peek};
+
+    #[test]
+    fn comb_peek_never_panics_on_mid_codepoint_bounds() {
+        let text = "a😀z";
+        let got = comb_peek(text, 2, 2);
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn comb_cross_applies_byte_guard() {
+        let huge = "x".repeat(70 * 1024 * 1024);
+        let groups = vec![vec![huge], vec!["b".to_string()]];
+        let got = comb_cross(&groups);
+        assert!(got.is_empty());
+    }
 }
 
 pub fn extract_keywords(question: &str) -> Vec<String> {
@@ -296,7 +333,7 @@ pub fn filter_by_keyword_predicate(
                 total = before,
                 "keyword pre-filter"
             );
-            eprintln!(
+            verbose!(
                 "    PRUNE: {}/{} chunks survived keyword filter",
                 filtered.len(),
                 before

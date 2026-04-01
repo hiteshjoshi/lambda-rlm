@@ -23,6 +23,62 @@
 //!
 //! Set FIREWORKS_API in your environment.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEGRADED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn is_verbose() -> bool {
+    VERBOSE.load(AtomicOrdering::Relaxed)
+}
+
+pub fn bump_error() -> u64 {
+    ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1
+}
+
+pub fn bump_warn() -> u64 {
+    WARN_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1
+}
+
+pub fn bump_degraded() -> u64 {
+    DEGRADED_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1
+}
+
+pub fn issue_counts() -> (u64, u64, u64) {
+    (
+        ERROR_COUNT.load(AtomicOrdering::Relaxed),
+        WARN_COUNT.load(AtomicOrdering::Relaxed),
+        DEGRADED_COUNT.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// Print only in verbose mode. Use for internal pipeline details (M calls, SPLIT, REDUCE, etc.)
+macro_rules! verbose {
+    ($($arg:tt)*) => {
+        if $crate::is_verbose() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Print an error that is always visible. Increments global error counter.
+macro_rules! error_msg {
+    ($($arg:tt)*) => {{
+        $crate::bump_error();
+        eprintln!("[ERROR] {}", format_args!($($arg)*));
+    }};
+}
+
+/// Print a warning that is always visible. Increments global warning counter.
+macro_rules! warn_msg {
+    ($($arg:tt)*) => {{
+        $crate::bump_warn();
+        eprintln!("[WARN] {}", format_args!($($arg)*));
+    }};
+}
+
 mod codegen;
 mod combinator;
 mod cost;
@@ -39,9 +95,10 @@ static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
+use regex::Regex;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, OwnedSemaphorePermit};
@@ -52,6 +109,7 @@ static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INTERACTIVE_SESSION_LIVE: AtomicU64 = AtomicU64::new(0);
 const INTERACTIVE_SESSION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_SESSION_LEAK_WARN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_RUNTIME_BLOCKING_THREADS: usize = 512;
 
 #[must_use = "interactive session permit must be held for session lifetime"]
 struct InteractiveSessionPermit {
@@ -130,26 +188,42 @@ fn open_file_no_follow(path: &std::path::Path) -> Option<(std::fs::File, u64, u6
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
     Some((file, meta.len(), meta.dev(), meta.ino()))
 }
 
-/// On non-Unix (Windows), check symlink_metadata before opening to reject
-/// symlinks/junctions. Not fully atomic like O_NOFOLLOW, but closes the
-/// common case and prevents directory traversal via reparse points.
+/// On Windows, open with FILE_FLAG_OPEN_REPARSE_POINT so the open syscall
+/// does not follow symlinks/junctions.
 /// dev/ino returned as 0 — inode verification not available on Windows.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_file_no_follow(path: &std::path::Path) -> Option<(std::fs::File, u64, u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    Some((file, meta.len(), 0, 0))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_file_no_follow(path: &std::path::Path) -> Option<(std::fs::File, u64, u64, u64)> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() {
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
-    let size = file.metadata().ok()?.len();
-    Some((file, size, 0, 0))
+    Some((file, meta.len(), 0, 0))
 }
 
 use combinator::{comb_peek, extract_keywords};
@@ -284,6 +358,10 @@ struct Cli {
     /// Max fix iterations when using --claude or --opencode (0 = unlimited)
     #[arg(long, default_value = "10")]
     max_iterations: usize,
+
+    /// Verbose output (show internal pipeline details: M calls, SPLIT, REDUCE, etc.)
+    #[arg(short, long, default_value = "false")]
+    verbose: bool,
 }
 
 /// Schema version for CLI configuration. Bump when adding/removing/renaming
@@ -439,37 +517,55 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         "h", "hpp", "rb", "php", "swift", "kt", "sh", "sql", "tf", "hcl",
     ];
 
-    let canonical_root = path
-        .canonicalize()
+    let root_meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("Cannot resolve path: {}", path.display()))?;
+    anyhow::ensure!(
+        !root_meta.file_type().is_symlink(),
+        "Cannot safely open symlink path: {}",
+        path.display()
+    );
 
-    if canonical_root.is_file() {
-        let (_, file_size, _, _) = open_file_no_follow(&canonical_root)
-            .ok_or_else(|| anyhow::anyhow!("Cannot safely open {}", canonical_root.display()))?;
+    if root_meta.is_file() {
+        let (file, file_size, _, _) = open_file_no_follow(path)
+            .ok_or_else(|| anyhow::anyhow!("Cannot safely open {}", path.display()))?;
         let oversized = file_size > MAX_AGGREGATE_BYTES;
         let mut out = format!("// === {} ===\n", path.display());
-        let (mut file, _, _, _) = open_file_no_follow(&canonical_root)
-            .ok_or_else(|| anyhow::anyhow!("Failed to open {}", canonical_root.display()))?;
         use std::io::Read;
-        file.read_to_string(&mut out)
-            .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
+        let mut file = file;
         if oversized {
-            let mut end = MAX_AGGREGATE_BYTES as usize;
-            while end > 0 && !out.is_char_boundary(end) {
-                end -= 1;
+            let mut bytes = Vec::with_capacity(MAX_AGGREGATE_BYTES as usize);
+            file.take(MAX_AGGREGATE_BYTES)
+                .read_to_end(&mut bytes)
+                .with_context(|| {
+                    format!(
+                        "Failed to read truncated contents of {}",
+                        path.display()
+                    )
+                })?;
+            while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+                let _ = bytes.pop();
             }
-            let omitted = out.len().saturating_sub(end);
-            out.truncate(end);
+            out.push_str(
+                std::str::from_utf8(&bytes).context("truncated file contained invalid UTF-8")?,
+            );
+        } else {
+            file.read_to_string(&mut out)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+        }
+        if oversized {
+            let omitted = file_size.saturating_sub(MAX_AGGREGATE_BYTES);
             out.push_str(&format!("\n// [TRUNCATED: {omitted} bytes omitted]\n"));
             tracing::warn!(
-                path = %canonical_root.display(),
-                kept = end,
+                path = %path.display(),
+                kept = MAX_AGGREGATE_BYTES,
                 omitted,
                 "truncated oversized single-file input"
             );
         }
         return Ok(out);
     }
+
+    anyhow::ensure!(root_meta.is_dir(), "input path is neither file nor directory");
 
     let mut all_code = String::new();
     let mut file_count = 0usize;
@@ -486,7 +582,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         ".git",
         "vendor",
     ];
-    let mut stack: Vec<PathBuf> = vec![canonical_root.clone()];
+    let mut stack: Vec<PathBuf> = vec![path.clone()];
     while let Some(dir) = stack.pop() {
         let read_dir = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -513,19 +609,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
             }
 
             if meta.is_dir() {
-                // Path traversal protection: verify resolved path stays under root
-                if let Ok(canonical_dir) = file_path.canonicalize() {
-                    if canonical_dir.starts_with(&canonical_root) {
-                        stack.push(file_path);
-                    } else {
-                        tracing::warn!(
-                            path = %file_path.display(),
-                            resolved = %canonical_dir.display(),
-                            "skipping directory that escapes root"
-                        );
-                        skipped += 1;
-                    }
-                }
+                stack.push(file_path);
                 continue;
             }
 
@@ -535,19 +619,6 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if !extensions.contains(&ext) {
                 continue;
-            }
-
-            // Path traversal protection for files
-            if let Ok(canonical_file) = file_path.canonicalize() {
-                if !canonical_file.starts_with(&canonical_root) {
-                    tracing::warn!(
-                        path = %file_path.display(),
-                        resolved = %canonical_file.display(),
-                        "skipping path that escapes root"
-                    );
-                    skipped += 1;
-                    continue;
-                }
             }
 
             // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
@@ -624,12 +695,9 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
     }
 
     if skipped > 0 {
-        tracing::info!(
-            count = skipped,
-            "skipped symlinks/traversals during collection"
-        );
+        warn_msg!("skipped {skipped} files during collection (symlinks/unreadable)");
     }
-    eprintln!("Collected {file_count} files ({} chars)", all_code.len());
+    verbose!("Collected {file_count} files ({} chars)", all_code.len());
     Ok(all_code)
 }
 
@@ -650,14 +718,14 @@ async fn run_analysis(
     if prompt.is_empty() {
         anyhow::bail!("No source files found in {}", cli.path.display());
     }
-    eprintln!(
+    verbose!(
         "Phase 1: P stored externally ({} chars), library L loaded",
         prompt.len()
     );
 
     // ── Phase 2: Task Detection ──
     let task = if cli.task == TaskType::Auto {
-        eprintln!("Phase 2: Auto-detecting task type...");
+        verbose!("Phase 2: Auto-detecting task type...");
         let preview = comb_peek(&prompt, 0, cli.peek_size);
         match auto_detect_task(preview, prompt.len(), &cli.question, oracle).await {
             Ok(task) => task,
@@ -667,24 +735,24 @@ async fn run_analysis(
                         error = %error,
                         "auto-detect truncated; defaulting to summarise"
                     );
-                    eprintln!(
-                        "  Phase 2: auto-detect truncated at classifier budget; defaulting to summarise"
+                    warn_msg!(
+                        "auto-detect truncated at classifier budget; defaulting to summarise"
                     );
                 } else {
                     tracing::warn!(error = %error, "auto-detect failed; defaulting to summarise");
-                    eprintln!("  Phase 2: auto-detect failed; defaulting to summarise");
+                    warn_msg!("auto-detect failed; defaulting to summarise");
                 }
                 TaskType::Summarise
             }
         }
     } else {
-        eprintln!("Phase 2: Task type = {} (user-specified)", cli.task);
+        verbose!("Phase 2: Task type = {} (user-specified)", cli.task);
         cli.task.clone()
     };
 
     // ── Phase 3: Dispatch (direct if |P| ≤ K) ──
     if prompt.len() <= cli.window {
-        eprintln!(
+        verbose!(
             "Phase 3: |P| = {} <= tau = {}, direct dispatch (no recursion)\n",
             prompt.len(),
             cli.window
@@ -700,7 +768,7 @@ async fn run_analysis(
 
         let elapsed = start.elapsed();
         eprintln!(
-            "  DONE -- {} M call(s) in {:.1}s",
+            "Done: {} call(s) in {:.1}s",
             oracle.calls(),
             elapsed.as_secs_f64()
         );
@@ -762,36 +830,39 @@ async fn run_analysis(
                 effective_calls = plan.total_calls,
                 "budget-aware replanning reduced branching factor"
             );
-            eprintln!(
+            verbose!(
                 "  Budget-aware replanning: k={} total_calls={} (budget={available})",
                 plan.k, plan.total_calls
             );
         }
     }
 
-    eprintln!("Phase 4: Execution Plan");
-    eprintln!("  Task:        {task}");
-    eprintln!("  Pipeline:    {}", pipeline_desc(&task));
-    eprintln!("  Compose:     {}", composition_desc(&task));
-    eprintln!(
+    verbose!("Phase 4: Execution Plan");
+    verbose!("  Task:        {task}");
+    verbose!("  Pipeline:    {}", pipeline_desc(&task));
+    verbose!("  Compose:     {}", composition_desc(&task));
+    verbose!(
         "  Input:       {} chars, tau={}  k={}  depth={}",
         prompt.len(),
         plan.tau,
         plan.k,
         plan.depth
     );
-    eprintln!(
+    verbose!(
         "  Calls:       {} leaf + {} reduce = {} total",
         plan.leaf_calls, plan.reduce_calls, plan.total_calls
     );
-    eprintln!("  Concurrency: {} max parallel\n", cli.concurrency);
+    verbose!("  Concurrency: {} max parallel\n", cli.concurrency);
 
     let keywords = extract_keywords(&cli.question);
     let verifier = Verifier::new(task.clone(), keywords.clone());
 
     // Bounded concurrency: prevents OOM on wide/deep recursion trees.
-    // Default 100 permits limits total in-flight phi() calls across all depths.
-    let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+    // Derived from oracle bulkhead capacity (--concurrency) with a small multiplier
+    // to allow queuing without exceeding the bulkhead's 30s timeout. Previously
+    // hardcoded to 100, which caused bulkhead permit timeouts when concurrency < 100.
+    let phi_permits = (cli.concurrency * 3).max(8).min(500);
+    let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(phi_permits));
 
     // Generate trace_id for correlating logs across the entire recursion tree.
     // blake3(question + timestamp) truncated to 16 bytes — unique per invocation.
@@ -811,7 +882,7 @@ async fn run_analysis(
         id.copy_from_slice(&hash.as_bytes()[..16]);
         id
     };
-    eprintln!("  Trace ID: {}", hex::encode(trace_id));
+    verbose!("  Trace ID: {}", hex::encode(trace_id));
 
     let cfg = Arc::new(PhiConfig {
         question: cli.question.clone(),
@@ -847,12 +918,12 @@ async fn run_analysis(
         }
     }
 
-    eprintln!("Phase 5: Executing Phi...\n");
+    eprintln!("Analyzing...");
     let result = phi(cfg, prompt, 0, None).await?;
 
     let elapsed = start.elapsed();
     eprintln!(
-        "  DONE -- {} M call(s) in {:.1}s ({:.1} calls/sec)",
+        "Done: {} call(s) in {:.1}s ({:.1} calls/sec)",
         oracle.calls(),
         elapsed.as_secs_f64(),
         oracle.calls() as f64 / elapsed.as_secs_f64().max(0.001)
@@ -908,27 +979,74 @@ fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
 }
 
 fn sanitize_error(error: &anyhow::Error) -> String {
-    let mut detail = format!("{error:?}");
+    // Show the top-level error message (human-readable), redacting secrets
+    let mut message = format!("{error}");
     for (name, value) in std::env::vars() {
-        let looks_sensitive =
-            name == "FIREWORKS_API" || name.starts_with("OPENCODE_") || name == "CLAUDE_API_KEY";
-        if looks_sensitive && !value.is_empty() {
-            detail = detail.replace(&value, "[REDACTED]");
+        if is_sensitive_env_var_name(&name) && !value.is_empty() {
+            message = message.replace(&value, "[REDACTED]");
         }
     }
-    tracing::error!(error = %detail, "request failed");
-    "Not Found".to_string()
+    // In verbose mode, also show the full error chain
+    if is_verbose() {
+        let mut chain = format!("{error:?}");
+        for (name, value) in std::env::vars() {
+            if is_sensitive_env_var_name(&name) && !value.is_empty() {
+                chain = chain.replace(&value, "[REDACTED]");
+            }
+        }
+        tracing::error!(error = %chain, "request failed");
+    }
+    message
+}
+
+/// Print a summary of errors/warnings/degraded results at the end of a run.
+fn print_issue_summary() {
+    let (errors, warnings, degraded) = issue_counts();
+    let total = errors + warnings + degraded;
+    if total == 0 {
+        return;
+    }
+    eprintln!();
+    eprintln!("--- Issue Summary ---");
+    if errors > 0 {
+        eprintln!("  Errors:   {errors}");
+    }
+    if warnings > 0 {
+        eprintln!("  Warnings: {warnings}");
+    }
+    if degraded > 0 {
+        eprintln!("  Degraded: {degraded} (partial results due to failures)");
+    }
+    eprintln!("  Use -v for full details.");
+}
+
+fn is_sensitive_env_var_name(name: &str) -> bool {
+    static SENSITIVE_ENV_NAME_RE: OnceLock<Regex> = OnceLock::new();
+    SENSITIVE_ENV_NAME_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)^[a-z_][a-z0-9_]*(?:key|token|secret|api)[a-z0-9_]*$")
+                .expect("valid sensitive env-name regex")
+        })
+        .is_match(name)
 }
 
 fn print_runtime_telemetry() {
+    if !is_verbose() {
+        return;
+    }
     let codegen_guards = codegen::codegen_guard_live_counts();
     let interactive_live = INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire);
-    eprintln!("    Codegen budget guards live: {}", codegen_guards.budget);
-    eprintln!(
+    verbose!("    Codegen budget guards live: {}", codegen_guards.budget);
+    verbose!("    Codegen flight guards live: {}", codegen_guards.flight);
+    verbose!(
         "    Child cleanup guards live: {}",
         codegen_guards.child_cleanup
     );
-    eprintln!("    Interactive session live: {}", interactive_live);
+    verbose!(
+        "    PTY session guards live: {}",
+        codegen_guards.pty_session
+    );
+    verbose!("    Interactive session live: {}", interactive_live);
 }
 
 fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
@@ -955,6 +1073,7 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
             + codegen_guards.budget
             + codegen_guards.flight
             + codegen_guards.child_cleanup
+            + codegen_guards.pty_session
             + interactive_live;
         if live_total == 0 {
             return Ok(());
@@ -994,52 +1113,76 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
         "ChildCleanup leak detected"
     );
     debug_assert_eq!(
+        codegen_guards.pty_session, 0,
+        "PtySessionGuard leak detected"
+    );
+    debug_assert_eq!(
         interactive_live, 0,
         "InteractiveSessionPermit leak detected"
     );
     anyhow::bail!(
-        "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={}, interactive_session_guards_live={})",
+        "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={}, pty_session_guards_live={}, interactive_session_guards_live={})",
         metrics.budget_guards_live,
         metrics.inflight_guards_live,
         codegen_guards.budget,
         codegen_guards.flight,
         codegen_guards.child_cleanup,
+        codegen_guards.pty_session,
         interactive_live,
     )
 }
 
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("{}", sanitize_error(&error));
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(MAX_RUNTIME_BLOCKING_THREADS)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("runtime initialization failed: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = runtime.block_on(run()) {
+        eprintln!("[ERROR] {}", sanitize_error(&error));
+        print_issue_summary();
         std::process::exit(1);
     }
+    print_issue_summary();
 }
 
 async fn run() -> Result<()> {
+    let cli = Cli::parse();
+    cli.validate()?;
+    VERBOSE.store(cli.verbose, Ordering::Relaxed);
+
     // Initialize structured logging with non-blocking writer.
     // Non-blocking prevents disk-full or slow disks from stalling the async
     // runtime — logs are dropped (with a counter) rather than blocking tasks.
     // The _guard must live for the duration of main() to flush on exit.
+    // In non-verbose mode, only log errors (user-facing output uses warn_msg!/error_msg!).
+    // RUST_LOG env var always takes precedence for debugging.
+    let default_filter = if cli.verbose { "warn" } else { "error" };
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_target(false)
         .with_writer(non_blocking)
         .init();
 
-    let cli = Cli::parse();
-    cli.validate()?;
     let _ = INTERACTIVE_SESSION_SEMAPHORE.set(Arc::new(tokio::sync::Semaphore::new(1)));
 
     eprintln!("\n================================================================");
     eprintln!("  lambda-RLM v3: Hardened Functional Runtime for Long-Context Reasoning");
     eprintln!("  (arXiv:2603.20105 -- Roy et al., 2026)");
-    eprintln!("  config fingerprint: {}", cli.config_fingerprint());
+    verbose!("  config fingerprint: {}", cli.config_fingerprint());
     eprintln!("================================================================\n");
 
     let oracle = build_oracle(&cli)?;
@@ -1204,13 +1347,13 @@ async fn run() -> Result<()> {
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");
-        eprintln!(
+        verbose!(
             "    (full log: {})",
             codegen::log_file_name(&generator, iteration)
         );
 
         if !oracle.budget_unlimited() && oracle.budget_remaining() == 0 {
-            eprintln!(">>> Budget exhausted. Terminating fix loop.");
+            error_msg!("Budget exhausted. Terminating fix loop.");
             break;
         }
 
@@ -1304,15 +1447,24 @@ mod tests {
         let _fireworks = ScopedEnvVar::set("FIREWORKS_API", "fw-test-secret");
         let _claude = ScopedEnvVar::set("CLAUDE_API_KEY", "claude-test-secret");
         let _opencode = ScopedEnvVar::set("OPENCODE_TOKEN", "opencode-test-secret");
+        let _custom = ScopedEnvVar::set("INTERNAL_DEPLOY_TOKEN", "custom-test-secret");
 
-        let err = anyhow::anyhow!("failure fw-test-secret claude-test-secret opencode-test-secret");
+        let err = anyhow::anyhow!(
+            "failure fw-test-secret claude-test-secret opencode-test-secret custom-test-secret"
+        );
         let exposed = sanitize_error(&err);
-        assert_eq!(exposed, "Not Found");
+        // sanitize_error should show the message but redact all secrets
+        assert!(!exposed.contains("fw-test-secret"), "fireworks key leaked");
+        assert!(!exposed.contains("claude-test-secret"), "claude key leaked");
+        assert!(!exposed.contains("opencode-test-secret"), "opencode key leaked");
+        assert!(!exposed.contains("custom-test-secret"), "custom token leaked");
+        assert!(exposed.contains("[REDACTED]"), "should contain redaction markers");
 
         let debug = format!("{err:?}");
         assert!(debug.contains("fw-test-secret"));
         assert!(debug.contains("claude-test-secret"));
         assert!(debug.contains("opencode-test-secret"));
+        assert!(debug.contains("custom-test-secret"));
     }
 
     #[test]
@@ -1408,6 +1560,121 @@ mod tests {
             0,
             "interactive session live counter should not leak after abort"
         );
+    }
+
+    #[test]
+    #[ignore = "loom model test; run explicitly when validating permit races"]
+    fn loom_interactive_session_permit_single_holder_and_release() {
+        use loom::sync::atomic::{AtomicBool as LoomAtomicBool, AtomicUsize as LoomAtomicUsize};
+        use loom::sync::{Arc as LoomArc, Mutex as LoomMutex};
+        use loom::thread as loom_thread;
+
+        struct LoomInteractivePermit {
+            held: LoomArc<LoomAtomicBool>,
+            live: LoomArc<LoomAtomicUsize>,
+            acquired: bool,
+        }
+
+        impl LoomInteractivePermit {
+            fn acquire(
+                held: LoomArc<LoomAtomicBool>,
+                live: LoomArc<LoomAtomicUsize>,
+            ) -> Option<Self> {
+                if held
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    live.fetch_add(1, Ordering::AcqRel);
+                    Some(Self {
+                        held,
+                        live,
+                        acquired: true,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+
+        impl Drop for LoomInteractivePermit {
+            fn drop(&mut self) {
+                if self.acquired {
+                    self.live.fetch_sub(1, Ordering::AcqRel);
+                    self.held.store(false, Ordering::Release);
+                    self.acquired = false;
+                }
+            }
+        }
+
+        loom::model(|| {
+            let held = LoomArc::new(LoomAtomicBool::new(false));
+            let live = LoomArc::new(LoomAtomicUsize::new(0));
+            let peak = LoomArc::new(LoomAtomicUsize::new(0));
+            let panic_seen = LoomArc::new(LoomAtomicBool::new(false));
+            let panic_slot = LoomArc::new(LoomMutex::new(None::<String>));
+
+            let mut joins = Vec::new();
+            for idx in 0..2 {
+                let held_t = LoomArc::clone(&held);
+                let live_t = LoomArc::clone(&live);
+                let peak_t = LoomArc::clone(&peak);
+                let panic_seen_t = LoomArc::clone(&panic_seen);
+                let panic_slot_t = LoomArc::clone(&panic_slot);
+                joins.push(loom_thread::spawn(move || {
+                    if let Some(_permit) =
+                        LoomInteractivePermit::acquire(held_t, LoomArc::clone(&live_t))
+                    {
+                        let current = live_t.load(Ordering::Acquire);
+                        loop {
+                            let observed = peak_t.load(Ordering::Acquire);
+                            if observed >= current {
+                                break;
+                            }
+                            if peak_t
+                                .compare_exchange(
+                                    observed,
+                                    current,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                        if idx == 0 {
+                            let panic = std::panic::catch_unwind(|| panic!("loom panic"));
+                            if panic.is_err() {
+                                panic_seen_t.store(true, Ordering::Release);
+                                *panic_slot_t.lock().expect("panic slot") =
+                                    Some("panic".to_owned());
+                            }
+                        } else {
+                            loom_thread::yield_now();
+                        }
+                    }
+                }));
+            }
+
+            for join in joins {
+                join.join().expect("loom interactive worker should join");
+            }
+
+            assert!(
+                panic_seen.load(Ordering::Acquire),
+                "model should exercise unwind path"
+            );
+            assert_eq!(peak.load(Ordering::Acquire), 1, "permit must be singleton");
+            assert_eq!(live.load(Ordering::Acquire), 0, "drop must release permit");
+            assert!(
+                !held.load(Ordering::Acquire),
+                "held flag must clear after drop/unwind"
+            );
+            assert!(
+                panic_slot.lock().expect("panic slot").is_some(),
+                "panic path should be observed"
+            );
+        });
     }
 
     #[tokio::test(flavor = "current_thread")]

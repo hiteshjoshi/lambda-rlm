@@ -24,6 +24,9 @@ dashmap = "6"
 bytes = "1"
 regex = "1"
 fs4 = "0.8"
+portable-pty = "0.8"
+memchr = "2"
+getrandom = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 jemallocator = "0.5"
