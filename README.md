@@ -210,6 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `9d30728`
+
+- Hardened OpenCode runtime safety in `src/codegen.rs` by caching `opencode --version` validation in-process, pre-warming the OpenCode summary fallback regex during preflight, and re-validating version compatibility in `run_opencode` before each spawn so fatal drift is isolated by the OpenCode circuit.
+- Added deterministic ENOSPC degradation coverage in `tests/e2e_codegen.rs` with an OpenCode CLI stub to prove fix-loop execution falls back to inline analysis prompts (without `--file`) when `.lambda-rlm-result.md` cannot be persisted.
+- Tightened single-file ingest FD hygiene in `src/main.rs` by routing the file path through `GuardedFile` + `FD_SEMAPHORE`, aligning one-file and directory scans under the same permit lifecycle guarantees.
+
 Latest fix-loop hardening commit: `4d9085c`
 
 - Hardened `src/codegen.rs` with a TTL scavenger for `CODEGEN_SINGLE_FLIGHT`, generator-prefixed single-flight keys (`claude:`/`opencode:`), and stronger no-runtime child-process reaping so stale leader slots and orphaned generator processes do not accumulate.
