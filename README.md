@@ -129,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, no longer blocks on startup probing, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, verifies startup readiness before declaring the session active, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
 
 ## How it works
 
@@ -183,7 +183,7 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--claude` | `false` | Enable fix loop with Claude Code |
 | `--opencode` | `false` | Enable fix loop with OpenCode |
 | `--interactive` | `false` | Run generator in interactive TTY mode |
-| `--interactive-timeout` | `30` | Interactive startup timeout in minutes (1..=120) |
+| `--interactive-timeout` | `15` | Interactive startup timeout in seconds (5..=30) |
 | `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
 | `--no-cache` | `false` | Disable replay cache |
@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.32 (`60196f1`): hardened interactive startup by adding a real readiness probe (child must stay alive before session activation), tightened startup timeout bounds to 5-30 seconds for faster failure on stuck launches, switched shutdown-path interactive termination to SIGTERM-first escalation, and made result-file atomic writes durably fsync both file and parent directory before interactive spawn.
 - v3.31 (`e155be2`): added OpenCode-specific 5-minute global interactive timeout wrapping to prevent stuck sessions from hanging the fix loop indefinitely, switched interactive timeout termination to SIGTERM-with-SIGKILL escalation for process-group cleanup (including a regression test that proves TERM then forced kill), and hardened guard/resource cleanup with panic-safe inflight map drops, bounded JoinSet return draining, and preallocated `parse_items` output buffers.
 - v3.30 (`2a82930`): made `ChildCleanup` drop wait up to 5s for confirmed background reaping so interactive OpenCode/Claude exits cannot orphan lingering children during runtime shutdown, tightened Phi abort-drain timeout to 500ms for faster cancellation cleanup, added explicit runtime telemetry for codegen/interactive live guards, and reduced overlap-split allocations with pre-sized chunk builders.
 - v3.29 (`a7b1be4`): restored Unix interactive child process-group isolation for Claude/OpenCode sessions, force-kill/reap now targets the full process group so orphaned descendants cannot hang fix-loop shutdown, added a hard interactive deadline (`session timeout + 30s`) plus non-TTY revalidation before spawn, and added regression coverage for process-group cleanup on timeout.
