@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.9 (`f47b483`): added `--interactive` codegen mode for Claude/OpenCode with TTY preflight checks, hard interactive timeouts, and mode-aware single-flight/cache keys.
 - v3.8 (`a3a007e`): ENOSPC fallback for `.lambda-rlm-result.md`, atomic/symlink-safe codegen logs, shutdown leak enforcement, and expanded secret redaction.
 - v3.7 (`f58f5b4`): codegen process hardening with bounded execution, safer child cleanup, and stricter output validation.
 - v3.6 (`84b9bb5`): added `--opencode` fix-loop support and shared codegen dispatch.
