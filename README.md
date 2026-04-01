@@ -129,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, verifies startup readiness before declaring the session active, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, marks the session active immediately after spawn to avoid TTY startup deadlocks, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
 
 ## How it works
 
@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.34 (`c3af55c`): fixed the interactive `.. state` freeze by removing interactive child process-group isolation (keeps the TUI in the foreground terminal group), eliminated the startup-readiness gate that could deadlock on TTY sessions, and kept timeout/shutdown watchdog enforcement so runaway sessions still terminate safely.
 - v3.33 (`697e9ff`): fixed interactive-mode hang paths by adding a watchdog RAII stop guard that always signals shutdown on every return/abort path, added regression tests proving interactive children are reaped on both clean exit and parent task abort, added leak telemetry for overlong interactive session permits, and added periodic single-flight `DashMap::shrink_to_fit()` during maintenance sweeps to curb long-run memory retention.
 - v3.32 (`60196f1`): hardened interactive startup by adding a real readiness probe (child must stay alive before session activation), tightened startup timeout bounds to 5-30 seconds for faster failure on stuck launches, switched shutdown-path interactive termination to SIGTERM-first escalation, and made result-file atomic writes durably fsync both file and parent directory before interactive spawn.
 - v3.31 (`e155be2`): added OpenCode-specific 5-minute global interactive timeout wrapping to prevent stuck sessions from hanging the fix loop indefinitely, switched interactive timeout termination to SIGTERM-with-SIGKILL escalation for process-group cleanup (including a regression test that proves TERM then forced kill), and hardened guard/resource cleanup with panic-safe inflight map drops, bounded JoinSet return draining, and preallocated `parse_items` output buffers.
