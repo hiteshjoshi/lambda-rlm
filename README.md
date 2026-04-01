@@ -129,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, applies `--interactive-timeout` only to startup probing (default 30 minutes), then waits for natural user exit, and requires an attached TTY.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, applies `--interactive-timeout` only to startup probing (default 30 minutes), enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
 
 ## How it works
 
@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.17 (`230a307`): added a bounded interactive session timeout to kill/reap hung Claude/OpenCode TTY children, kept startup probing behavior intact, added a regression test for session-timeout termination, and moved full source collection into `spawn_blocking` to avoid blocking the async runtime on large repository scans.
 - v3.16 (`108b289`): made interactive Claude/OpenCode sessions shutdown-aware by wiring the fix-loop shutdown channel into interactive child waits, racing process exit vs shutdown to avoid stuck sessions on SIGTERM/SIGINT, clamping interactive startup timeouts defensively (1..=120 minutes), and adding tests that prove shutdown-triggered child kill/reap behavior.
 - v3.15 (`a065094`): fixed interactive TTY hangs by keeping interactive generators in the foreground process group, split `--interactive-timeout` to startup probing only (no session hard-kill), and added interactive process tests for startup-timeout semantics and early non-success exits.
 - v3.14 (`ea8b71c`): removed codegen bulkhead/budget retention from interactive generator sessions so TTY-driven OpenCode/Claude runs no longer starve fix-loop concurrency, tightened interactive error classification (`codegen_retryable` timeout/wait and `codegen_fatal` spawn), and added JoinSet emptiness assertions after abort-drain/pool return.
