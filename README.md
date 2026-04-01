@@ -129,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, no longer blocks on startup probing, prioritizes shutdown signals, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, no longer blocks on startup probing, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
 
 ## How it works
 
@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.25 (`abb02b5`): bypassed codegen single-flight coalescing for interactive sessions so duplicate interactive calls no longer await each other, removed Unix process-group isolation in interactive generator launches to preserve direct TTY signal flow, removed biased select ordering in interactive process waits, hardened Phi JoinSet return-drop by aborting/draining before pool return, and extended shutdown guard-drain windows to 30s in interactive mode.
 - v3.24 (`0c2841a`): initialized the interactive session semaphore at startup, wrapped interactive admission in an explicit panic-safe RAII permit guard with coverage proving single-session exclusivity/release, and added periodic `inflight` `DashMap::shrink_to_fit()` maintenance every 1000 Oracle calls to reduce long-run map fragmentation.
 - v3.23 (`9b0d2c1`): switched interactive fix-loop admission to `acquire_owned()` so semaphore permits are reliably released with owned lifetimes, wrapped full interactive codegen execution in a hard session timeout guard, tracked live codegen child PIDs for explicit shutdown cleanup, and added forced child termination on leak-drain timeout before final shutdown failure.
 - v3.22 (`5dfc586`): hardened interactive child cleanup with runtime-shutdown-safe background reaping, added pressure-based single-flight eviction and `/tmp` filesystem validation for codegen work directories, bounded JoinSet pool reuse with shrink-on-pressure plus batched semaphore acquisition in Phi, added budget-aware replanning plus timed leak-drain checks, and tightened cache/telemetry resilience with shared read locks and stderr flush guarantees.
