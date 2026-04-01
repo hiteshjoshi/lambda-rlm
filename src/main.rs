@@ -994,6 +994,7 @@ async fn run() -> Result<()> {
             iteration,
             cli.interactive,
             Duration::from_secs(cli.interactive_timeout.saturating_mul(60)),
+            shutdown_rx.clone(),
         )
         .await?;
 

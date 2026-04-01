@@ -43,6 +43,8 @@ const MAX_CODEGEN_BULKHEAD_PERMITS: usize = 64;
 const CODEGEN_CACHE_SCHEMA_VERSION: u8 = 1;
 const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
+const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
+const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
@@ -174,6 +176,7 @@ pub async fn run_code_generator(
     iteration: usize,
     interactive: bool,
     interactive_timeout: Duration,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     maybe_scavenge_codegen_single_flight();
     let flight_key = codegen_flight_key(
@@ -233,6 +236,7 @@ pub async fn run_code_generator(
                     iteration,
                     interactive,
                     interactive_timeout,
+                    shutdown.clone(),
                 )
                 .await
                 .map_err(|error| {
@@ -256,6 +260,7 @@ async fn run_code_generator_once(
     iteration: usize,
     interactive: bool,
     interactive_timeout: Duration,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     let cache_key = codegen_cache_key(generator, result, interactive);
     if !interactive {
@@ -275,15 +280,30 @@ async fn run_code_generator_once(
     );
 
     if interactive {
+        let interactive_timeout = clamp_interactive_startup_timeout(interactive_timeout);
         let started = Instant::now();
         let run = match generator {
             CodeGenerator::Claude => {
-                run_claude_interactive(result, work_dir, question, iteration, interactive_timeout)
-                    .await
+                run_claude_interactive(
+                    result,
+                    work_dir,
+                    question,
+                    iteration,
+                    interactive_timeout,
+                    shutdown,
+                )
+                .await
             }
             CodeGenerator::Opencode => {
-                run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout)
-                    .await
+                run_opencode_interactive(
+                    result,
+                    work_dir,
+                    question,
+                    iteration,
+                    interactive_timeout,
+                    shutdown,
+                )
+                .await
             }
         };
         oracle.record_codegen_call(generator, started.elapsed());
@@ -358,6 +378,13 @@ async fn run_code_generator_once(
             )
         }
     }
+}
+
+fn clamp_interactive_startup_timeout(timeout: Duration) -> Duration {
+    timeout.clamp(
+        INTERACTIVE_STARTUP_TIMEOUT_MIN,
+        INTERACTIVE_STARTUP_TIMEOUT_MAX,
+    )
 }
 
 #[must_use = "CodegenFlightGuard must stay alive to release single-flight ownership"]
@@ -891,11 +918,6 @@ impl ChildCleanup {
         self.child = None;
     }
 
-    fn into_child(mut self) -> Result<tokio::process::Child> {
-        self.child
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("child process handle missing"))
-    }
 }
 
 impl Drop for ChildCleanup {
@@ -1075,6 +1097,7 @@ async fn run_generator_interactive_process(
     mut cmd: tokio::process::Command,
     generator: &CodeGenerator,
     timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let generator_name = match generator {
         CodeGenerator::Claude => "claude",
@@ -1121,17 +1144,33 @@ async fn run_generator_interactive_process(
         Err(_) => {}
     }
 
-    let mut child = child.into_child()?;
-    let status = child
-        .wait()
-        .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("Failed to wait for {generator_name}"))
-        .context("codegen_retryable")?;
-    if !status.success() {
-        return Err(classify_non_success_exit(generator_name, status));
+    let wait_for_child = async {
+        child
+            .child_mut()?
+            .wait()
+            .await
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("Failed to wait for {generator_name}"))
+            .context("codegen_retryable")
+    };
+
+    tokio::select! {
+        status = wait_for_child => {
+            let status = status?;
+            child.disarm();
+            if !status.success() {
+                return Err(classify_non_success_exit(generator_name, status));
+            }
+            Ok(())
+        }
+        changed = shutdown_rx.changed() => {
+            if changed.is_ok() || *shutdown_rx.borrow() {
+                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
+            }
+            child.kill_and_reap().await;
+            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
+        }
     }
-    Ok(())
 }
 
 fn interactive_prompt(question: &str, iteration: usize) -> String {
@@ -1215,6 +1254,7 @@ async fn run_claude_interactive(
     question: &str,
     iteration: usize,
     timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
@@ -1227,7 +1267,7 @@ async fn run_claude_interactive(
         cmd.arg("--dangerously-skip-permissions")
             .arg(interactive_prompt(question, iteration));
         configure_interactive_generator_command(&mut cmd, work_dir);
-        run_generator_interactive_process(cmd, &CodeGenerator::Claude, timeout).await?;
+        run_generator_interactive_process(cmd, &CodeGenerator::Claude, timeout, shutdown_rx).await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
     .await;
@@ -1310,6 +1350,7 @@ async fn run_opencode_interactive(
     question: &str,
     iteration: usize,
     timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
 
@@ -1323,7 +1364,8 @@ async fn run_opencode_interactive(
         );
         let mut cmd = tokio::process::Command::new("opencode");
         configure_interactive_generator_command(&mut cmd, work_dir);
-        run_generator_interactive_process(cmd, &CodeGenerator::Opencode, timeout).await?;
+        run_generator_interactive_process(cmd, &CodeGenerator::Opencode, timeout, shutdown_rx)
+            .await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
     .await;
@@ -1358,6 +1400,14 @@ mod tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    fn unique_pid_file_path() -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("lambda-rlm-interactive-pid-{stamp}.txt"))
     }
 
     #[test]
@@ -1638,6 +1688,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_process_timeout_only_covers_startup() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("1")
             .stdout(std::process::Stdio::null())
@@ -1648,6 +1699,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(150),
+            shutdown_rx,
         )
         .await
         .expect("startup timeout should not terminate interactive session");
@@ -1655,6 +1707,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_process_reports_early_non_success_exit() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg("exit 1")
@@ -1666,6 +1719,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(500),
+            shutdown_rx,
         )
         .await
         .expect_err("non-success exit should fail");
@@ -1674,15 +1728,90 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_process_spawn_failure_is_fatal() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let cmd = tokio::process::Command::new("binary-that-should-not-exist-lambda-rlm");
         let err = run_generator_interactive_process(
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(50),
+            shutdown_rx,
         )
         .await
         .expect_err("missing binary should fail to spawn");
         assert!(error_has_context(&err, "codegen_fatal"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_process_shutdown_signal_kills_child() {
+        let pid_file = unique_pid_file_path();
+        let pid_file_str = pid_file.to_string_lossy().into_owned();
+        let shell = format!("echo $$ > \"{pid_file_str}\"; exec sleep 1000");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(shell)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let join = tokio::spawn(run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(50),
+            shutdown_rx,
+        ));
+
+        let pid = tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = raw.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("interactive process should write pid file");
+
+        shutdown_tx.send(true).expect("send shutdown");
+        let err = tokio::time::timeout(StdDuration::from_secs(5), join)
+            .await
+            .expect("interactive task should finish quickly")
+            .expect("interactive task join should succeed")
+            .expect_err("shutdown should interrupt interactive process");
+        assert!(error_has_context(&err, "codegen_retryable"));
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while pid_alive(pid) {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("child process should be reaped after shutdown");
+
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[test]
+    fn interactive_startup_timeout_is_clamped() {
+        assert_eq!(
+            clamp_interactive_startup_timeout(StdDuration::from_secs(1)),
+            INTERACTIVE_STARTUP_TIMEOUT_MIN
+        );
+        assert_eq!(
+            clamp_interactive_startup_timeout(StdDuration::from_secs(30)),
+            INTERACTIVE_STARTUP_TIMEOUT_MIN
+        );
+        assert_eq!(
+            clamp_interactive_startup_timeout(StdDuration::from_secs(2 * 60 * 60)),
+            INTERACTIVE_STARTUP_TIMEOUT_MAX
+        );
+        assert_eq!(
+            clamp_interactive_startup_timeout(StdDuration::from_secs(3 * 60 * 60)),
+            INTERACTIVE_STARTUP_TIMEOUT_MAX
+        );
     }
 
     #[test]
