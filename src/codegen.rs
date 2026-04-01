@@ -20,6 +20,7 @@ const RESULT_FILE_NAME: &str = ".lambda-rlm-result.md";
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 const CODEGEN_BUDGET_UNITS: usize = 50;
+const RESULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_CB_THRESHOLD: usize = 3;
 const CLAUDE_CB_COOLDOWN: Duration = Duration::from_secs(60);
 const OPENCODE_CB_THRESHOLD: usize = 2;
@@ -58,7 +59,9 @@ impl Drop for CodegenBudgetGuard<'_> {
                     "CodegenBudgetGuard dropped without commit() — restoring reserved budget"
                 );
             }
-            self.oracle.budget_unreserve(self.units);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.oracle.budget_unreserve(self.units);
+            }));
         }
     }
 }
@@ -223,29 +226,42 @@ async fn write_result_file_atomically(
     let work_dir = work_dir.to_path_buf();
     let result_file_clone = result_file.clone();
     let result_owned = result.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut tmp = tempfile::NamedTempFile::new_in(&work_dir).with_context(|| {
-            format!(
-                "Failed to create temporary result file in {}",
-                work_dir.display()
-            )
-        })?;
-        tmp.write_all(result_owned.as_bytes()).with_context(|| {
-            format!(
-                "Failed to write temporary result file in {}",
-                work_dir.display()
-            )
-        })?;
-        tmp.persist(&result_file_clone).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to move {}: {}",
-                result_file_clone.display(),
-                e.error
-            )
-        })?;
-        Ok(())
-    })
+    tokio::time::timeout(
+        RESULT_WRITE_TIMEOUT,
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut tmp = tempfile::NamedTempFile::new_in(&work_dir).with_context(|| {
+                format!(
+                    "Failed to create temporary result file in {}",
+                    work_dir.display()
+                )
+            })?;
+            tmp.write_all(result_owned.as_bytes()).with_context(|| {
+                format!(
+                    "Failed to write temporary result file in {}",
+                    work_dir.display()
+                )
+            })?;
+            tmp.as_file_mut()
+                .sync_all()
+                .context("Failed to fsync temporary result file")?;
+            let persisted = tmp.persist(&result_file_clone).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to move {}: {}",
+                    result_file_clone.display(),
+                    e.error
+                )
+            })?;
+            persisted
+                .sync_all()
+                .context("Failed to fsync persisted result file")?;
+            if let Ok(dir) = std::fs::File::open(&work_dir) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }),
+    )
     .await
+    .context("Result file writer task timed out")?
     .context("Result file writer task failed")??;
 
     Ok(())
@@ -268,6 +284,35 @@ fn last_non_empty_line(text: &str) -> Option<&str> {
     text.lines().rev().find(|line| !line.trim().is_empty())
 }
 
+fn is_opencode_preamble_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with("```")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('>')
+    {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("opencode")
+        || lower.starts_with("model:")
+        || lower.starts_with("provider:")
+        || lower.starts_with("tokens:")
+        || lower.starts_with("cost:")
+        || lower.starts_with("duration:")
+        || lower.starts_with("status:")
+}
+
+fn extract_opencode_summary_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find(|line| !is_opencode_preamble_line(line))
+        .or_else(|| first_non_empty_line(text))
+}
+
 impl CodeGenerator {
     fn extract_result(&self, output: &[u8]) -> Result<Arc<str>> {
         let stdout = std::str::from_utf8(output)
@@ -280,7 +325,7 @@ impl CodeGenerator {
 
         let summary = match self {
             CodeGenerator::Claude => last_non_empty_line(&stdout),
-            CodeGenerator::Opencode => first_non_empty_line(&stdout),
+            CodeGenerator::Opencode => extract_opencode_summary_line(&stdout),
         };
 
         summary
@@ -670,6 +715,16 @@ mod tests {
             .extract_result(output)
             .expect("summary");
         assert_eq!(summary.as_ref(), "metadata");
+    }
+
+    #[test]
+    fn extract_result_skips_opencode_headers() {
+        let output =
+            b"OpenCode v0.6.0\nModel: gpt-5\nStatus: done\nFixed input validation and added tests\n";
+        let summary = CodeGenerator::Opencode
+            .extract_result(output)
+            .expect("summary");
+        assert_eq!(summary.as_ref(), "Fixed input validation and added tests");
     }
 
     #[test]
