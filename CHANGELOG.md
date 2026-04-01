@@ -2,6 +2,12 @@
 
 ## Recent fix-loop hardening commits (moved from README)
 
+### `a065094`
+
+- Fixed interactive TTY hangs in `src/codegen.rs` by removing Unix `process_group(0)` from interactive generator command setup so child TUIs stay in the terminal foreground process group and can read stdin reliably.
+- Split interactive timeout semantics in `src/codegen.rs`: `--interactive-timeout` now bounds startup probing only, then interactive sessions wait for natural exit without forced timeout cancellation.
+- Added interactive regression coverage in `src/codegen.rs` for startup-timeout behavior and early non-success interactive exits.
+
 ### `ea8b71c`
 
 - Fixed the interactive codegen deadlock in `src/codegen.rs` by moving code-generator bulkhead/budget acquisition to the non-interactive path only, so long-lived TTY sessions no longer hold permits that block other runtime work.

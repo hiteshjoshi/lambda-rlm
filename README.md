@@ -129,7 +129,7 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, enforces a hard timeout (`--interactive-timeout`, default 30 minutes), and requires an attached TTY.
+Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, applies `--interactive-timeout` only to startup probing (default 30 minutes), then waits for natural user exit, and requires an attached TTY.
 
 ## How it works
 
@@ -183,7 +183,7 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--claude` | `false` | Enable fix loop with Claude Code |
 | `--opencode` | `false` | Enable fix loop with OpenCode |
 | `--interactive` | `false` | Run generator in interactive TTY mode |
-| `--interactive-timeout` | `30` | Interactive hard timeout in minutes (1..=120) |
+| `--interactive-timeout` | `30` | Interactive startup timeout in minutes (1..=120) |
 | `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
 | `--no-cache` | `false` | Disable replay cache |
@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.15 (`a065094`): fixed interactive TTY hangs by keeping interactive generators in the foreground process group, split `--interactive-timeout` to startup probing only (no session hard-kill), and added interactive process tests for startup-timeout semantics and early non-success exits.
 - v3.14 (`ea8b71c`): removed codegen bulkhead/budget retention from interactive generator sessions so TTY-driven OpenCode/Claude runs no longer starve fix-loop concurrency, tightened interactive error classification (`codegen_retryable` timeout/wait and `codegen_fatal` spawn), and added JoinSet emptiness assertions after abort-drain/pool return.
 - v3.13 (`bedafe5`): removed interactive `spawn_blocking` polling in favor of direct Tokio child waits with async timeouts/reaping, and updated timeout coverage to exercise the interactive path without blocking-pool starvation.
 - v3.12 (`c17d7a7`): moved interactive Claude/OpenCode execution onto a blocking process path with explicit timeout polling and forced reap on timeout, eliminating async/TTY hangs where interactive sessions stalled after launch.
