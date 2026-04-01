@@ -75,6 +75,7 @@ fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
 
 fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
     set.detach_all();
+    debug_assert!(set.is_empty(), "JoinSet pool received non-empty set");
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Ok(mut pool) = cfg.joinset_pool.lock() {
             if pool.len() < MAX_JOINSET_POOL {
@@ -102,6 +103,7 @@ async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usiz
         );
         set.detach_all();
     }
+    debug_assert!(set.is_empty(), "abort_and_drain left JoinSet non-empty");
 }
 
 /// PRE: cfg.task != Auto (resolved in Phase 2)

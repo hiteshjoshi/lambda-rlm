@@ -268,30 +268,62 @@ async fn run_code_generator_once(
         }
     }
 
-    let _bulkhead = codegen_bulkhead(generator)
-        .acquire_owned()
-        .await
-        .with_context(|| format!("{generator} bulkhead saturated"))?;
-    let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
     let circuit = codegen_circuit(generator)?;
     anyhow::ensure!(
         circuit.allow_request(),
         "code generation temporarily unavailable"
     );
 
+    if interactive {
+        let started = Instant::now();
+        let run = match generator {
+            CodeGenerator::Claude => {
+                run_claude_interactive(result, work_dir, question, iteration, interactive_timeout)
+                    .await
+            }
+            CodeGenerator::Opencode => {
+                run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout)
+                    .await
+            }
+        };
+        oracle.record_codegen_call(generator, started.elapsed());
+
+        return match run {
+            Ok(summary) => {
+                circuit.record_success();
+                Ok(summary)
+            }
+            Err(error) => {
+                if error_has_context(&error, "codegen_fatal") {
+                    circuit.record_failure();
+                    circuit.record_failure();
+                    tracing::error!(generator = %generator, iteration, error = ?error, "code generation fatal failure");
+                } else if error_has_context(&error, "codegen_retryable") {
+                    circuit.record_failure();
+                    tracing::warn!(generator = %generator, iteration, error = ?error, "code generation retryable failure");
+                } else {
+                    circuit.record_failure();
+                    tracing::error!(generator = %generator, iteration, error = ?error, "code generation execution failed");
+                }
+                Err(
+                    anyhow::anyhow!("code generation unavailable").context(match generator {
+                        CodeGenerator::Claude => "claude_service_unavailable",
+                        CodeGenerator::Opencode => "opencode_service_unavailable",
+                    }),
+                )
+            }
+        };
+    }
+
+    let _bulkhead = codegen_bulkhead(generator)
+        .acquire_owned()
+        .await
+        .with_context(|| format!("{generator} bulkhead saturated"))?;
+    let mut budget_guard = CodegenBudgetGuard::acquire(oracle, CODEGEN_BUDGET_UNITS)?;
     let started = Instant::now();
-    let run = match (generator, interactive) {
-        (CodeGenerator::Claude, true) => {
-            run_claude_interactive(result, work_dir, question, iteration, interactive_timeout).await
-        }
-        (CodeGenerator::Claude, false) => run_claude(result, work_dir, question, iteration).await,
-        (CodeGenerator::Opencode, true) => {
-            run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout)
-                .await
-        }
-        (CodeGenerator::Opencode, false) => {
-            run_opencode(result, work_dir, question, iteration).await
-        }
+    let run = match generator {
+        CodeGenerator::Claude => run_claude(result, work_dir, question, iteration).await,
+        CodeGenerator::Opencode => run_opencode(result, work_dir, question, iteration).await,
     };
     oracle.record_codegen_call(generator, started.elapsed());
 
@@ -1049,7 +1081,9 @@ async fn run_generator_interactive_process(
     };
     let child = cmd
         .spawn()
-        .with_context(|| format!("Failed to spawn `{generator_name}` — is it installed and on PATH?"))?;
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to spawn `{generator_name}` — is it installed and on PATH?"))
+        .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
     let status = match tokio::time::timeout(timeout, async {
@@ -1064,11 +1098,16 @@ async fn run_generator_interactive_process(
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             child.kill_and_reap().await;
-            return Err(error).with_context(|| format!("Failed to wait for {generator_name}"));
+            return Err(error)
+                .with_context(|| format!("Failed to wait for {generator_name}"))
+                .context("codegen_retryable");
         }
         Err(_) => {
             child.kill_and_reap().await;
-            anyhow::bail!("{generator_name} interactive session timed out after {timeout:?}");
+            return Err(
+                anyhow::anyhow!("{generator_name} interactive session timed out after {timeout:?}")
+                    .context("codegen_retryable"),
+            );
         }
     };
 
@@ -1601,6 +1640,20 @@ mod tests {
             format!("{err:#}").contains("interactive session timed out"),
             "unexpected timeout error: {err:#}"
         );
+        assert!(error_has_context(&err, "codegen_retryable"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_process_spawn_failure_is_fatal() {
+        let cmd = tokio::process::Command::new("binary-that-should-not-exist-lambda-rlm");
+        let err = run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(50),
+        )
+        .await
+        .expect_err("missing binary should fail to spawn");
+        assert!(error_has_context(&err, "codegen_fatal"));
     }
 
     #[test]
