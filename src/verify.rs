@@ -44,9 +44,7 @@ impl Verifier {
         // Task-specific validation — exhaustive match, no wildcards
         match self.task {
             TaskType::Search => {
-                if !self.keywords.is_empty()
-                    && !keyword_matches(trimmed, &self.keywords)
-                {
+                if !self.keywords.is_empty() && !keyword_matches(trimmed, &self.keywords) {
                     return VerifyResult::Degraded(
                         trimmed.to_string(),
                         "output lacks search keywords",
@@ -69,26 +67,17 @@ impl Verifier {
 
             TaskType::Classify => {
                 if trimmed.len() < 10 {
-                    return VerifyResult::Degraded(
-                        trimmed.to_string(),
-                        "classification too terse",
-                    );
+                    return VerifyResult::Degraded(trimmed.to_string(), "classification too terse");
                 }
                 VerifyResult::Accept(trimmed.to_string())
             }
 
-            TaskType::Aggregate => {
-                VerifyResult::Accept(trimmed.to_string())
-            }
+            TaskType::Aggregate => VerifyResult::Accept(trimmed.to_string()),
 
-            TaskType::Pairwise => {
-                VerifyResult::Accept(trimmed.to_string())
-            }
+            TaskType::Pairwise => VerifyResult::Accept(trimmed.to_string()),
 
             TaskType::MultiHop => {
-                if !self.keywords.is_empty()
-                    && !keyword_matches(trimmed, &self.keywords)
-                {
+                if !self.keywords.is_empty() && !keyword_matches(trimmed, &self.keywords) {
                     return VerifyResult::Degraded(
                         trimmed.to_string(),
                         "evidence lacks query keywords",

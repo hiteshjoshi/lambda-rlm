@@ -57,12 +57,20 @@ impl CostModel {
         let tf = tau as f64;
         let leaf_cost = (nf / tf) * self.cost_leaf(tau);
         if !neural_reduce || k <= 1 {
-            return if leaf_cost.is_finite() { leaf_cost } else { f64::MAX / 2.0 };
+            return if leaf_cost.is_finite() {
+                leaf_cost
+            } else {
+                f64::MAX / 2.0
+            };
         }
         let c_reduce = self.cost_reduce(k, true);
         let reduce_cost = c_reduce * (nf * kf - tf) / (tf * (kf - 1.0));
         let total = leaf_cost + reduce_cost;
-        if total.is_finite() { total } else { f64::MAX / 2.0 }
+        if total.is_finite() {
+            total
+        } else {
+            f64::MAX / 2.0
+        }
     }
 
     /// End-to-end accuracy — Theorem 3
@@ -84,7 +92,11 @@ impl CostModel {
             a_leaf.powf(k_pow_d)
         };
         let result = a_reduce.powf(d) * leaf_acc;
-        if result.is_finite() { result } else { 0.0 }
+        if result.is_finite() {
+            result
+        } else {
+            0.0
+        }
     }
 }
 
@@ -291,14 +303,22 @@ pub fn compute_plan(
 
     let leaf_calls = {
         let raw = (k as f64).powf(depth as f64);
-        if raw > usize::MAX as f64 { usize::MAX } else { raw as usize }
+        if raw > usize::MAX as f64 {
+            usize::MAX
+        } else {
+            raw as usize
+        }
     };
 
     let reduce_calls = if neural && depth > 0 {
         let mut internal = 0usize;
         for d in 0..depth {
             let level = (k as f64).powf(d as f64);
-            let level_usize = if level > usize::MAX as f64 { usize::MAX } else { level as usize };
+            let level_usize = if level > usize::MAX as f64 {
+                usize::MAX
+            } else {
+                level as usize
+            };
             internal = internal.saturating_add(level_usize);
         }
         internal
