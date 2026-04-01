@@ -48,7 +48,6 @@ type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
 static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightEntry>> = OnceLock::new();
 static CODEGEN_SINGLE_FLIGHT_LAST_SCAVENGE_SECS: AtomicU64 = AtomicU64::new(0);
-static OPENCODE_VERSION_CHECK: OnceLock<std::result::Result<(), Arc<str>>> = OnceLock::new();
 
 struct CodegenFlightEntry {
     sender: CodegenFlightSender,
@@ -493,14 +492,6 @@ async fn write_result_file_atomically(
     result: &str,
     _iteration: usize,
 ) -> Result<()> {
-    if cfg!(debug_assertions) && std::env::var_os("LAMBDA_RLM_TEST_FORCE_RESULT_ENOSPC").is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "forced ENOSPC for codegen test",
-        )
-        .into());
-    }
-
     validate_analysis_result_content(result)?;
 
     let result_file = work_dir.join(RESULT_FILE_NAME);
@@ -666,7 +657,11 @@ fn extract_opencode_summary_line(text: &str) -> Option<&str> {
 }
 
 fn extract_opencode_summary_line_regex(text: &str) -> Option<&str> {
-    let re = opencode_summary_regex();
+    static FALLBACK_RE: OnceLock<Regex> = OnceLock::new();
+    let re = FALLBACK_RE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*(?:>>>\s*)?(?P<summary>CLEAN|(?:[A-Za-z0-9][^\n]{8,240}))\s*$")
+            .expect("fallback regex must compile")
+    });
     re.captures_iter(text).find_map(|captures| {
         let candidate = captures.name("summary")?.as_str().trim();
         if candidate.is_empty() || is_opencode_preamble_line(candidate) {
@@ -676,15 +671,7 @@ fn extract_opencode_summary_line_regex(text: &str) -> Option<&str> {
     })
 }
 
-fn opencode_summary_regex() -> &'static Regex {
-    static FALLBACK_RE: OnceLock<Regex> = OnceLock::new();
-    FALLBACK_RE.get_or_init(|| {
-        Regex::new(r"(?m)^\s*(?:>>>\s*)?(?P<summary>CLEAN|(?:[A-Za-z0-9][^\n]{8,240}))\s*$")
-            .expect("fallback regex must compile")
-    })
-}
-
-fn validate_opencode_binary_version_uncached() -> Result<()> {
+pub fn validate_opencode_binary_version() -> Result<()> {
     let output = std::process::Command::new("opencode")
         .arg("--version")
         .output()
@@ -701,18 +688,6 @@ fn validate_opencode_binary_version_uncached() -> Result<()> {
         version.trim()
     );
     Ok(())
-}
-
-pub fn validate_opencode_binary_version() -> Result<()> {
-    let cached = OPENCODE_VERSION_CHECK.get_or_init(|| {
-        let _ = opencode_summary_regex();
-        validate_opencode_binary_version_uncached()
-            .map_err(|error| Arc::<str>::from(format!("{error:#}")))
-    });
-    match cached {
-        Ok(()) => Ok(()),
-        Err(message) => Err(anyhow::anyhow!(message.to_string())),
-    }
 }
 
 impl CodeGenerator {
@@ -1063,8 +1038,6 @@ async fn run_opencode(
     question: &str,
     iteration: usize,
 ) -> Result<Arc<str>> {
-    validate_opencode_binary_version().context("codegen_fatal")?;
-
     let mut wrote_result_file = true;
     if let Err(error) = write_result_file_atomically(work_dir, result, iteration).await {
         if is_storage_full_error(&error) {
