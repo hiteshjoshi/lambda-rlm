@@ -49,6 +49,7 @@ const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_DROP_REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1090,7 +1091,6 @@ impl ChildCleanup {
 
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
-        CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(mut child) = self.child.take() {
                 let pid = child.id();
@@ -1100,11 +1100,14 @@ impl Drop for ChildCleanup {
                     }
                     Ok(None) | Err(_) => {
                         untrack_codegen_child_pid(pid);
-                        spawn_background_child_reap(child);
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        spawn_background_child_reap(child, Some(tx));
+                        let _ = rx.recv_timeout(CHILD_DROP_REAP_WAIT_TIMEOUT);
                     }
                 }
             }
         }));
+        CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1117,12 +1120,17 @@ async fn kill_and_reap_owned(mut child: tokio::process::Child, wait_timeout: Dur
     untrack_codegen_child_pid(pid);
 }
 
-fn spawn_background_child_reap(mut child: tokio::process::Child) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            kill_and_reap_owned(child, CHILD_REAP_TIMEOUT).await;
-        });
-        return;
+fn spawn_background_child_reap(
+    mut child: tokio::process::Child,
+    completion_tx: Option<std::sync::mpsc::Sender<()>>,
+) {
+    if completion_tx.is_none() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                kill_and_reap_owned(child, CHILD_REAP_TIMEOUT).await;
+            });
+            return;
+        }
     }
 
     let _ = std::thread::Builder::new()
@@ -1147,6 +1155,9 @@ fn spawn_background_child_reap(mut child: tokio::process::Child) {
                 }
                 let _ = child.kill();
                 let _ = child.wait();
+            }
+            if let Some(tx) = completion_tx {
+                let _ = tx.send(());
             }
         });
 }
@@ -1313,7 +1324,8 @@ async fn run_generator_interactive_process(
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
-    let hard_deadline = tokio::time::Instant::now() + session_timeout.saturating_add(Duration::from_secs(30));
+    let hard_deadline =
+        tokio::time::Instant::now() + session_timeout.saturating_add(Duration::from_secs(30));
     let soft_deadline = tokio::time::Instant::now() + session_timeout;
 
     loop {
@@ -1335,11 +1347,15 @@ async fn run_generator_interactive_process(
         if now >= hard_deadline {
             tracing::error!(
                 generator = generator_name,
-                hard_timeout_secs = session_timeout.saturating_add(Duration::from_secs(30)).as_secs(),
+                hard_timeout_secs = session_timeout
+                    .saturating_add(Duration::from_secs(30))
+                    .as_secs(),
                 "interactive session exceeded hard deadline; force-killing child process group"
             );
             child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
-            return Err(anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable"));
+            return Err(
+                anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable")
+            );
         }
         if now >= soft_deadline {
             tracing::warn!(
@@ -1905,7 +1921,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn child_cleanup_drop_is_non_blocking() {
+    async fn child_cleanup_drop_is_bounded() {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("1000")
             .stdout(std::process::Stdio::null())
@@ -1918,8 +1934,8 @@ mod tests {
         let start = StdInstant::now();
         drop(cleanup);
         assert!(
-            start.elapsed() < StdDuration::from_millis(10),
-            "drop should not block runtime thread"
+            start.elapsed() <= CHILD_DROP_REAP_WAIT_TIMEOUT + StdDuration::from_secs(1),
+            "drop should not exceed bounded reap wait"
         );
     }
 

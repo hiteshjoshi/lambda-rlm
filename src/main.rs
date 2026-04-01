@@ -681,6 +681,7 @@ async fn run_analysis(
             elapsed.as_secs_f64()
         );
         oracle.print_telemetry();
+        print_runtime_telemetry();
         return Ok(result);
     }
 
@@ -833,6 +834,7 @@ async fn run_analysis(
         oracle.calls() as f64 / elapsed.as_secs_f64().max(0.001)
     );
     oracle.print_telemetry();
+    print_runtime_telemetry();
     Ok(result)
 }
 
@@ -892,6 +894,17 @@ fn sanitize_error(error: &anyhow::Error) -> String {
     }
     tracing::error!(error = %detail, "request failed");
     "Not Found".to_string()
+}
+
+fn print_runtime_telemetry() {
+    let codegen_guards = codegen::codegen_guard_live_counts();
+    let interactive_live = INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire);
+    eprintln!("    Codegen budget guards live: {}", codegen_guards.budget);
+    eprintln!(
+        "    Child cleanup guards live: {}",
+        codegen_guards.child_cleanup
+    );
+    eprintln!("    Interactive session live: {}", interactive_live);
 }
 
 fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
@@ -956,7 +969,10 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
         codegen_guards.child_cleanup, 0,
         "ChildCleanup leak detected"
     );
-    debug_assert_eq!(interactive_live, 0, "InteractiveSessionPermit leak detected");
+    debug_assert_eq!(
+        interactive_live, 0,
+        "InteractiveSessionPermit leak detected"
+    );
     anyhow::bail!(
         "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={}, interactive_session_guards_live={})",
         metrics.budget_guards_live,
@@ -1160,6 +1176,7 @@ async fn run() -> Result<()> {
         ensure_no_live_guards(&oracle, cli.interactive).await?;
 
         oracle.print_telemetry();
+        print_runtime_telemetry();
 
         let trimmed: String = summary.chars().take(200).collect();
         eprintln!(">>> Iteration {iteration} done: {trimmed}");

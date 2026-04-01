@@ -48,7 +48,19 @@ pub fn comb_split_overlap(text: &str, k: usize, delta_chars: usize) -> Vec<Strin
         let raw_end = ((i + 1) * per_chunk).min(total);
         let start = raw_start.saturating_sub(delta_lines);
         let end = (raw_end + delta_lines).min(total);
-        let chunk: String = lines[start..end].join("\n");
+        let slice = &lines[start..end];
+        let estimated_len: usize = slice
+            .iter()
+            .map(|line| line.len())
+            .sum::<usize>()
+            .saturating_add(slice.len().saturating_sub(1));
+        let mut chunk = String::with_capacity(estimated_len);
+        for (idx, line) in slice.iter().enumerate() {
+            if idx > 0 {
+                chunk.push('\n');
+            }
+            chunk.push_str(line);
+        }
         if !chunk.trim().is_empty() {
             chunks.push(chunk);
         }

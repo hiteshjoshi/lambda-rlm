@@ -61,7 +61,7 @@ pub struct PhiConfig {
 /// JS) generates millions of chunks that exhaust memory before semaphore
 /// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
-const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
+const JOINSET_DRAIN_TIMEOUT_MILLIS: u64 = 500;
 const MAX_JOINSET_POOL: usize = 100;
 const AUTO_DETECT_MAX_TOKENS: u32 = 256;
 const RESOURCE_ACQUIRE_TIMEOUT_SECS: u64 = 30;
@@ -132,13 +132,13 @@ async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usiz
             drop(res);
         }
     };
-    if tokio::time::timeout(Duration::from_secs(JOINSET_DRAIN_TIMEOUT_SECS), drain)
+    if tokio::time::timeout(Duration::from_millis(JOINSET_DRAIN_TIMEOUT_MILLIS), drain)
         .await
         .is_err()
     {
         tracing::error!(
             depth,
-            timeout_secs = JOINSET_DRAIN_TIMEOUT_SECS,
+            timeout_ms = JOINSET_DRAIN_TIMEOUT_MILLIS,
             "joinset drain timed out after abort_all"
         );
         set.detach_all();
