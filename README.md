@@ -210,6 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `a3a007e`
+
+- Hardened `src/codegen.rs` for disk-pressure resilience: if writing `.lambda-rlm-result.md` hits ENOSPC, the fix loop degrades to an inline in-memory prompt instead of failing the iteration.
+- Added atomic log writes with symlink-safe preflight in `src/codegen.rs` so `.lambda-rlm-claude-*.log` / `.lambda-rlm-opencode-*.log` are written via temp+persist flow.
+- Tightened shutdown-leak guarantees in `src/main.rs` by failing the run if budget/codegen guard live-counters are non-zero at exit.
+- Expanded secret redaction in `src/main.rs`, `src/oracle.rs`, and `src/codegen.rs` to scrub both `FIREWORKS_API` and `OPENCODE_*` values from error surfaces.
+
 Latest fix-loop hardening commit: `ddf3f6c`
 
 - Added OpenCode production hardening in `src/codegen.rs` and `src/main.rs`: version handshake (`opencode 1.x`), stricter per-generator timeouts, control-character rejection in OpenCode summary parsing, and safer child-process reap behavior in drop paths.

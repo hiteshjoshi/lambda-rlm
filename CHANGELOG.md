@@ -1,5 +1,21 @@
 # Changelog
 
+### v3.8 — OpenCode Resilience Hardening (`a3a007e`)
+
+**Hardened:**
+- Added ENOSPC degradation in `src/codegen.rs`: when `.lambda-rlm-result.md` cannot be written due to disk-full conditions, the fix loop falls back to an inline bounded analysis prompt instead of aborting.
+- Added atomic, symlink-safe log writes in `src/codegen.rs` for both Claude and OpenCode iteration logs.
+- Added strict shutdown leak enforcement in `src/main.rs` to fail the run if live guard counters are non-zero.
+
+**Secured:**
+- Expanded secret scrubbing in `src/main.rs`, `src/oracle.rs`, and `src/codegen.rs` to redact both `FIREWORKS_API` and `OPENCODE_*` values.
+- Hardened single-file collection path in `src/main.rs` with `open_file_no_follow`, plus saturating aggregate-byte accounting and owned FD semaphore permits.
+
+**Tested:**
+- Added `child_cleanup_drop_reaps_process` in `src/codegen.rs` to assert dropped generator children are reaped within 5 seconds.
+
+**Net: +205 / -47 across runtime hardening paths. 56/56 tests pass.**
+
 ### v3.7 — Codegen Process Hardening (`f58f5b4`)
 
 **Hardened:**
