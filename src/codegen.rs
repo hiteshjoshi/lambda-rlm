@@ -890,6 +890,12 @@ impl ChildCleanup {
     fn disarm(&mut self) {
         self.child = None;
     }
+
+    fn into_child(mut self) -> Result<tokio::process::Child> {
+        self.child
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("child process handle missing"))
+    }
 }
 
 impl Drop for ChildCleanup {
@@ -1063,11 +1069,6 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
 }
 
 async fn run_generator_interactive_process(
@@ -1082,40 +1083,54 @@ async fn run_generator_interactive_process(
     let child = cmd
         .spawn()
         .map_err(anyhow::Error::from)
-        .with_context(|| format!("Failed to spawn `{generator_name}` — is it installed and on PATH?"))
+        .with_context(|| {
+            format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
+        })
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
-    let status = match tokio::time::timeout(timeout, async {
-        child
-            .child_mut()?
-            .wait()
-            .await
-            .map_err(anyhow::Error::from)
+    // Interactive sessions are intentionally unbounded once started.
+    // The timeout only applies to startup probing (early process failures).
+    let startup_probe = tokio::time::timeout(timeout, async {
+        loop {
+            let maybe_status = child
+                .child_mut()?
+                .try_wait()
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("Failed to probe {generator_name} startup"))?;
+            if let Some(status) = maybe_status {
+                return Ok::<std::process::ExitStatus, anyhow::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     })
-    .await
-    {
-        Ok(Ok(status)) => status,
+    .await;
+
+    match startup_probe {
+        Ok(Ok(status)) => {
+            child.disarm();
+            if !status.success() {
+                return Err(classify_non_success_exit(generator_name, status));
+            }
+            return Ok(());
+        }
         Ok(Err(error)) => {
             child.kill_and_reap().await;
-            return Err(error)
-                .with_context(|| format!("Failed to wait for {generator_name}"))
-                .context("codegen_retryable");
+            return Err(error).context("codegen_retryable");
         }
-        Err(_) => {
-            child.kill_and_reap().await;
-            return Err(
-                anyhow::anyhow!("{generator_name} interactive session timed out after {timeout:?}")
-                    .context("codegen_retryable"),
-            );
-        }
-    };
+        Err(_) => {}
+    }
 
-    child.disarm();
+    let mut child = child.into_child()?;
+    let status = child
+        .wait()
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to wait for {generator_name}"))
+        .context("codegen_retryable")?;
     if !status.success() {
         return Err(classify_non_success_exit(generator_name, status));
     }
-
     Ok(())
 }
 
@@ -1622,9 +1637,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn interactive_process_times_out() {
+    async fn interactive_process_timeout_only_covers_startup() {
         let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("1000")
+        cmd.arg("1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(150),
+        )
+        .await
+        .expect("startup timeout should not terminate interactive session");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_process_reports_early_non_success_exit() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("exit 1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null());
@@ -1632,14 +1665,10 @@ mod tests {
         let err = run_generator_interactive_process(
             cmd,
             &CodeGenerator::Opencode,
-            StdDuration::from_millis(150),
+            StdDuration::from_millis(500),
         )
         .await
-        .expect_err("sleep should time out");
-        assert!(
-            format!("{err:#}").contains("interactive session timed out"),
-            "unexpected timeout error: {err:#}"
-        );
+        .expect_err("non-success exit should fail");
         assert!(error_has_context(&err, "codegen_retryable"));
     }
 

@@ -200,7 +200,7 @@ struct Cli {
     #[arg(long, default_value = "false", requires = "code_generator")]
     interactive: bool,
 
-    /// Interactive session timeout in minutes (1..=120)
+    /// Interactive startup timeout in minutes (1..=120)
     #[arg(
         long,
         default_value = "30",
@@ -308,11 +308,11 @@ impl Cli {
 fn parse_interactive_timeout_minutes(raw: &str) -> std::result::Result<u64, String> {
     let mins: u64 = raw
         .parse()
-        .map_err(|_| "interactive timeout must be an integer".to_string())?;
+        .map_err(|_| "interactive startup timeout must be an integer".to_string())?;
     if (1..=120).contains(&mins) {
         Ok(mins)
     } else {
-        Err("interactive timeout must be between 1 and 120 minutes".to_string())
+        Err("interactive startup timeout must be between 1 and 120 minutes".to_string())
     }
 }
 
