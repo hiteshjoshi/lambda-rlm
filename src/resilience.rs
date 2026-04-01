@@ -345,6 +345,8 @@ pub struct ReplayCache {
     corruption_count: AtomicUsize,
 }
 
+const QUARANTINE_MAX_FILES: usize = 100;
+
 pub struct CachePermit<'a> {
     _cache: &'a ReplayCache,
 }
@@ -360,7 +362,7 @@ impl ReplayCache {
             Self::scavenge_orphaned_temps(&dir);
             // Bound the quarantine directory to prevent unbounded growth from
             // bitrot/disk corruption over long-running deployments.
-            Self::scavenge_quarantine(&dir, 100);
+            Self::scavenge_quarantine(&dir, QUARANTINE_MAX_FILES);
         }
         Self {
             dir,
@@ -429,6 +431,16 @@ impl ReplayCache {
                 "scavenged old quarantined cache entries"
             );
         }
+    }
+
+    /// Run low-frequency maintenance to keep crash leftovers bounded in
+    /// long-running daemons.
+    pub fn maintenance_sweep(&self) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        Self::scavenge_orphaned_temps(&self.dir);
+        Self::scavenge_quarantine(&self.dir, QUARANTINE_MAX_FILES);
     }
 
     /// Content-addressed cache key including schema version.
@@ -1004,15 +1016,15 @@ mod tests {
         }
 
         // Scavenge to 100
-        ReplayCache::scavenge_quarantine(&dir, 100);
+        ReplayCache::scavenge_quarantine(&dir, QUARANTINE_MAX_FILES);
 
         let remaining = std::fs::read_dir(&quarantine_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .count();
         assert!(
-            remaining <= 100,
-            "quarantine should be bounded to 100, got {remaining}"
+            remaining <= QUARANTINE_MAX_FILES,
+            "quarantine should be bounded to {QUARANTINE_MAX_FILES}, got {remaining}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

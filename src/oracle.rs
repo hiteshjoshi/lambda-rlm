@@ -630,6 +630,10 @@ impl Oracle {
         &self.cache
     }
 
+    pub fn run_cache_maintenance(&self) {
+        self.cache.maintenance_sweep();
+    }
+
     pub fn budget_remaining(&self) -> usize {
         self.budget.remaining()
     }

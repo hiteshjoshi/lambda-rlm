@@ -286,9 +286,12 @@ async fn run_code_generator_once(
         }
         (CodeGenerator::Claude, false) => run_claude(result, work_dir, question, iteration).await,
         (CodeGenerator::Opencode, true) => {
-            run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout).await
+            run_opencode_interactive(result, work_dir, question, iteration, interactive_timeout)
+                .await
         }
-        (CodeGenerator::Opencode, false) => run_opencode(result, work_dir, question, iteration).await,
+        (CodeGenerator::Opencode, false) => {
+            run_opencode(result, work_dir, question, iteration).await
+        }
     };
     oracle.record_codegen_call(generator, started.elapsed());
 
@@ -1057,7 +1060,9 @@ async fn run_generator_interactive_process(
             .with_context(|| format!("Failed to run {generator_name}"))
     })
     .await
-    .with_context(|| format!("{generator_name} interactive session timed out after {timeout:?}"))??;
+    .with_context(|| {
+        format!("{generator_name} interactive session timed out after {timeout:?}")
+    })??;
 
     child.disarm();
     if !status.success() {
@@ -1280,6 +1285,7 @@ mod tests {
     use loom::sync::Arc as LoomArc;
     use loom::thread as loom_thread;
     use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
 
     fn pid_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
@@ -1535,6 +1541,37 @@ mod tests {
         })
         .await
         .expect("child process should be reaped within timeout");
+    }
+
+    #[test]
+    fn child_cleanup_drop_reaps_without_runtime() {
+        let (cleanup, pid) = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let mut cmd = tokio::process::Command::new("sleep");
+                cmd.arg("1000")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .stdin(std::process::Stdio::null());
+                let child = cmd.spawn().expect("spawn sleep");
+                let pid = child.id().expect("pid");
+                (ChildCleanup::new(child), pid)
+            })
+        };
+
+        drop(cleanup);
+
+        let deadline = StdInstant::now() + StdDuration::from_secs(5);
+        while pid_alive(pid) && StdInstant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(50));
+        }
+        assert!(
+            !pid_alive(pid),
+            "child process should be reaped by fallback thread"
+        );
     }
 
     #[test]

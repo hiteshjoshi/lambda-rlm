@@ -328,6 +328,7 @@ fn parse_interactive_timeout_minutes(raw: &str) -> std::result::Result<u64, Stri
 /// 256MB aligns with Phi's hard input limit and prevents oversized ingest.
 const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OPEN_FILES: usize = 1024;
+const CACHE_MAINTENANCE_INTERVAL_SECS: u64 = 15 * 60;
 static FD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 #[must_use = "GuardedFile holds an FD permit until dropped"]
@@ -812,9 +813,7 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
 fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
     let metrics = oracle.metrics();
     let codegen_guards_live = codegen::codegen_guard_live_count();
-    if metrics.budget_guards_live > 0
-        || metrics.inflight_guards_live > 0
-        || codegen_guards_live > 0
+    if metrics.budget_guards_live > 0 || metrics.inflight_guards_live > 0 || codegen_guards_live > 0
     {
         anyhow::bail!(
             "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_guards_live={})",
@@ -888,6 +887,27 @@ async fn run() -> Result<()> {
             eprintln!("\n>>> Signal received, initiating graceful shutdown...");
             oracle_shutdown.trigger_shutdown();
             let _ = tx.send(true);
+        });
+    }
+    {
+        let oracle_cache = Arc::clone(&oracle);
+        let mut maintenance_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(CACHE_MAINTENANCE_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        oracle_cache.run_cache_maintenance();
+                    }
+                    changed = maintenance_shutdown_rx.changed() => {
+                        if changed.is_err() || *maintenance_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
         });
     }
     drop(shutdown_tx);
@@ -1082,9 +1102,7 @@ mod tests {
         let _claude = ScopedEnvVar::set("CLAUDE_API_KEY", "claude-test-secret");
         let _opencode = ScopedEnvVar::set("OPENCODE_TOKEN", "opencode-test-secret");
 
-        let err = anyhow::anyhow!(
-            "failure fw-test-secret claude-test-secret opencode-test-secret"
-        );
+        let err = anyhow::anyhow!("failure fw-test-secret claude-test-secret opencode-test-secret");
         let exposed = sanitize_error(&err);
         assert_eq!(exposed, "Not Found");
 
