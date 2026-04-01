@@ -244,7 +244,12 @@ async fn reduce_summarise(
     oracle: &Oracle,
     max_tokens: u32,
 ) -> Result<String> {
-    let combined = child_results
+    let useful = filter_nonempty(child_results);
+    if useful.is_empty() {
+        return Ok("No summaries produced.".into());
+    }
+
+    let combined = useful
         .iter()
         .enumerate()
         .map(|(i, s)| format!("--- Section {} ---\n{}", i + 1, s))
@@ -264,7 +269,7 @@ async fn reduce_summarise(
              Combine them into ONE concise summary focused on the question below. \
              Preserve details relevant to the question: modules, purpose, \
              important functions, dependencies.",
-            child_results.len(),
+            useful.len(),
             max_depth - depth,
             max_depth
         );
