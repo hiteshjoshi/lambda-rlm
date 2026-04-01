@@ -428,6 +428,8 @@ pub fn phi(
                         Some(Ok((idx, Err(e)))) if depth > 0 => {
                             tracing::warn!(depth, child = idx, error = %e, "child failed, degrading");
                             error_msg!("child {idx} failed at depth {depth}: {e}");
+                            crate::bump_degraded();
+                            indexed_results.push((idx, format!("[degraded: child {idx} failed at depth {depth}]")));
                         }
                         Some(Ok((idx, Err(e)))) => {
                             if is_budget_exhausted_error(&e) {

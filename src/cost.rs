@@ -162,10 +162,10 @@ impl Plan {
     }
 
     /// Verify the checksum matches the plan fields.
-    /// Returns true if checksum is empty (legacy plans without checksum) or matches.
+    /// Rejects empty checksums — all plans must be integrity-checked.
     fn verify_checksum(&self) -> bool {
         if self.checksum.is_empty() {
-            return true; // Legacy plan without checksum — accept and re-save with checksum
+            return false; // Reject plans without checksum — force recompute
         }
         self.checksum == self.compute_checksum()
     }

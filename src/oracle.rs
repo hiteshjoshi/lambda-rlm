@@ -516,10 +516,12 @@ impl FireworksProvider {
 
                 if let Some(reason) = finish_reason.as_deref() {
                     if is_truncation_finish_reason(reason) {
-                        // For small token budgets (e.g., classifiers), continuation
-                        // won't help — the model is just being verbose. Return what
-                        // we have instead of wasting 4 more API calls.
-                        if max_tokens <= 1024 {
+                        // For small token budgets (utility/classification calls),
+                        // continuation won't produce meaningful additional content.
+                        // Return what we have instead of wasting API calls.
+                        // Threshold matches AUTO_DETECT_MAX_TOKENS / 4 = 512,
+                        // well below any user-controlled analytical budget.
+                        if max_tokens <= 512 {
                             if !combined.is_empty() {
                                 return Ok(combined);
                             }
