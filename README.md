@@ -210,6 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `4578ddc`
+
+- Hardened `src/codegen.rs` result-file durability by adding timeout-bounded blocking writes with fsync on temp/persisted files and best-effort directory sync.
+- Added panic-safe budget restoration in `CodegenBudgetGuard::drop` so failed/unwound generator paths cannot cascade into double-panic abort behavior.
+- Improved OpenCode summary extraction to skip common CLI preamble/header lines and added regression coverage for header-heavy OpenCode output.
+
 Latest fix-loop hardening commit: `0e6ba39`
 
 - Updated code-generator summary extraction in `src/codegen.rs` to honor generator-specific contracts: Claude uses the last non-empty line and OpenCode uses the first non-empty line.
