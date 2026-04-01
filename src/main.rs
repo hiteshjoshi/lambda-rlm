@@ -248,12 +248,12 @@ struct Cli {
     #[arg(long, default_value = "false", requires = "code_generator")]
     interactive: bool,
 
-    /// Interactive startup timeout in minutes (1..=120)
+    /// Interactive startup timeout in seconds (5..=30)
     #[arg(
         long,
-        default_value = "30",
+        default_value = "15",
         requires = "interactive",
-        value_parser = parse_interactive_timeout_minutes
+        value_parser = parse_interactive_timeout_seconds
     )]
     interactive_timeout: u64,
 
@@ -353,14 +353,14 @@ impl Cli {
     }
 }
 
-fn parse_interactive_timeout_minutes(raw: &str) -> std::result::Result<u64, String> {
-    let mins: u64 = raw
+fn parse_interactive_timeout_seconds(raw: &str) -> std::result::Result<u64, String> {
+    let secs: u64 = raw
         .parse()
         .map_err(|_| "interactive startup timeout must be an integer".to_string())?;
-    if (1..=120).contains(&mins) {
-        Ok(mins)
+    if (5..=30).contains(&secs) {
+        Ok(secs)
     } else {
-        Err("interactive startup timeout must be between 1 and 120 minutes".to_string())
+        Err("interactive startup timeout must be between 5 and 30 seconds".to_string())
     }
 }
 
@@ -1168,7 +1168,7 @@ async fn run() -> Result<()> {
             &cli.question,
             iteration,
             cli.interactive,
-            Duration::from_secs(cli.interactive_timeout.saturating_mul(60)),
+            Duration::from_secs(cli.interactive_timeout),
             shutdown_rx.clone(),
         )
         .await?;
@@ -1293,9 +1293,9 @@ mod tests {
 
     #[test]
     fn interactive_timeout_parser_enforces_bounds() {
-        assert!(parse_interactive_timeout_minutes("0").is_err());
-        assert!(parse_interactive_timeout_minutes("121").is_err());
-        assert_eq!(parse_interactive_timeout_minutes("30").expect("valid"), 30);
+        assert!(parse_interactive_timeout_seconds("4").is_err());
+        assert!(parse_interactive_timeout_seconds("31").is_err());
+        assert_eq!(parse_interactive_timeout_seconds("15").expect("valid"), 15);
     }
 
     #[test]

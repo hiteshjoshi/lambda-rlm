@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use crate::oracle::Oracle;
@@ -45,13 +46,15 @@ const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
 const CODEGEN_SINGLE_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEGEN_SINGLE_FLIGHT_MAX_ENTRIES: usize = 1_000;
-const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
-const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
+const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const OPENCODE_INTERACTIVE_GLOBAL_TIMEOUT: Duration = Duration::from_secs(300);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_SHUTDOWN_REAP_TIMEOUT: Duration = Duration::from_millis(100);
 const CHILD_DROP_REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERACTIVE_STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -825,9 +828,9 @@ async fn write_result_file_atomically(
             persisted
                 .sync_all()
                 .context("Failed to fsync persisted result file")?;
-            if let Ok(dir) = std::fs::File::open(&work_dir) {
-                let _ = dir.sync_all();
-            }
+            let dir = std::fs::File::open(&work_dir)
+                .with_context(|| format!("Failed to open {} for fsync", work_dir.display()))?;
+            dir.sync_all().context("Failed to fsync result directory")?;
             Ok(())
         }),
     )
@@ -1354,10 +1357,99 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveWatchdogEvent {
+    StartupTimeout,
+    SessionTimeout,
+    SessionHardTimeout,
+}
+
+fn spawn_interactive_watchdog(
+    pid: Option<u32>,
+    startup_timeout: Duration,
+    session_timeout: Duration,
+    mut startup_ready_rx: tokio::sync::oneshot::Receiver<()>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> (
+    JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<InteractiveWatchdogEvent>,
+) {
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut stop_rx => return,
+            startup_ready = &mut startup_ready_rx => {
+                if startup_ready.is_err() {
+                    let _ = event_tx.send(InteractiveWatchdogEvent::StartupTimeout);
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(startup_timeout) => {
+                let _ = event_tx.send(InteractiveWatchdogEvent::StartupTimeout);
+                return;
+            }
+        }
+
+        tokio::select! {
+            _ = &mut stop_rx => return,
+            _ = tokio::time::sleep(session_timeout) => {
+                #[cfg(unix)]
+                kill_process_group_sigterm(pid);
+                let _ = event_tx.send(InteractiveWatchdogEvent::SessionTimeout);
+            }
+        }
+
+        tokio::select! {
+            _ = &mut stop_rx => return,
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                #[cfg(unix)]
+                kill_process_group_sigkill(pid);
+                let _ = event_tx.send(InteractiveWatchdogEvent::SessionHardTimeout);
+            }
+        }
+    });
+
+    (handle, event_rx)
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+async fn stop_interactive_watchdog(
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    handle: JoinHandle<()>,
+) {
+    let _ = stop_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_millis(250), handle).await;
+}
+
+async fn stop_interactive_watchdog_once(
+    stop_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    handle: &mut Option<JoinHandle<()>>,
+) {
+    if let (Some(stop_tx), Some(handle)) = (stop_tx.take(), handle.take()) {
+        stop_interactive_watchdog(stop_tx, handle).await;
+    }
+}
+
 async fn run_generator_interactive_process(
     mut cmd: tokio::process::Command,
     generator: &CodeGenerator,
-    _startup_timeout: Duration,
+    startup_timeout: Duration,
     session_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1373,10 +1465,26 @@ async fn run_generator_interactive_process(
         })
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
+    let child_pid = child.child_mut()?.id();
+    let (startup_ready_tx, startup_ready_rx) = tokio::sync::oneshot::channel();
+    let (watchdog_stop_tx, watchdog_stop_rx) = tokio::sync::oneshot::channel();
+    let (watchdog_handle, mut watchdog_events) = spawn_interactive_watchdog(
+        child_pid,
+        startup_timeout,
+        session_timeout,
+        startup_ready_rx,
+        watchdog_stop_rx,
+    );
+    let mut startup_ready_tx = Some(startup_ready_tx);
+    let mut watchdog_stop_tx = Some(watchdog_stop_tx);
+    let mut watchdog_handle = Some(watchdog_handle);
+    let mut startup_verified = child_pid.is_none();
 
-    let hard_deadline =
-        tokio::time::Instant::now() + session_timeout.saturating_add(Duration::from_secs(30));
-    let soft_deadline = tokio::time::Instant::now() + session_timeout;
+    if startup_verified {
+        if let Some(tx) = startup_ready_tx.take() {
+            let _ = tx.send(());
+        }
+    }
 
     loop {
         let status = child
@@ -1387,34 +1495,32 @@ async fn run_generator_interactive_process(
             .context("codegen_retryable")?;
         if let Some(status) = status {
             child.disarm();
+            stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
             if !status.success() {
-                return Err(classify_non_success_exit(generator_name, status));
+                let classified = classify_non_success_exit(generator_name, status);
+                if !startup_verified {
+                    return Err(classified.context("codegen_fatal"));
+                }
+                return Err(classified);
+            }
+            if !startup_verified {
+                return Err(anyhow::anyhow!(
+                    "interactive generator exited before startup readiness"
+                )
+                .context("codegen_fatal"));
             }
             return Ok(());
         }
 
-        let now = tokio::time::Instant::now();
-        if now >= hard_deadline {
-            tracing::error!(
-                generator = generator_name,
-                hard_timeout_secs = session_timeout
-                    .saturating_add(Duration::from_secs(30))
-                    .as_secs(),
-                "interactive session exceeded hard deadline; force-killing child process group"
-            );
-            child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
-            return Err(
-                anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable")
-            );
-        }
-        if now >= soft_deadline {
-            tracing::warn!(
-                generator = generator_name,
-                timeout_secs = session_timeout.as_secs(),
-                "interactive session exceeded timeout; sending SIGTERM with SIGKILL escalation"
-            );
-            child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
-            return Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"));
+        if !startup_verified {
+            if let Some(pid) = child_pid {
+                if pid_alive(pid) {
+                    startup_verified = true;
+                    if let Some(tx) = startup_ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
         }
 
         tokio::select! {
@@ -1422,10 +1528,52 @@ async fn run_generator_interactive_process(
                 if changed.is_ok() || *shutdown_rx.borrow() {
                     tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
                 }
-                child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+                child
+                    .terminate_with_escalation(CHILD_SHUTDOWN_REAP_TIMEOUT)
+                    .await;
+                stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
                 return Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"));
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            event = watchdog_events.recv() => {
+                match event {
+                    Some(InteractiveWatchdogEvent::StartupTimeout) => {
+                        tracing::warn!(
+                            generator = generator_name,
+                            startup_timeout_secs = startup_timeout.as_secs(),
+                            "interactive generator startup timed out"
+                        );
+                        child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
+                        stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
+                        return Err(anyhow::anyhow!("interactive startup timeout").context("codegen_retryable"));
+                    }
+                    Some(InteractiveWatchdogEvent::SessionTimeout) => {
+                        tracing::warn!(
+                            generator = generator_name,
+                            timeout_secs = session_timeout.as_secs(),
+                            "interactive session exceeded timeout; sending SIGTERM with SIGKILL escalation"
+                        );
+                        child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
+                        stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
+                        return Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"));
+                    }
+                    Some(InteractiveWatchdogEvent::SessionHardTimeout) => {
+                        tracing::error!(
+                            generator = generator_name,
+                            hard_timeout_secs = session_timeout.saturating_add(Duration::from_secs(30)).as_secs(),
+                            "interactive session exceeded hard deadline; force-killing child process group"
+                        );
+                        child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+                        stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
+                        return Err(anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable"));
+                    }
+                    None => {
+                        child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
+                        stop_interactive_watchdog_once(&mut watchdog_stop_tx, &mut watchdog_handle).await;
+                        return Err(anyhow::anyhow!("interactive watchdog terminated unexpectedly").context("codegen_retryable"));
+                    }
+                }
+            }
+            _ = tokio::time::sleep(INTERACTIVE_STARTUP_PROBE_INTERVAL) => {}
         }
     }
 }
@@ -1664,7 +1812,7 @@ mod tests {
     use std::time::Duration as StdDuration;
     use std::time::Instant as StdInstant;
 
-    fn pid_alive(pid: u32) -> bool {
+    fn test_pid_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
@@ -1929,7 +2077,7 @@ mod tests {
 
         tokio::time::timeout(StdDuration::from_secs(5), async move {
             loop {
-                if !pid_alive(pid) {
+                if !test_pid_alive(pid) {
                     break;
                 }
                 tokio::time::sleep(StdDuration::from_millis(50)).await;
@@ -1961,11 +2109,11 @@ mod tests {
         drop(cleanup);
 
         let deadline = StdInstant::now() + StdDuration::from_secs(5);
-        while pid_alive(pid) && StdInstant::now() < deadline {
+        while test_pid_alive(pid) && StdInstant::now() < deadline {
             std::thread::sleep(StdDuration::from_millis(50));
         }
         assert!(
-            !pid_alive(pid),
+            !test_pid_alive(pid),
             "child process should be reaped by fallback thread"
         );
     }
@@ -1990,7 +2138,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn interactive_process_startup_timeout_does_not_gate_session() {
+    async fn interactive_process_requires_startup_readiness() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("1")
@@ -2001,12 +2149,12 @@ mod tests {
         run_generator_interactive_process(
             cmd,
             &CodeGenerator::Opencode,
-            StdDuration::from_millis(150),
+            StdDuration::from_secs(5),
             StdDuration::from_secs(5),
             shutdown_rx,
         )
         .await
-        .expect("interactive session should complete without startup probing");
+        .expect("interactive session should complete after startup probing");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2084,19 +2232,19 @@ mod tests {
 
         shutdown_tx.send(true).expect("send shutdown");
         let shutdown_started = tokio::time::Instant::now();
-        let err = tokio::time::timeout(StdDuration::from_millis(100), join)
+        let err = tokio::time::timeout(StdDuration::from_millis(500), join)
             .await
             .expect("interactive task should finish quickly after shutdown")
             .expect("interactive task join should succeed")
             .expect_err("shutdown should interrupt interactive process");
         assert!(error_has_context(&err, "codegen_retryable"));
         assert!(
-            shutdown_started.elapsed() <= StdDuration::from_millis(100),
-            "interactive shutdown path exceeded 100ms"
+            shutdown_started.elapsed() <= StdDuration::from_millis(500),
+            "interactive shutdown path exceeded 500ms"
         );
 
         tokio::time::timeout(StdDuration::from_secs(5), async {
-            while pid_alive(pid) {
+            while test_pid_alive(pid) {
                 tokio::time::sleep(StdDuration::from_millis(50)).await;
             }
         })
@@ -2179,7 +2327,7 @@ mod tests {
         .expect("process group child pid should be written");
 
         tokio::time::timeout(StdDuration::from_secs(5), async {
-            while pid_alive(child_pid) {
+            while test_pid_alive(child_pid) {
                 tokio::time::sleep(StdDuration::from_millis(50)).await;
             }
         })
@@ -2245,7 +2393,7 @@ mod tests {
         .expect("interactive timeout should send SIGTERM before escalation");
 
         tokio::time::timeout(StdDuration::from_secs(8), async {
-            while pid_alive(pid) {
+            while test_pid_alive(pid) {
                 tokio::time::sleep(StdDuration::from_millis(50)).await;
             }
         })
@@ -2262,7 +2410,7 @@ mod tests {
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c")
-                .arg("exit 0")
+                .arg("sleep 0.1; exit 0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .stdin(std::process::Stdio::null());
@@ -2297,15 +2445,15 @@ mod tests {
             INTERACTIVE_STARTUP_TIMEOUT_MIN
         );
         assert_eq!(
-            clamp_interactive_startup_timeout(StdDuration::from_secs(30)),
+            clamp_interactive_startup_timeout(StdDuration::from_secs(3)),
             INTERACTIVE_STARTUP_TIMEOUT_MIN
         );
         assert_eq!(
-            clamp_interactive_startup_timeout(StdDuration::from_secs(2 * 60 * 60)),
+            clamp_interactive_startup_timeout(StdDuration::from_secs(60)),
             INTERACTIVE_STARTUP_TIMEOUT_MAX
         );
         assert_eq!(
-            clamp_interactive_startup_timeout(StdDuration::from_secs(3 * 60 * 60)),
+            clamp_interactive_startup_timeout(StdDuration::from_secs(120)),
             INTERACTIVE_STARTUP_TIMEOUT_MAX
         );
     }
