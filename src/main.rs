@@ -571,7 +571,10 @@ async fn run_analysis(
     let start = Instant::now();
 
     // ── Phase 1: REPL Initialization ──
-    let prompt = collect_source_files(&cli.path)?;
+    let collect_path = cli.path.clone();
+    let prompt = tokio::task::spawn_blocking(move || collect_source_files(&collect_path))
+        .await
+        .context("source collection task panicked")??;
     if prompt.is_empty() {
         anyhow::bail!("No source files found in {}", cli.path.display());
     }
@@ -997,6 +1000,10 @@ async fn run() -> Result<()> {
             shutdown_rx.clone(),
         )
         .await?;
+
+        if cli.interactive {
+            ensure_no_live_guards(&oracle)?;
+        }
 
         oracle.print_telemetry();
 

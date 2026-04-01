@@ -45,6 +45,7 @@ const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
+const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
@@ -290,6 +291,7 @@ async fn run_code_generator_once(
                     question,
                     iteration,
                     interactive_timeout,
+                    INTERACTIVE_SESSION_TIMEOUT,
                     shutdown,
                 )
                 .await
@@ -301,6 +303,7 @@ async fn run_code_generator_once(
                     question,
                     iteration,
                     interactive_timeout,
+                    INTERACTIVE_SESSION_TIMEOUT,
                     shutdown,
                 )
                 .await
@@ -1096,7 +1099,8 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
 async fn run_generator_interactive_process(
     mut cmd: tokio::process::Command,
     generator: &CodeGenerator,
-    timeout: Duration,
+    startup_timeout: Duration,
+    session_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let generator_name = match generator {
@@ -1112,9 +1116,8 @@ async fn run_generator_interactive_process(
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
-    // Interactive sessions are intentionally unbounded once started.
-    // The timeout only applies to startup probing (early process failures).
-    let startup_probe = tokio::time::timeout(timeout, async {
+    // Probe startup so immediate failures are surfaced quickly.
+    let startup_probe = tokio::time::timeout(startup_timeout, async {
         loop {
             let maybe_status = child
                 .child_mut()?
@@ -1162,6 +1165,15 @@ async fn run_generator_interactive_process(
                 return Err(classify_non_success_exit(generator_name, status));
             }
             Ok(())
+        }
+        _ = tokio::time::sleep(session_timeout) => {
+            tracing::warn!(
+                generator = generator_name,
+                timeout_secs = session_timeout.as_secs(),
+                "interactive session exceeded timeout; terminating child process"
+            );
+            child.kill_and_reap().await;
+            Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))
         }
         changed = shutdown_rx.changed() => {
             if changed.is_ok() || *shutdown_rx.borrow() {
@@ -1253,7 +1265,8 @@ async fn run_claude_interactive(
     work_dir: &Path,
     question: &str,
     iteration: usize,
-    timeout: Duration,
+    startup_timeout: Duration,
+    session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
@@ -1267,7 +1280,14 @@ async fn run_claude_interactive(
         cmd.arg("--dangerously-skip-permissions")
             .arg(interactive_prompt(question, iteration));
         configure_interactive_generator_command(&mut cmd, work_dir);
-        run_generator_interactive_process(cmd, &CodeGenerator::Claude, timeout, shutdown_rx).await?;
+        run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Claude,
+            startup_timeout,
+            session_timeout,
+            shutdown_rx,
+        )
+        .await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
     .await;
@@ -1349,7 +1369,8 @@ async fn run_opencode_interactive(
     work_dir: &Path,
     question: &str,
     iteration: usize,
-    timeout: Duration,
+    startup_timeout: Duration,
+    session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     write_result_file_atomically(work_dir, result, iteration).await?;
@@ -1364,8 +1385,14 @@ async fn run_opencode_interactive(
         );
         let mut cmd = tokio::process::Command::new("opencode");
         configure_interactive_generator_command(&mut cmd, work_dir);
-        run_generator_interactive_process(cmd, &CodeGenerator::Opencode, timeout, shutdown_rx)
-            .await?;
+        run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            startup_timeout,
+            session_timeout,
+            shutdown_rx,
+        )
+        .await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
     .await;
@@ -1699,6 +1726,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(150),
+            StdDuration::from_secs(5),
             shutdown_rx,
         )
         .await
@@ -1719,6 +1747,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(500),
+            StdDuration::from_secs(5),
             shutdown_rx,
         )
         .await
@@ -1734,6 +1763,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(50),
+            StdDuration::from_secs(5),
             shutdown_rx,
         )
         .await
@@ -1759,6 +1789,7 @@ mod tests {
             cmd,
             &CodeGenerator::Opencode,
             StdDuration::from_millis(50),
+            StdDuration::from_secs(30),
             shutdown_rx,
         ));
 
@@ -1792,6 +1823,27 @@ mod tests {
         .expect("child process should be reaped after shutdown");
 
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_process_session_timeout_kills_child() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("1000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        let err = run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(50),
+            StdDuration::from_millis(120),
+            shutdown_rx,
+        )
+        .await
+        .expect_err("session timeout should terminate hanging interactive process");
+        assert!(error_has_context(&err, "codegen_retryable"));
     }
 
     #[test]
