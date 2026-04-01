@@ -2,6 +2,13 @@
 
 ## Recent fix-loop hardening commits (moved from README)
 
+### `d860423`
+
+- Tightened leak detection at process exit in `src/main.rs` by extending `ensure_no_live_guards` to fail on non-zero `inflight_guards_live` in addition to budget/codegen guard counters.
+- Hardened guard lifecycles in `src/codegen.rs` and `src/main.rs` with `#[must_use]` on runtime guards (`CodegenFlightGuard`, `ChildCleanup`, `GuardedFile`) and panic-safe `catch_unwind` drop wrappers on their cleanup paths.
+- Improved shutdown responsiveness in `src/phi.rs` by probing `watch::Receiver::has_changed()` before invoking expensive reduce work, reducing wasted compute after shutdown is signaled.
+- Added regression coverage in `src/codegen.rs` for `is_storage_full_error` (`ErrorKind::StorageFull` + common ENOSPC text signatures).
+
 ### `9d30728`
 
 - Hardened OpenCode runtime safety in `src/codegen.rs` by caching `opencode --version` validation in-process, pre-warming the OpenCode summary fallback regex during preflight, and re-validating version compatibility in `run_opencode` before each spawn so fatal drift is isolated by the OpenCode circuit.
