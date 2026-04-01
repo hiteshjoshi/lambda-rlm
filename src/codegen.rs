@@ -44,6 +44,7 @@ const CODEGEN_CACHE_SCHEMA_VERSION: u8 = 1;
 const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
 const CODEGEN_SINGLE_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEGEN_SINGLE_FLIGHT_MAX_ENTRIES: usize = 1_000;
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -248,6 +249,17 @@ pub async fn run_code_generator(
                     sender: Arc::clone(&tx),
                     inserted_at: Instant::now(),
                 });
+                if flights.len() > CODEGEN_SINGLE_FLIGHT_MAX_ENTRIES {
+                    let removed = evict_stale_codegen_flights(flights);
+                    if removed > 0 {
+                        tracing::warn!(
+                            removed,
+                            size = flights.len(),
+                            threshold = CODEGEN_SINGLE_FLIGHT_MAX_ENTRIES,
+                            "evicted stale single-flight entries on pressure"
+                        );
+                    }
+                }
 
                 let _flight_guard = CodegenFlightGuard::new(flights, flight_key.clone());
 
@@ -286,12 +298,19 @@ fn validate_codegen_work_dir(work_dir: &Path) -> Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let _ = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(work_dir)
             .with_context(|| format!("refusing unsafe work directory {}", work_dir.display()))?;
+
+        if let Ok(tmp_meta) = std::fs::symlink_metadata("/tmp") {
+            anyhow::ensure!(
+                meta.dev() == tmp_meta.dev(),
+                "work directory must be on the same filesystem as /tmp for atomic writes"
+            );
+        }
     }
 
     Ok(())
@@ -1003,22 +1022,26 @@ fn spawn_background_child_reap(mut child: tokio::process::Child) {
     let _ = std::thread::Builder::new()
         .name("codegen-child-reaper".to_owned())
         .spawn(move || {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            break;
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                rt.block_on(kill_and_reap_owned(child, CHILD_REAP_TIMEOUT));
+            } else {
+                let _ = child.start_kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
+                let _ = child.kill();
+                let _ = child.wait();
             }
-            let _ = child.kill();
-            let _ = child.wait();
         });
 }
 
@@ -1924,6 +1947,40 @@ mod tests {
         })
         .await
         .expect("child cleanup guards should drain after timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_cleanup_has_no_guard_leak_over_many_iterations() {
+        for _ in 0..200 {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg("exit 0")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null());
+
+            run_generator_interactive_process(
+                cmd,
+                &CodeGenerator::Opencode,
+                StdDuration::from_millis(50),
+                StdDuration::from_secs(1),
+                shutdown_rx,
+            )
+            .await
+            .expect("interactive process exits cleanly");
+        }
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                if codegen_guard_live_counts().child_cleanup == 0 {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("child cleanup guards should return to zero");
     }
 
     #[test]

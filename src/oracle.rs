@@ -845,6 +845,13 @@ impl Oracle {
                     failures
                 );
             }
+            if self.circuit.state() == "half_open" {
+                let nonce = crate::resilience::process_nonce();
+                let jitter = ((nonce[0] as u64) ^ ((n as u64) & 0xff)) % 1000;
+                if jitter > 0 {
+                    tokio::time::sleep(Duration::from_millis(jitter)).await;
+                }
+            }
 
             if attempt > 0 {
                 // Deterministic jitter: blake3(idempotency_key || attempt) mod cap.
@@ -1114,6 +1121,11 @@ impl Oracle {
         if let Err(e) = handle.write_all(buf.as_bytes()) {
             let drops = TELEMETRY_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(target: "telemetry", error = %e, drops, "stderr write failed — telemetry dropped");
+            return;
+        }
+        if let Err(e) = handle.flush() {
+            let drops = TELEMETRY_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(target: "telemetry", error = %e, drops, "stderr flush failed — telemetry dropped");
         }
     }
 }

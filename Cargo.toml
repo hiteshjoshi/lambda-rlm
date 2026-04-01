@@ -23,6 +23,7 @@ which = "7"
 dashmap = "6"
 bytes = "1"
 regex = "1"
+fs4 = "0.8"
 
 [target.'cfg(not(windows))'.dependencies]
 jemallocator = "0.5"

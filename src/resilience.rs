@@ -5,6 +5,7 @@
 //! correct visibility on ARM64 and other weakly-ordered architectures.
 
 use std::path::PathBuf;
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -507,7 +508,14 @@ impl ReplayCache {
         if !self.enabled.load(Ordering::Acquire) || !Self::validate_key(key) {
             return None;
         }
-        let raw = std::fs::read_to_string(self.dir.join(key)).ok()?;
+        let mut file = std::fs::File::open(self.dir.join(key)).ok()?;
+        #[cfg(unix)]
+        {
+            use fs4::FileExt;
+            FileExt::lock_shared(&file).ok()?;
+        }
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
         // Content integrity: first line is "blake3:{hex_hash}", rest is content
         let (header, content) = raw.split_once('\n')?;
         let stored_hash = header.strip_prefix("blake3:")?;

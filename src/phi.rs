@@ -62,7 +62,7 @@ pub struct PhiConfig {
 /// backpressure kicks in. 256MB allows ~42k chunks at tau=6000.
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
-const MAX_JOINSET_POOL: usize = 32;
+const MAX_JOINSET_POOL: usize = 100;
 const AUTO_DETECT_MAX_TOKENS: u32 = 256;
 
 fn is_budget_exhausted_error(error: &anyhow::Error) -> bool {
@@ -86,6 +86,9 @@ fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
         if let Ok(mut pool) = cfg.joinset_pool.lock() {
             if pool.len() < MAX_JOINSET_POOL {
                 pool.push(set);
+                if pool.len() > (MAX_JOINSET_POOL / 2) {
+                    pool.shrink_to_fit();
+                }
             }
         }
     }));
@@ -371,17 +374,22 @@ pub fn phi(
         // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
         // Each spawn acquires a concurrency permit to bound total recursive tasks.
         let mut set_guard = JoinSetReturnGuard::new(&cfg);
+        let mut permit_pool = Arc::clone(&cfg.concurrency)
+            .acquire_many_owned(num_children as u32)
+            .await
+            .map_err(|_| anyhow::anyhow!("phi concurrency semaphore closed"))?;
         for (i, chunk) in chunks.into_iter().enumerate() {
             let cfg = Arc::clone(&cfg);
-            let sem = Arc::clone(&cfg.concurrency);
+            let permit = permit_pool
+                .split(1)
+                .ok_or_else(|| anyhow::anyhow!("failed to split child semaphore permit"))?;
             eprintln!("{indent}|  child {}/{num_children}", i + 1);
             set_guard.set_mut().spawn(async move {
-                // Acquire concurrency permit — blocks if too many tasks active
-                let permit = sem.acquire_owned().await.unwrap();
                 let result = phi(cfg, chunk, depth + 1, Some(permit)).await;
                 (i, result)
             });
         }
+        drop(permit_pool);
 
         // Collect results with cooperative shutdown check.
         // On depth-0 fatal errors, drain remaining tasks before returning

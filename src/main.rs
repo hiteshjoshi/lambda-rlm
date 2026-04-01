@@ -645,7 +645,7 @@ async fn run_analysis(
     } else {
         Some(oracle.cache())
     };
-    let p = compute_plan(
+    let mut plan = compute_plan(
         prompt.len(),
         &task,
         &cost_model,
@@ -657,6 +657,47 @@ async fn run_analysis(
         cli.context_window,
     );
 
+    if !oracle.budget_unlimited() {
+        let available = oracle.budget_remaining();
+        if plan.total_calls > available {
+            let mut candidate_k = plan.k;
+            while candidate_k > 1 && plan.total_calls > available {
+                candidate_k -= 1;
+                let candidate = compute_plan(
+                    prompt.len(),
+                    &task,
+                    &cost_model,
+                    cli.alpha,
+                    candidate_k,
+                    cli.window,
+                    plan_cache,
+                    &cli.model,
+                    cli.context_window,
+                );
+                if candidate.total_calls < plan.total_calls {
+                    plan = candidate;
+                }
+            }
+            if plan.total_calls > available {
+                anyhow::bail!(
+                    "Admission declined: worst-case execution needs {} calls but only {} budget remaining. Reduce input size, increase --max-calls, or use a smaller k/depth.",
+                    plan.total_calls,
+                    available
+                );
+            }
+            tracing::warn!(
+                available,
+                effective_k = plan.k,
+                effective_calls = plan.total_calls,
+                "budget-aware replanning reduced branching factor"
+            );
+            eprintln!(
+                "  Budget-aware replanning: k={} total_calls={} (budget={available})",
+                plan.k, plan.total_calls
+            );
+        }
+    }
+
     eprintln!("Phase 4: Execution Plan");
     eprintln!("  Task:        {task}");
     eprintln!("  Pipeline:    {}", pipeline_desc(&task));
@@ -664,13 +705,13 @@ async fn run_analysis(
     eprintln!(
         "  Input:       {} chars, tau={}  k={}  depth={}",
         prompt.len(),
-        p.tau,
-        p.k,
-        p.depth
+        plan.tau,
+        plan.k,
+        plan.depth
     );
     eprintln!(
         "  Calls:       {} leaf + {} reduce = {} total",
-        p.leaf_calls, p.reduce_calls, p.total_calls
+        plan.leaf_calls, plan.reduce_calls, plan.total_calls
     );
     eprintln!("  Concurrency: {} max parallel\n", cli.concurrency);
 
@@ -704,9 +745,9 @@ async fn run_analysis(
     let cfg = Arc::new(PhiConfig {
         question: cli.question.clone(),
         task,
-        tau: p.tau,
-        k: p.k,
-        max_depth: p.depth,
+        tau: plan.tau,
+        k: plan.k,
+        max_depth: plan.depth,
         overlap: cli.overlap,
         max_tokens: cli.max_tokens,
         keywords,
@@ -724,7 +765,7 @@ async fn run_analysis(
     // This prevents spawning thousands of tasks that exhaust budget mid-tree,
     // wasting CPU and leaving zombie tasks.
     if !oracle.budget_unlimited() {
-        let worst_case = p.total_calls;
+        let worst_case = plan.total_calls;
         let available = oracle.budget_remaining();
         if worst_case > available {
             anyhow::bail!(
@@ -815,7 +856,21 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
+async fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
+    for _ in 0..100 {
+        let metrics = oracle.metrics();
+        let codegen_guards = codegen::codegen_guard_live_counts();
+        let live_total = metrics.budget_guards_live
+            + metrics.inflight_guards_live
+            + codegen_guards.budget
+            + codegen_guards.flight
+            + codegen_guards.child_cleanup;
+        if live_total == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     let metrics = oracle.metrics();
     let codegen_guards = codegen::codegen_guard_live_counts();
     debug_assert_eq!(metrics.budget_guards_live, 0, "BudgetGuard leak detected");
@@ -829,22 +884,14 @@ fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
         codegen_guards.child_cleanup, 0,
         "ChildCleanup leak detected"
     );
-    if metrics.budget_guards_live > 0
-        || metrics.inflight_guards_live > 0
-        || codegen_guards.budget > 0
-        || codegen_guards.flight > 0
-        || codegen_guards.child_cleanup > 0
-    {
-        anyhow::bail!(
-            "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={})",
-            metrics.budget_guards_live,
-            metrics.inflight_guards_live,
-            codegen_guards.budget,
-            codegen_guards.flight,
-            codegen_guards.child_cleanup
-        );
-    }
-    Ok(())
+    anyhow::bail!(
+        "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={})",
+        metrics.budget_guards_live,
+        metrics.inflight_guards_live,
+        codegen_guards.budget,
+        codegen_guards.flight,
+        codegen_guards.child_cleanup
+    )
 }
 
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
@@ -947,7 +994,7 @@ async fn run() -> Result<()> {
         // Single-shot mode: analyze and print
         let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
         println!("{result}");
-        ensure_no_live_guards(&oracle)?;
+        ensure_no_live_guards(&oracle).await?;
         return Ok(());
     }
     let generator = generator.unwrap();
@@ -1001,7 +1048,7 @@ async fn run() -> Result<()> {
         if is_clean {
             eprintln!("\n>>> Analysis came back clean. Nothing to fix.");
             println!("{result}");
-            ensure_no_live_guards(&oracle)?;
+            ensure_no_live_guards(&oracle).await?;
             return Ok(());
         }
 
@@ -1031,7 +1078,7 @@ async fn run() -> Result<()> {
         )
         .await?;
 
-        ensure_no_live_guards(&oracle)?;
+        ensure_no_live_guards(&oracle).await?;
 
         oracle.print_telemetry();
 
@@ -1059,7 +1106,7 @@ async fn run() -> Result<()> {
         );
         eprintln!(">>> Run again to continue if needed.");
     }
-    ensure_no_live_guards(&oracle)?;
+    ensure_no_live_guards(&oracle).await?;
     Ok(())
 }
 
@@ -1191,5 +1238,50 @@ mod tests {
             .try_acquire_owned()
             .expect("fd permit should be returned by Drop");
         drop(recovered);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_no_follow_resists_symlink_swap_race() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stable = temp.path().join("stable.txt");
+        let secret = temp.path().join("secret.txt");
+        let link = temp.path().join("volatile.txt");
+
+        std::fs::write(&stable, "stable").expect("write stable file");
+        std::fs::write(&secret, "secret").expect("write secret file");
+        std::fs::copy(&stable, &link).expect("seed volatile path");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_swap = Arc::clone(&stop);
+        let link_swap = link.clone();
+        let stable_swap = stable.clone();
+        let secret_swap = secret.clone();
+
+        let swapper = std::thread::spawn(move || {
+            while !stop_swap.load(Ordering::Acquire) {
+                let _ = std::fs::remove_file(&link_swap);
+                let _ = symlink(&secret_swap, &link_swap);
+                let _ = std::fs::remove_file(&link_swap);
+                let _ = std::fs::copy(&stable_swap, &link_swap);
+            }
+        });
+
+        for _ in 0..500 {
+            if let Some((_file, _size, _dev, _ino)) = open_file_no_follow(&link) {
+                if let Ok(meta) = std::fs::symlink_metadata(&link) {
+                    assert!(
+                        !meta.file_type().is_symlink(),
+                        "open_file_no_follow must never succeed on symlink path"
+                    );
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Release);
+        swapper.join().expect("swapper thread");
     }
 }
