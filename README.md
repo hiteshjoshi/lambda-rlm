@@ -210,6 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `5e87b79`
+
+- Added `INFLIGHT_GUARD_LIVE_COUNT` tracking in `src/oracle.rs`, wired it into `OracleMetrics`, and exposed both `Budget guards live` and `Inflight guards live` in telemetry output for leak visibility at steady state.
+- Added a loom race test in `src/oracle.rs` (`inflight_guard_always_drops_under_race`) to prove single-flight guard cleanup leaves no stuck ownership under concurrent leader races.
+- Hardened `ChildCleanup::drop` in `src/codegen.rs` to avoid runtime-assumption failures by doing async kill+wait when a runtime handle exists and synchronous best-effort kill/reap fallback otherwise.
+
 Latest fix-loop hardening commit: `892138e`
 
 - Enforced Oracle resource acquisition as a typed RAII stack in `src/oracle.rs` (`Budget -> Cache -> Bulkhead`), added inflight leak gauges/invariants, and exposed production metrics (`cache hit rate`, `circuit state`, `budget guard live`, `inflight count`).
