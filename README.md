@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.11 (`032b6cc`): added periodic replay-cache maintenance during long-running fix loops, exposed Oracle cache sweep hooks, and added a test proving `ChildCleanup` reaps processes even when dropped outside a Tokio runtime.
 - v3.10 (`d860423`): enforced shutdown leak checks for Oracle inflight guards, added panic-safe drop hardening and `#[must_use]` coverage for runtime guard types, and tightened shutdown responsiveness before expensive Phi reduction.
 - v3.9 (`f47b483`): added `--interactive` codegen mode for Claude/OpenCode with TTY preflight checks, hard interactive timeouts, and mode-aware single-flight/cache keys.
 - v3.8 (`a3a007e`): ENOSPC fallback for `.lambda-rlm-result.md`, atomic/symlink-safe codegen logs, shutdown leak enforcement, and expanded secret redaction.
