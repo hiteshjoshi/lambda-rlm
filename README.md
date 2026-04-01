@@ -210,6 +210,11 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `0e6ba39`
+
+- Updated code-generator summary extraction in `src/codegen.rs` to honor generator-specific contracts: Claude uses the last non-empty line and OpenCode uses the first non-empty line.
+- Moved generator binary preflight checks into `Cli::validate()` in `src/main.rs` so invalid `--claude`/`--opencode` setups fail fast during startup validation.
+
 Latest fix-loop hardening commit: `5e87b79`
 
 - Added `INFLIGHT_GUARD_LIVE_COUNT` tracking in `src/oracle.rs`, wired it into `OracleMetrics`, and exposed both `Budget guards live` and `Inflight guards live` in telemetry output for leak visibility at steady state.
