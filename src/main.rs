@@ -1140,6 +1140,9 @@ async fn run() -> Result<()> {
 
         // 3. Hand to code generator
         validate_codegen_result_target(&work_dir)?;
+        if cli.interactive && !std::io::stdin().is_terminal() {
+            anyhow::bail!("--interactive requires an attached TTY on stdin");
+        }
         let _interactive_permit = acquire_interactive_session_permit(cli.interactive).await?;
         let summary = codegen::run_code_generator(
             oracle.as_ref(),

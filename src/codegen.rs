@@ -94,6 +94,22 @@ fn untrack_codegen_child_pid(pid: Option<u32>) {
     }
 }
 
+#[cfg(unix)]
+fn kill_process_group_sigkill(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        if let Ok(pgid) = i32::try_from(pid) {
+            let target = format!("-{pgid}");
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg("--")
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
 pub fn force_kill_tracked_codegen_children() -> usize {
     let pids: Vec<u32> = tracked_codegen_children()
         .iter()
@@ -103,6 +119,7 @@ pub fn force_kill_tracked_codegen_children() -> usize {
     for pid in &pids {
         #[cfg(unix)]
         {
+            kill_process_group_sigkill(Some(*pid));
             let _ = std::process::Command::new("kill")
                 .arg("-9")
                 .arg(pid.to_string())
@@ -1055,6 +1072,8 @@ impl ChildCleanup {
     async fn kill_and_reap(&mut self, wait_timeout: Duration) {
         if let Some(child) = self.child.as_mut() {
             let pid = child.id();
+            #[cfg(unix)]
+            kill_process_group_sigkill(pid);
             let _ = child.start_kill();
             let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
             untrack_codegen_child_pid(pid);
@@ -1091,6 +1110,8 @@ impl Drop for ChildCleanup {
 
 async fn kill_and_reap_owned(mut child: tokio::process::Child, wait_timeout: Duration) {
     let pid = child.id();
+    #[cfg(unix)]
+    kill_process_group_sigkill(pid);
     let _ = child.start_kill();
     let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
     untrack_codegen_child_pid(pid);
@@ -1265,6 +1286,11 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
 }
 
 async fn run_generator_interactive_process(
@@ -1287,40 +1313,53 @@ async fn run_generator_interactive_process(
         .context("codegen_fatal")?;
     let mut child = ChildCleanup::new(child);
 
-    let wait_for_child = async {
-        child
-            .child_mut()?
-            .wait()
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("Failed to wait for {generator_name}"))
-            .context("codegen_retryable")
-    };
+    let hard_deadline = tokio::time::Instant::now() + session_timeout.saturating_add(Duration::from_secs(30));
+    let soft_deadline = tokio::time::Instant::now() + session_timeout;
 
-    tokio::select! {
-        status = wait_for_child => {
-            let status = status?;
+    loop {
+        let status = child
+            .child_mut()?
+            .try_wait()
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("Failed to poll {generator_name} status"))
+            .context("codegen_retryable")?;
+        if let Some(status) = status {
             child.disarm();
             if !status.success() {
                 return Err(classify_non_success_exit(generator_name, status));
             }
-            Ok(())
+            return Ok(());
         }
-        changed = shutdown_rx.changed() => {
-            if changed.is_ok() || *shutdown_rx.borrow() {
-                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
-            }
+
+        let now = tokio::time::Instant::now();
+        if now >= hard_deadline {
+            tracing::error!(
+                generator = generator_name,
+                hard_timeout_secs = session_timeout.saturating_add(Duration::from_secs(30)).as_secs(),
+                "interactive session exceeded hard deadline; force-killing child process group"
+            );
             child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
-            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
+            return Err(anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable"));
         }
-        _ = tokio::time::sleep(session_timeout) => {
+        if now >= soft_deadline {
             tracing::warn!(
                 generator = generator_name,
                 timeout_secs = session_timeout.as_secs(),
                 "interactive session exceeded timeout; terminating child process"
             );
             child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
-            Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))
+            return Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"));
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() || *shutdown_rx.borrow() {
+                    tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
+                }
+                child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+                return Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 }
@@ -2031,6 +2070,57 @@ mod tests {
         })
         .await
         .expect("child cleanup guards should drain after timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    async fn interactive_process_group_cleanup_on_timeout() {
+        let pid_file = unique_pid_file_path();
+        let pid_file_str = pid_file.to_string_lossy().into_owned();
+        let shell = format!("sleep 1000 & echo $! > \"{pid_file_str}\"; exec sleep 1000");
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(shell)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        cmd.process_group(0);
+
+        let err = run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(50),
+            StdDuration::from_millis(120),
+            shutdown_rx,
+        )
+        .await
+        .expect_err("session timeout should terminate interactive process group");
+        assert!(error_has_context(&err, "codegen_retryable"));
+
+        let child_pid = tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = raw.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("process group child pid should be written");
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while pid_alive(child_pid) {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("session timeout should reap background process group child");
+
+        let _ = std::fs::remove_file(pid_file);
     }
 
     #[tokio::test(flavor = "current_thread")]
