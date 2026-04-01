@@ -22,6 +22,7 @@ tempfile = "3"
 which = "7"
 dashmap = "6"
 bytes = "1"
+regex = "1"
 
 [target.'cfg(not(windows))'.dependencies]
 jemallocator = "0.5"

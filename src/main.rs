@@ -42,7 +42,7 @@ use clap::{ArgGroup, Parser};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit};
 use tracing_subscriber::EnvFilter;
 
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
@@ -293,6 +293,33 @@ const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OPEN_FILES: usize = 1024;
 static FD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
+struct GuardedFile {
+    file: Option<std::fs::File>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl GuardedFile {
+    fn new(file: std::fs::File, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            file: Some(file),
+            permit: Some(permit),
+        }
+    }
+
+    fn file_mut(&mut self) -> Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("guarded file already closed"))
+    }
+}
+
+impl Drop for GuardedFile {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = self.permit.take();
+    }
+}
+
 fn collect_source_files(path: &PathBuf) -> Result<String> {
     let extensions = [
         "rs", "ts", "js", "py", "svelte", "toml", "yaml", "yml", "json", "go", "java", "c", "cpp",
@@ -425,7 +452,8 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                     continue;
                 }
             };
-            if let Some((mut file, size, open_dev, open_ino)) = open_file_no_follow(&file_path) {
+            if let Some((file, size, open_dev, open_ino)) = open_file_no_follow(&file_path) {
+                let mut guarded = GuardedFile::new(file, fd_permit);
                 // TOCTOU inode check: verify the opened file is the same inode
                 // the directory walker saw.
                 #[cfg(unix)]
@@ -462,7 +490,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                 use std::io::Read;
                 let checkpoint = all_code.len();
                 all_code.push_str(&format!("\n// === {} ===\n", file_path.display()));
-                match file.read_to_string(&mut all_code) {
+                match guarded.file_mut()?.read_to_string(&mut all_code) {
                     Ok(_) => {
                         if !all_code.ends_with('\n') {
                             all_code.push('\n');
@@ -476,7 +504,6 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                     }
                 }
             }
-            drop(fd_permit);
         }
         if accumulated_bytes >= MAX_AGGREGATE_BYTES {
             break;
@@ -682,12 +709,24 @@ fn build_oracle(cli: &Cli) -> Result<Arc<Oracle>> {
 
 fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
     let target = work_dir.join(".lambda-rlm-result.md");
-    if target.exists() {
-        anyhow::ensure!(
-            open_file_no_follow(&target).is_some(),
-            "refusing codegen result target symlink: {}",
-            target.display()
-        );
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "refusing codegen result target symlink: {}",
+                target.display()
+            );
+            anyhow::ensure!(
+                open_file_no_follow(&target).is_some(),
+                "refusing unsafe codegen result target: {}",
+                target.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect result target {}", target.display()));
+        }
     }
     Ok(())
 }

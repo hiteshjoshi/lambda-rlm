@@ -162,6 +162,9 @@ pub fn phi(
                 hex::encode(&cfg.trace_id[..4])
             );
             let (sys, prompt) = leaf_prompt(&text, &cfg.question, &cfg.task);
+            if *cfg.shutdown.borrow() {
+                return Err(anyhow::anyhow!("Graceful shutdown requested"));
+            }
 
             match cfg.oracle.call(&sys, &prompt, 2048).await {
                 Ok(raw) => {
@@ -216,6 +219,9 @@ pub fn phi(
                 &text
             };
             let (sys, prompt) = leaf_prompt(truncated, &cfg.question, &cfg.task);
+            if *cfg.shutdown.borrow() {
+                return Err(anyhow::anyhow!("Graceful shutdown requested"));
+            }
             match cfg.oracle.call(&sys, &prompt, 2048).await {
                 Ok(raw) => match cfg.verifier.check(&raw, text.len()) {
                     VerifyResult::Accept(v) | VerifyResult::Degraded(v, _) => return Ok(v),
@@ -417,6 +423,12 @@ pub fn phi(
         if matches!(cfg.task, TaskType::Summarise | TaskType::MultiHop) {
             let chars: usize = child_results.iter().map(|r| r.len()).sum();
             eprintln!("{indent}|  (synthesis: {chars} chars)");
+        }
+
+        if *cfg.shutdown.borrow() {
+            return Err(anyhow::anyhow!(
+                "Graceful shutdown requested at depth {depth}"
+            ));
         }
 
         let reduce_result = reduce_for_task(
