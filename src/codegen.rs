@@ -46,6 +46,7 @@ const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -936,10 +937,10 @@ impl ChildCleanup {
             .ok_or_else(|| anyhow::anyhow!("child process handle missing"))
     }
 
-    async fn kill_and_reap(&mut self) {
+    async fn kill_and_reap(&mut self, wait_timeout: Duration) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
         }
         self.child = None;
     }
@@ -972,6 +973,8 @@ impl Drop for ChildCleanup {
                                 Err(_) => break,
                             }
                         }
+                        let _ = child.kill();
+                        let _ = child.wait();
                     });
             }
         }));
@@ -1046,14 +1049,14 @@ async fn run_generator_process(
     let stdout = match child.child_mut()?.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            child.kill_and_reap().await;
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
             anyhow::bail!("failed to capture generator stdout");
         }
     };
     let stderr = match child.child_mut()?.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            child.kill_and_reap().await;
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
             anyhow::bail!("failed to capture generator stderr");
         }
     };
@@ -1072,7 +1075,7 @@ async fn run_generator_process(
     let status = match child.child_mut()?.wait().await {
         Ok(status) => status,
         Err(error) => {
-            child.kill_and_reap().await;
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
             return Err(error).with_context(|| format!("Failed to run {generator_name}"));
         }
     };
@@ -1157,7 +1160,7 @@ async fn run_generator_interactive_process(
             if changed.is_ok() || *shutdown_rx.borrow() {
                 tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
             }
-            child.kill_and_reap().await;
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
             Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
         }
         status = wait_for_child => {
@@ -1174,7 +1177,7 @@ async fn run_generator_interactive_process(
                 timeout_secs = session_timeout.as_secs(),
                 "interactive session exceeded timeout; terminating child process"
             );
-            child.kill_and_reap().await;
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
             Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"))
         }
     }
@@ -1711,6 +1714,25 @@ mod tests {
         assert!(
             !pid_alive(pid),
             "child process should be reaped by fallback thread"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_cleanup_drop_is_non_blocking() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("10")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        let child = cmd.spawn().expect("spawn sleep");
+        let cleanup = ChildCleanup::new(child);
+
+        let start = StdInstant::now();
+        drop(cleanup);
+        assert!(
+            start.elapsed() < StdDuration::from_millis(50),
+            "drop should not block runtime thread"
         );
     }
 
