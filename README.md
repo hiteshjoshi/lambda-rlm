@@ -210,6 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `ddf3f6c`
+
+- Added OpenCode production hardening in `src/codegen.rs` and `src/main.rs`: version handshake (`opencode 1.x`), stricter per-generator timeouts, control-character rejection in OpenCode summary parsing, and safer child-process reap behavior in drop paths.
+- Added semantic replay-cache validation in `src/resilience.rs` and wired it in `src/oracle.rs` so malformed cached payloads are quarantined and never replayed into runtime logic.
+- Added guard-lifecycle hardening (`#[must_use]` for codegen/inflight guards, live codegen guard telemetry at fix-loop shutdown), API-key scrubbing in error logs, and a new GitHub CI workflow with nightly Miri leak checks.
+- Added FD admission control in `src/main.rs` file collection path to prevent runaway open-file pressure under very large repository scans.
+
 Latest fix-loop hardening commit: `4578ddc`
 
 - Hardened `src/codegen.rs` result-file durability by adding timeout-bounded blocking writes with fsync on temp/persisted files and best-effort directory sync.
