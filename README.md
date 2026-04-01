@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.29 (`a7b1be4`): restored Unix interactive child process-group isolation for Claude/OpenCode sessions, force-kill/reap now targets the full process group so orphaned descendants cannot hang fix-loop shutdown, added a hard interactive deadline (`session timeout + 30s`) plus non-TTY revalidation before spawn, and added regression coverage for process-group cleanup on timeout.
 - v3.28 (`608172c`): added explicit interactive session live-permit leak tracking with shutdown enforcement, added periodic codegen single-flight maintenance in the global cache/maintenance loop to evict stale flights even when idle, and tightened child cleanup non-blocking regression coverage to assert sub-10ms drop latency under long-running children.
 - v3.27 (`de62103`): added 30s timeout guards around interactive session admission and phi/oracle/codegen semaphore acquisition to fail fast instead of hanging under permit starvation, moved codegen budget reservation ahead of bulkhead acquisition, and finalized codegen budget consumption on all completed headless runs to prevent budget leaks under error exits.
 - v3.26 (`d96a6e7`): made SIGINT handling interactive-session-aware so Ctrl-C is delivered to foreground OpenCode/Claude TTY children without prematurely shutting down the parent loop, added explicit interactive-session activity tracking tied to the permit lifecycle, and hardened `ChildCleanup` drop to skip background reaping when the child is already exited.
