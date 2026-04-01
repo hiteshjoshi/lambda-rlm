@@ -48,6 +48,38 @@ use tracing_subscriber::EnvFilter;
 
 static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
+#[must_use = "interactive session permit must be held for session lifetime"]
+struct InteractiveSessionPermit(Option<OwnedSemaphorePermit>);
+
+impl InteractiveSessionPermit {
+    const fn none() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for InteractiveSessionPermit {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.0.take();
+        }));
+    }
+}
+
+async fn acquire_interactive_session_permit(interactive: bool) -> Result<InteractiveSessionPermit> {
+    if !interactive {
+        return Ok(InteractiveSessionPermit::none());
+    }
+
+    let permit = INTERACTIVE_SESSION_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .context("interactive session already in progress")?;
+
+    Ok(InteractiveSessionPermit(Some(permit)))
+}
+
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
 /// Returns None if the file is a symlink or cannot be opened.
 /// On Unix, uses O_NOFOLLOW to atomically reject symlinks.
@@ -937,6 +969,7 @@ async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     cli.validate()?;
+    let _ = INTERACTIVE_SESSION_SEMAPHORE.set(Arc::new(tokio::sync::Semaphore::new(1)));
 
     eprintln!("\n================================================================");
     eprintln!("  lambda-RLM v3: Hardened Functional Runtime for Long-Context Reasoning");
@@ -1071,18 +1104,7 @@ async fn run() -> Result<()> {
 
         // 3. Hand to code generator
         validate_codegen_result_target(&work_dir)?;
-        let _interactive_permit = if cli.interactive {
-            Some(
-                INTERACTIVE_SESSION_SEMAPHORE
-                    .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .context("interactive session already in progress")?,
-            )
-        } else {
-            None
-        };
+        let _interactive_permit = acquire_interactive_session_permit(cli.interactive).await?;
         let summary = codegen::run_code_generator(
             oracle.as_ref(),
             &generator,
@@ -1231,6 +1253,26 @@ mod tests {
             "--interactive",
         ]);
         assert!(parsed.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_session_permit_enforces_single_holder() {
+        let sem = INTERACTIVE_SESSION_SEMAPHORE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone();
+        let first = acquire_interactive_session_permit(true)
+            .await
+            .expect("first interactive permit");
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "second interactive permit must be blocked while first is held"
+        );
+        drop(first);
+
+        let second = acquire_interactive_session_permit(true)
+            .await
+            .expect("permit should be available after drop");
+        drop(second);
     }
 
     #[tokio::test(flavor = "current_thread")]

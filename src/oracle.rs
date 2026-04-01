@@ -797,6 +797,9 @@ impl Oracle {
 
         // 3. Bulkhead permit is now held by ResourceStack.
         let n = self.call_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if n % 1000 == 0 {
+            self.inflight.shrink_to_fit();
+        }
 
         // Idempotency key: stable across retries of the same call, unique per
         // logical invocation. Prevents duplicate execution when the server
