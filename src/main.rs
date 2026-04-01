@@ -231,6 +231,11 @@ impl Cli {
             !(self.claude && self.opencode),
             "--claude and --opencode are mutually exclusive; pick one code generator"
         );
+        if self.claude {
+            validate_generator_access(&types::CodeGenerator::Claude)?;
+        } else if self.opencode {
+            validate_generator_access(&types::CodeGenerator::Opencode)?;
+        }
         // Prevent pathological expansion: k^depth must stay under 100K total calls
         if self.k >= 2 {
             let max_safe_depth = ((100_000f64).ln() / (self.k as f64).ln()).floor() as usize;
@@ -759,7 +764,6 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     let generator = generator.unwrap();
-    validate_generator_access(&generator)?;
 
     // ── Fix loop mode ──
     let work_dir = if cli.path.is_file() {

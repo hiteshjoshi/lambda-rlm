@@ -260,11 +260,12 @@ async fn remove_result_file(work_dir: &Path) {
     }
 }
 
-fn last_non_empty_line(text: &str) -> &str {
-    text.lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("(no output)")
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| !line.trim().is_empty())
+}
+
+fn last_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().rev().find(|line| !line.trim().is_empty())
 }
 
 impl CodeGenerator {
@@ -278,10 +279,13 @@ impl CodeGenerator {
         validate_generator_output(self, &stdout)?;
 
         let summary = match self {
-            CodeGenerator::Claude | CodeGenerator::Opencode => last_non_empty_line(&stdout),
+            CodeGenerator::Claude => last_non_empty_line(&stdout),
+            CodeGenerator::Opencode => first_non_empty_line(&stdout),
         };
 
-        Ok(Arc::from(summary))
+        summary
+            .map(Arc::from)
+            .ok_or_else(|| anyhow::anyhow!("{self} output did not contain a non-empty summary line"))
     }
 }
 
@@ -647,7 +651,7 @@ mod tests {
     #[test]
     fn last_non_empty_line_extracts_final_signal() {
         let output = "line one\n\nline two\n\n";
-        assert_eq!(last_non_empty_line(output), "line two");
+        assert_eq!(last_non_empty_line(output), Some("line two"));
     }
 
     #[test]
@@ -660,12 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_result_uses_last_line_for_opencode() {
+    fn extract_result_uses_first_line_for_opencode() {
         let output = b"metadata\nfix done\n";
         let summary = CodeGenerator::Opencode
             .extract_result(output)
             .expect("summary");
-        assert_eq!(summary.as_ref(), "fix done");
+        assert_eq!(summary.as_ref(), "metadata");
     }
 
     #[test]
