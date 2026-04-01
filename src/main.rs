@@ -41,12 +41,14 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tracing_subscriber::EnvFilter;
 
 static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[must_use = "interactive session permit must be held for session lifetime"]
 struct InteractiveSessionPermit(Option<OwnedSemaphorePermit>);
@@ -60,7 +62,9 @@ impl InteractiveSessionPermit {
 impl Drop for InteractiveSessionPermit {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self.0.take();
+            if self.0.take().is_some() {
+                INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
+            }
         }));
     }
 }
@@ -76,6 +80,8 @@ async fn acquire_interactive_session_permit(interactive: bool) -> Result<Interac
         .acquire_owned()
         .await
         .context("interactive session already in progress")?;
+
+    INTERACTIVE_SESSION_ACTIVE.store(true, Ordering::Release);
 
     Ok(InteractiveSessionPermit(Some(permit)))
 }
@@ -989,25 +995,35 @@ async fn run() -> Result<()> {
         let tx = shutdown_tx.clone();
         let oracle_shutdown = Arc::clone(&oracle);
         tokio::spawn(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
                 let mut sigterm =
                     signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
                 let mut sighup =
                     signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-                tokio::select! {
-                    _ = ctrl_c => {},
-                    _ = sigterm.recv() => {},
-                    _ = sighup.recv() => {
-                        eprintln!("\n>>> SIGHUP received — draining in-flight work before restart...");
-                    },
+                loop {
+                    tokio::select! {
+                        _ = sigint.recv() => {
+                            if INTERACTIVE_SESSION_ACTIVE.load(Ordering::Acquire) {
+                                tracing::info!("ignoring SIGINT while interactive session owns terminal");
+                                continue;
+                            }
+                            break;
+                        }
+                        _ = sigterm.recv() => break,
+                        _ = sighup.recv() => {
+                            eprintln!("\n>>> SIGHUP received — draining in-flight work before restart...");
+                            break;
+                        },
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
-                let _ = ctrl_c.await;
+                let _ = tokio::signal::ctrl_c().await;
             }
             eprintln!("\n>>> Signal received, initiating graceful shutdown...");
             oracle_shutdown.trigger_shutdown();
@@ -1279,6 +1295,23 @@ mod tests {
             .await
             .expect("permit should be available after drop");
         drop(second);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_session_flag_tracks_permit_lifetime() {
+        INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
+        let permit = acquire_interactive_session_permit(true)
+            .await
+            .expect("interactive permit");
+        assert!(
+            INTERACTIVE_SESSION_ACTIVE.load(Ordering::Acquire),
+            "interactive session flag should be set while permit is held"
+        );
+        drop(permit);
+        assert!(
+            !INTERACTIVE_SESSION_ACTIVE.load(Ordering::Acquire),
+            "interactive session flag should clear after permit drop"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1065,9 +1065,17 @@ impl Drop for ChildCleanup {
     fn drop(&mut self) {
         CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(child) = self.child.take() {
-                untrack_codegen_child_pid(child.id());
-                spawn_background_child_reap(child);
+            if let Some(mut child) = self.child.take() {
+                let pid = child.id();
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        untrack_codegen_child_pid(pid);
+                    }
+                    Ok(None) | Err(_) => {
+                        untrack_codegen_child_pid(pid);
+                        spawn_background_child_reap(child);
+                    }
+                }
             }
         }));
     }
