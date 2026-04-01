@@ -51,20 +51,44 @@ static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = On
 static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INTERACTIVE_SESSION_LIVE: AtomicU64 = AtomicU64::new(0);
 const INTERACTIVE_SESSION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERACTIVE_SESSION_LEAK_WARN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[must_use = "interactive session permit must be held for session lifetime"]
-struct InteractiveSessionPermit(Option<OwnedSemaphorePermit>);
+struct InteractiveSessionPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    acquired_at: Option<Instant>,
+}
 
 impl InteractiveSessionPermit {
     const fn none() -> Self {
-        Self(None)
+        Self {
+            permit: None,
+            acquired_at: None,
+        }
+    }
+
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            permit: Some(permit),
+            acquired_at: Some(Instant::now()),
+        }
     }
 }
 
 impl Drop for InteractiveSessionPermit {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if self.0.take().is_some() {
+            if self.permit.take().is_some() {
+                if let Some(acquired_at) = self.acquired_at.take() {
+                    let held_for = acquired_at.elapsed();
+                    if held_for > INTERACTIVE_SESSION_LEAK_WARN_TIMEOUT {
+                        tracing::error!(
+                            held_for_secs = held_for.as_secs(),
+                            timeout_secs = INTERACTIVE_SESSION_LEAK_WARN_TIMEOUT.as_secs(),
+                            "interactive session permit held longer than session timeout"
+                        );
+                    }
+                }
                 INTERACTIVE_SESSION_LIVE.fetch_sub(1, Ordering::AcqRel);
                 INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
             }
@@ -91,7 +115,7 @@ async fn acquire_interactive_session_permit(interactive: bool) -> Result<Interac
     INTERACTIVE_SESSION_LIVE.fetch_add(1, Ordering::AcqRel);
     INTERACTIVE_SESSION_ACTIVE.store(true, Ordering::Release);
 
-    Ok(InteractiveSessionPermit(Some(permit)))
+    Ok(InteractiveSessionPermit::new(permit))
 }
 
 /// Open a file with atomic symlink protection and return (File, size_bytes, inode).
