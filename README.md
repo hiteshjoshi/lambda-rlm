@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.20 (`962b34d`): bounded interactive child kill/reap waits to avoid indefinite runtime stalls, made fallback `ChildCleanup` drop reaping force-kill and wait after a 5s deadline to prevent zombie leaks, and added regression coverage for non-blocking drop plus fail-fast interactive preflight when no TTY is attached.
 - v3.19 (`7feda6a`): hardened interactive OpenCode/Claude process isolation by putting interactive children in their own process group, added explicit telemetry counters for codegen budget/flight/child-cleanup guards with shutdown leak enforcement, degraded root-level Phi child budget exhaustion instead of failing the whole tree, and added regression tests for sub-100ms interactive shutdown plus disarm/drop race modeling.
 - v3.18 (`81e63a2`): removed interactive startup probing so OpenCode/Claude TTY sessions no longer sit in a preflight wait state, prioritized shutdown in interactive wait selection, split circuit breakers by generator+mode, and hardened interactive concurrency/leak boundaries with a single-session semaphore plus per-iteration live-guard checks.
 - v3.17 (`230a307`): added a bounded interactive session timeout to kill/reap hung Claude/OpenCode TTY children, kept startup probing behavior intact, added a regression test for session-timeout termination, and moved full source collection into `spawn_blocking` to avoid blocking the async runtime on large repository scans.
