@@ -116,7 +116,9 @@ impl<'a> JoinSetReturnGuard<'a> {
 
 impl Drop for JoinSetReturnGuard<'_> {
     fn drop(&mut self) {
-        if let Some(set) = self.set.take() {
+        if let Some(mut set) = self.set.take() {
+            set.abort_all();
+            while set.try_join_next().is_some() {}
             return_joinset(self.cfg, set);
         }
     }

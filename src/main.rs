@@ -888,8 +888,14 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
-    for _ in 0..100 {
+async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> Result<()> {
+    let max_wait = if interactive_mode {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    };
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
         let metrics = oracle.metrics();
         let codegen_guards = codegen::codegen_guard_live_counts();
         let live_total = metrics.budget_guards_live
@@ -1044,7 +1050,7 @@ async fn run() -> Result<()> {
         // Single-shot mode: analyze and print
         let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
         println!("{result}");
-        ensure_no_live_guards(&oracle).await?;
+        ensure_no_live_guards(&oracle, cli.interactive).await?;
         return Ok(());
     }
     let generator = generator.unwrap();
@@ -1098,7 +1104,7 @@ async fn run() -> Result<()> {
         if is_clean {
             eprintln!("\n>>> Analysis came back clean. Nothing to fix.");
             println!("{result}");
-            ensure_no_live_guards(&oracle).await?;
+            ensure_no_live_guards(&oracle, cli.interactive).await?;
             return Ok(());
         }
 
@@ -1118,7 +1124,7 @@ async fn run() -> Result<()> {
         )
         .await?;
 
-        ensure_no_live_guards(&oracle).await?;
+        ensure_no_live_guards(&oracle, cli.interactive).await?;
 
         oracle.print_telemetry();
 
@@ -1146,7 +1152,7 @@ async fn run() -> Result<()> {
         );
         eprintln!(">>> Run again to continue if needed.");
     }
-    ensure_no_live_guards(&oracle).await?;
+    ensure_no_live_guards(&oracle, cli.interactive).await?;
     Ok(())
 }
 

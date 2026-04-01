@@ -241,6 +241,21 @@ pub async fn run_code_generator(
     shutdown: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
     validate_codegen_work_dir(work_dir)?;
+    if !single_flight_enabled(interactive) {
+        return run_code_generator_once(
+            oracle,
+            generator,
+            result,
+            work_dir,
+            question,
+            iteration,
+            interactive,
+            interactive_timeout,
+            shutdown,
+        )
+        .await;
+    }
+
     maybe_scavenge_codegen_single_flight();
     let flight_key = codegen_flight_key(
         generator,
@@ -322,6 +337,11 @@ pub async fn run_code_generator(
             }
         }
     }
+}
+
+#[inline]
+fn single_flight_enabled(interactive: bool) -> bool {
+    !interactive
 }
 
 fn validate_codegen_work_dir(work_dir: &Path) -> Result<()> {
@@ -1229,11 +1249,6 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
 }
 
 async fn run_generator_interactive_process(
@@ -1267,15 +1282,6 @@ async fn run_generator_interactive_process(
     };
 
     tokio::select! {
-        biased;
-
-        changed = shutdown_rx.changed() => {
-            if changed.is_ok() || *shutdown_rx.borrow() {
-                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
-            }
-            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
-            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
-        }
         status = wait_for_child => {
             let status = status?;
             child.disarm();
@@ -1283,6 +1289,13 @@ async fn run_generator_interactive_process(
                 return Err(classify_non_success_exit(generator_name, status));
             }
             Ok(())
+        }
+        changed = shutdown_rx.changed() => {
+            if changed.is_ok() || *shutdown_rx.borrow() {
+                tracing::info!(generator = generator_name, "shutdown received; terminating interactive generator process");
+            }
+            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+            Err(anyhow::anyhow!("interactive session interrupted by shutdown").context("codegen_retryable"))
         }
         _ = tokio::time::sleep(session_timeout) => {
             tracing::warn!(
@@ -1675,6 +1688,12 @@ mod tests {
             false,
         );
         assert!(key.starts_with("opencode:"));
+    }
+
+    #[test]
+    fn interactive_mode_disables_single_flight() {
+        assert!(single_flight_enabled(false));
+        assert!(!single_flight_enabled(true));
     }
 
     #[test]
