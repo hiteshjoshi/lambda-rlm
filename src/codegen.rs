@@ -1025,21 +1025,42 @@ fn configure_generator_command(cmd: &mut tokio::process::Command, work_dir: &Pat
     }
 }
 
-fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, work_dir: &Path) {
+fn configure_interactive_generator_command_blocking(
+    cmd: &mut std::process::Command,
+    work_dir: &Path,
+) {
     cmd.current_dir(work_dir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
+        .stderr(Stdio::inherit());
+}
 
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
+fn wait_for_interactive_exit_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    generator_name: &str,
+) -> Result<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("Failed to wait for {generator_name}"))?
+        {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "{generator_name} interactive session timed out after {timeout:?}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
 async fn run_generator_interactive_process(
-    mut cmd: tokio::process::Command,
+    mut cmd: std::process::Command,
     generator: &CodeGenerator,
     timeout: Duration,
 ) -> Result<()> {
@@ -1047,27 +1068,19 @@ async fn run_generator_interactive_process(
         CodeGenerator::Claude => "claude",
         CodeGenerator::Opencode => "opencode",
     };
-    let child = cmd.spawn().with_context(|| {
-        format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
-    })?;
-    let mut child = ChildCleanup::new(child);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut child = cmd.spawn().with_context(|| {
+            format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
+        })?;
 
-    let status = tokio::time::timeout(timeout, async {
-        child
-            .child_mut()?
-            .wait()
-            .await
-            .with_context(|| format!("Failed to run {generator_name}"))
+        let status = wait_for_interactive_exit_with_timeout(&mut child, timeout, generator_name)?;
+        if !status.success() {
+            return Err(classify_non_success_exit(generator_name, status));
+        }
+        Ok(())
     })
     .await
-    .with_context(|| {
-        format!("{generator_name} interactive session timed out after {timeout:?}")
-    })??;
-
-    child.disarm();
-    if !status.success() {
-        return Err(classify_non_success_exit(generator_name, status));
-    }
+    .context("interactive process task failed")??;
 
     Ok(())
 }
@@ -1161,10 +1174,10 @@ async fn run_claude_interactive(
             ">>> Iteration {iteration}: launching interactive claude in {} ...",
             work_dir.display()
         );
-        let mut cmd = tokio::process::Command::new("claude");
+        let mut cmd = std::process::Command::new("claude");
         cmd.arg("--dangerously-skip-permissions")
             .arg(interactive_prompt(question, iteration));
-        configure_interactive_generator_command(&mut cmd, work_dir);
+        configure_interactive_generator_command_blocking(&mut cmd, work_dir);
         run_generator_interactive_process(cmd, &CodeGenerator::Claude, timeout).await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
@@ -1259,8 +1272,8 @@ async fn run_opencode_interactive(
         eprintln!(
             ">>> Start by opening .lambda-rlm-result.md, then apply fixes for: \"{question}\""
         );
-        let mut cmd = tokio::process::Command::new("opencode");
-        configure_interactive_generator_command(&mut cmd, work_dir);
+        let mut cmd = std::process::Command::new("opencode");
+        configure_interactive_generator_command_blocking(&mut cmd, work_dir);
         run_generator_interactive_process(cmd, &CodeGenerator::Opencode, timeout).await?;
         Ok(Arc::<str>::from("interactive session completed"))
     }
@@ -1571,6 +1584,37 @@ mod tests {
         assert!(
             !pid_alive(pid),
             "child process should be reaped by fallback thread"
+        );
+    }
+
+    #[test]
+    fn interactive_wait_times_out_and_reaps_child() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("1000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        let err = wait_for_interactive_exit_with_timeout(
+            &mut child,
+            StdDuration::from_millis(150),
+            "opencode",
+        )
+        .expect_err("sleep should time out");
+        assert!(
+            format!("{err:#}").contains("interactive session timed out"),
+            "unexpected timeout error: {err:#}"
+        );
+
+        let deadline = StdInstant::now() + StdDuration::from_secs(2);
+        while pid_alive(pid) && StdInstant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(25));
+        }
+        assert!(
+            !pid_alive(pid),
+            "timed out interactive process should be reaped"
         );
     }
 
