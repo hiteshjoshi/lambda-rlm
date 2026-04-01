@@ -210,6 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `1756c75`
+
+- Hardened code-generator execution in `src/codegen.rs` with content-addressed replay caching (`b3-codegen_*`), per-generator concurrency bulkheads, symlink-safe result-file checks, and regex-backed OpenCode summary fallback that degrades safely on format drift.
+- Tightened file-ingest and result-target safety in `src/main.rs` by binding open-file permits to file handles (`GuardedFile`) and enforcing explicit symlink-metadata validation before codegen handoff.
+- Added shutdown checks before every Phi LLM/reduce call in `src/phi.rs`, documented architecture trade-offs in `ARCHITECTURE.md`, and introduced `tests/e2e_codegen.rs` as the idempotency boundary harness.
+
 Latest fix-loop hardening commit: `e7dea1b`
 
 - Added code-generator single-flight deduplication in `src/codegen.rs` (`DashMap` + `watch`) so concurrent identical fix-loop retries share one Claude/OpenCode subprocess instead of spawning duplicates.
