@@ -119,7 +119,23 @@ impl Drop for JoinSetReturnGuard<'_> {
     fn drop(&mut self) {
         if let Some(mut set) = self.set.take() {
             set.abort_all();
-            while set.try_join_next().is_some() {}
+            let deadline =
+                std::time::Instant::now() + Duration::from_millis(JOINSET_DRAIN_TIMEOUT_MILLIS);
+            loop {
+                while set.try_join_next().is_some() {}
+                if set.is_empty() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        timeout_ms = JOINSET_DRAIN_TIMEOUT_MILLIS,
+                        "joinset drop drain timed out after abort_all; detaching remaining tasks"
+                    );
+                    set.detach_all();
+                    break;
+                }
+                std::thread::yield_now();
+            }
             return_joinset(self.cfg, set);
         }
     }

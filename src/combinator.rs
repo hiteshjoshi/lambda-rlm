@@ -190,47 +190,54 @@ pub fn parse_items(text: &str) -> Vec<String> {
         );
         return vec![];
     }
-    text.lines()
-        .map(|l| {
-            let t = l.trim();
-            // Strip bullet markers: -, *, •, ▪, ▸, ►
-            let t = t
-                .strip_prefix("- ")
-                .or_else(|| t.strip_prefix("* "))
-                .or_else(|| t.strip_prefix("• "))
-                .or_else(|| t.strip_prefix("▪ "))
-                .or_else(|| t.strip_prefix("▸ "))
-                .or_else(|| t.strip_prefix("► "))
-                .unwrap_or(t);
-            // Strip numbered list markers: "1. ", "2) ", etc.
-            let t = if t.len() > 2 {
-                let bytes = t.as_bytes();
-                if bytes[0].is_ascii_digit() {
-                    // Find end of digits
-                    let digit_end = t.bytes().take_while(|b| b.is_ascii_digit()).count();
-                    if digit_end < t.len() {
-                        let after_digits = &t[digit_end..];
-                        if let Some(rest) = after_digits.strip_prefix(". ") {
-                            rest
-                        } else if let Some(rest) = after_digits.strip_prefix(") ") {
-                            rest
-                        } else {
-                            t
-                        }
+    let estimated_items = (text.len() / 48).max(1).min(MAX_ITEMS_COUNT);
+    let mut items = Vec::with_capacity(estimated_items);
+
+    for raw_line in text.lines() {
+        if items.len() >= MAX_ITEMS_COUNT {
+            break;
+        }
+
+        let trimmed = raw_line.trim();
+        let trimmed = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))
+            .or_else(|| trimmed.strip_prefix("▪ "))
+            .or_else(|| trimmed.strip_prefix("▸ "))
+            .or_else(|| trimmed.strip_prefix("► "))
+            .unwrap_or(trimmed);
+
+        let trimmed = if trimmed.len() > 2 {
+            let bytes = trimmed.as_bytes();
+            if bytes[0].is_ascii_digit() {
+                let digit_end = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+                if digit_end < trimmed.len() {
+                    let after_digits = &trimmed[digit_end..];
+                    if let Some(rest) = after_digits.strip_prefix(". ") {
+                        rest
+                    } else if let Some(rest) = after_digits.strip_prefix(") ") {
+                        rest
                     } else {
-                        t
+                        trimmed
                     }
                 } else {
-                    t
+                    trimmed
                 }
             } else {
-                t
-            };
-            t.trim().to_string()
-        })
-        .filter(|l| !l.is_empty() && l.len() > 3)
-        .take(MAX_ITEMS_COUNT)
-        .collect()
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+
+        let item = trimmed.trim();
+        if !item.is_empty() && item.len() > 3 {
+            items.push(item.to_string());
+        }
+    }
+
+    items
 }
 
 pub fn merge_dedup(items: Vec<String>) -> Vec<String> {

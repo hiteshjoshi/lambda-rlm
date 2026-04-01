@@ -48,6 +48,7 @@ const CODEGEN_SINGLE_FLIGHT_MAX_ENTRIES: usize = 1_000;
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const OPENCODE_INTERACTIVE_GLOBAL_TIMEOUT: Duration = Duration::from_secs(300);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_DROP_REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,6 +103,22 @@ fn kill_process_group_sigkill(pid: Option<u32>) {
             let target = format!("-{pgid}");
             let _ = std::process::Command::new("kill")
                 .arg("-KILL")
+                .arg("--")
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group_sigterm(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        if let Ok(pgid) = i32::try_from(pid) {
+            let target = format!("-{pgid}");
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
                 .arg("--")
                 .arg(target)
                 .stdout(std::process::Stdio::null())
@@ -437,7 +454,8 @@ async fn run_code_generator_once(
                     )
                     .await
                 }
-                CodeGenerator::Opencode => {
+                CodeGenerator::Opencode => tokio::time::timeout(
+                    OPENCODE_INTERACTIVE_GLOBAL_TIMEOUT,
                     run_opencode_interactive(
                         result,
                         work_dir,
@@ -446,9 +464,16 @@ async fn run_code_generator_once(
                         interactive_timeout,
                         INTERACTIVE_SESSION_TIMEOUT,
                         shutdown,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "interactive opencode global timeout ({}s)",
+                        OPENCODE_INTERACTIVE_GLOBAL_TIMEOUT.as_secs()
                     )
-                    .await
-                }
+                    .context("codegen_retryable")
+                })?,
             }
         })
         .await
@@ -1082,6 +1107,31 @@ impl ChildCleanup {
         self.child = None;
     }
 
+    async fn terminate_with_escalation(&mut self, wait_timeout: Duration) {
+        if let Some(child) = self.child.as_mut() {
+            let pid = child.id();
+            #[cfg(unix)]
+            kill_process_group_sigterm(pid);
+            #[cfg(not(unix))]
+            {
+                let _ = child.start_kill();
+            }
+
+            let exited_cleanly = matches!(
+                tokio::time::timeout(wait_timeout, child.wait()).await,
+                Ok(Ok(_))
+            );
+            if !exited_cleanly {
+                #[cfg(unix)]
+                kill_process_group_sigkill(pid);
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
+            }
+            untrack_codegen_child_pid(pid);
+        }
+        self.child = None;
+    }
+
     fn disarm(&mut self) {
         let pid = self.child.as_ref().and_then(tokio::process::Child::id);
         untrack_codegen_child_pid(pid);
@@ -1352,7 +1402,7 @@ async fn run_generator_interactive_process(
                     .as_secs(),
                 "interactive session exceeded hard deadline; force-killing child process group"
             );
-            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+            child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
             return Err(
                 anyhow::anyhow!("interactive session hard timeout").context("codegen_retryable")
             );
@@ -1361,9 +1411,9 @@ async fn run_generator_interactive_process(
             tracing::warn!(
                 generator = generator_name,
                 timeout_secs = session_timeout.as_secs(),
-                "interactive session exceeded timeout; terminating child process"
+                "interactive session exceeded timeout; sending SIGTERM with SIGKILL escalation"
             );
-            child.kill_and_reap(CHILD_REAP_TIMEOUT).await;
+            child.terminate_with_escalation(CHILD_REAP_TIMEOUT).await;
             return Err(anyhow::anyhow!("interactive session timeout").context("codegen_retryable"));
         }
 
@@ -2137,6 +2187,73 @@ mod tests {
         .expect("session timeout should reap background process group child");
 
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    async fn interactive_timeout_sends_sigterm_then_sigkill() {
+        let pid_file = unique_pid_file_path();
+        let term_file = unique_pid_file_path();
+        let pid_file_str = pid_file.to_string_lossy().into_owned();
+        let term_file_str = term_file.to_string_lossy().into_owned();
+        let shell = format!(
+            "trap 'echo term > \"{term_file_str}\"' TERM; echo $$ > \"{pid_file_str}\"; while true; do sleep 1; done"
+        );
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(shell)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        cmd.process_group(0);
+
+        let err = run_generator_interactive_process(
+            cmd,
+            &CodeGenerator::Opencode,
+            StdDuration::from_millis(50),
+            StdDuration::from_millis(120),
+            shutdown_rx,
+        )
+        .await
+        .expect_err("session timeout should terminate interactive process group");
+        assert!(error_has_context(&err, "codegen_retryable"));
+
+        let pid = tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = raw.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("interactive process should publish pid");
+
+        tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                if term_file.exists() {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("interactive timeout should send SIGTERM before escalation");
+
+        tokio::time::timeout(StdDuration::from_secs(8), async {
+            while pid_alive(pid) {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("interactive timeout should escalate to SIGKILL for TERM-ignoring child");
+
+        let _ = std::fs::remove_file(pid_file);
+        let _ = std::fs::remove_file(term_file);
     }
 
     #[tokio::test(flavor = "current_thread")]

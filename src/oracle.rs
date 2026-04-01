@@ -199,12 +199,19 @@ impl<'a> InflightGuard<'a> {
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.map.remove(&self.key);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.map.remove(&self.key);
+            if self.map.is_empty() {
+                self.map.shrink_to_fit();
+            }
+        }))
+        .is_err()
+            && !std::thread::panicking()
+        {
+            tracing::error!("InflightGuard cleanup panicked during Drop");
+        }
         self.gauge.fetch_sub(1, Ordering::AcqRel);
         INFLIGHT_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
-        if self.map.is_empty() {
-            self.map.shrink_to_fit();
-        }
     }
 }
 
@@ -705,14 +712,14 @@ impl Oracle {
         let latency_ms = latency.as_millis() as u64;
         match generator {
             CodeGenerator::Claude => {
-                self.codegen_claude_calls.fetch_add(1, Ordering::AcqRel);
+                self.codegen_claude_calls.fetch_add(1, Ordering::Relaxed);
                 self.codegen_claude_latency_ms
-                    .fetch_add(latency_ms, Ordering::AcqRel);
+                    .fetch_add(latency_ms, Ordering::Relaxed);
             }
             CodeGenerator::Opencode => {
-                self.codegen_opencode_calls.fetch_add(1, Ordering::AcqRel);
+                self.codegen_opencode_calls.fetch_add(1, Ordering::Relaxed);
                 self.codegen_opencode_latency_ms
-                    .fetch_add(latency_ms, Ordering::AcqRel);
+                    .fetch_add(latency_ms, Ordering::Relaxed);
             }
         }
     }
@@ -906,11 +913,11 @@ impl Oracle {
                     let latency = start.elapsed();
                     self.circuit.record_success();
                     self.total_input_chars
-                        .fetch_add(user_prompt.len() as u64, Ordering::AcqRel);
+                        .fetch_add(user_prompt.len() as u64, Ordering::Relaxed);
                     self.total_output_chars
-                        .fetch_add(text.len() as u64, Ordering::AcqRel);
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
                     self.total_latency_ms
-                        .fetch_add(latency.as_millis() as u64, Ordering::AcqRel);
+                        .fetch_add(latency.as_millis() as u64, Ordering::Relaxed);
 
                     if let Err(e) = self.cache.put(&cache_key, &text) {
                         tracing::warn!(error = %sanitize_error_text(&e.to_string()), "cache write failed (non-fatal)");
@@ -982,9 +989,9 @@ impl Oracle {
         let calls = self.calls();
         let cache_hits = self.cache_hits.load(Ordering::Acquire);
         let errors = self.errors.load(Ordering::Acquire);
-        let input_chars = self.total_input_chars.load(Ordering::Acquire);
-        let output_chars = self.total_output_chars.load(Ordering::Acquire);
-        let latency_ms = self.total_latency_ms.load(Ordering::Acquire);
+        let input_chars = self.total_input_chars.load(Ordering::Relaxed);
+        let output_chars = self.total_output_chars.load(Ordering::Relaxed);
+        let latency_ms = self.total_latency_ms.load(Ordering::Relaxed);
         let budget_remaining = self.budget.remaining();
         let metrics = self.metrics();
         let leaked_budget_guards = metrics.budget_guards_live;
@@ -992,10 +999,10 @@ impl Oracle {
         let inflight_requests = metrics.inflight_requests;
         let inflight_gauge = self.inflight_gauge.load(Ordering::Acquire);
         let inflight_consistent = self.check_inflight_leak();
-        let codegen_claude_calls = self.codegen_claude_calls.load(Ordering::Acquire);
-        let codegen_opencode_calls = self.codegen_opencode_calls.load(Ordering::Acquire);
-        let codegen_claude_latency_ms = self.codegen_claude_latency_ms.load(Ordering::Acquire);
-        let codegen_opencode_latency_ms = self.codegen_opencode_latency_ms.load(Ordering::Acquire);
+        let codegen_claude_calls = self.codegen_claude_calls.load(Ordering::Relaxed);
+        let codegen_opencode_calls = self.codegen_opencode_calls.load(Ordering::Relaxed);
+        let codegen_claude_latency_ms = self.codegen_claude_latency_ms.load(Ordering::Relaxed);
+        let codegen_opencode_latency_ms = self.codegen_opencode_latency_ms.load(Ordering::Relaxed);
 
         // fmt::Write for String is infallible (OOM panics, never returns Err),
         // but we propagate via a helper to satisfy zero-swallowing discipline.
