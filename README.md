@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.13 (`bedafe5`): removed interactive `spawn_blocking` polling in favor of direct Tokio child waits with async timeouts/reaping, and updated timeout coverage to exercise the interactive path without blocking-pool starvation.
 - v3.12 (`c17d7a7`): moved interactive Claude/OpenCode execution onto a blocking process path with explicit timeout polling and forced reap on timeout, eliminating async/TTY hangs where interactive sessions stalled after launch.
 - v3.11 (`032b6cc`): added periodic replay-cache maintenance during long-running fix loops, exposed Oracle cache sweep hooks, and added a test proving `ChildCleanup` reaps processes even when dropped outside a Tokio runtime.
 - v3.10 (`d860423`): enforced shutdown leak checks for Oracle inflight guards, added panic-safe drop hardening and `#[must_use]` coverage for runtime guard types, and tightened shutdown responsiveness before expensive Phi reduction.
