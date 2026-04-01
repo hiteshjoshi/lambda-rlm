@@ -28,6 +28,12 @@ const MAX_SSE_BUFFER_BYTES: usize = 10 * 1024 * 1024;
 /// consistent with MAX_SSE_BUFFER_BYTES.
 const MAX_SSE_EVENTS: usize = 100_000;
 
+/// Maximum continuation rounds when provider reports finish_reason="length".
+/// Prevents unbounded continuation loops while still recovering long outputs.
+const MAX_TRUNCATION_CONTINUATIONS: usize = 4;
+
+const CONTINUATION_PROMPT: &str = "Continue exactly from where your previous answer ended. Do not repeat prior text. Return only the continuation.";
+
 // ── Structured Error Types ──────────────────────────────────────
 // Enables intelligent retry classification: retryable vs fatal.
 // Only used at the Oracle API boundary — internal modules keep anyhow.
@@ -46,13 +52,22 @@ pub enum OracleError {
     Network(String),
     #[error("stream corrupted: {0}")]
     StreamCorrupted(String),
+    #[error("incomplete stream: {0}")]
+    IncompleteStream(String),
+    #[error(
+        "response truncated at max_tokens={max_tokens} after {segments} segment(s); increase token budget"
+    )]
+    OutputTruncated { max_tokens: u32, segments: usize },
 }
 
 impl OracleError {
     /// Retryable errors: transient failures that may succeed on retry.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimit { .. } | Self::Timeout(_) | Self::Network(_) => true,
+            Self::RateLimit { .. }
+            | Self::Timeout(_)
+            | Self::Network(_)
+            | Self::IncompleteStream(_) => true,
             Self::ApiError { status, .. } => *status >= 500,
             _ => false,
         }
@@ -108,6 +123,8 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,12 +135,39 @@ struct StreamChunk {
 #[derive(Deserialize)]
 struct StreamChoice {
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+}
+
+struct LlmCompletion {
+    text: String,
+    finish_reason: Option<String>,
+}
+
+fn normalize_finish_reason(reason: Option<&str>) -> Option<String> {
+    reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_truncation_finish_reason(reason: &str) -> bool {
+    reason.eq_ignore_ascii_case("length")
+}
+
+fn chunk_preview_for_error(payload: &str) -> String {
+    const PREVIEW_CHARS: usize = 180;
+    let mut out: String = payload.chars().take(PREVIEW_CHARS).collect();
+    if payload.chars().count() > PREVIEW_CHARS {
+        out.push_str("...");
+    }
+    out.replace('\n', "\\n")
 }
 
 // ── Single-Flight Guard ──────────────────────────────────────────
@@ -227,9 +271,16 @@ impl FireworksProvider {
     }
 
     /// SSE stream parser per W3C Server-Sent Events specification.
-    async fn read_stream(&self, response: reqwest::Response) -> Result<String> {
+    /// Requires explicit [DONE] marker; missing [DONE] is treated as incomplete.
+    async fn read_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> std::result::Result<LlmCompletion, OracleError> {
         use futures::StreamExt;
+
         let mut result = String::new();
+        let mut finish_reason: Option<String> = None;
+        let mut saw_done = false;
         let mut stream = response.bytes_stream();
         let mut buf = BytesMut::with_capacity(8192);
         let mut event_data = String::new();
@@ -237,14 +288,14 @@ impl FireworksProvider {
         let mut event_count: usize = 0;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream read error: {e}"))?;
+            let chunk = chunk.map_err(|e| OracleError::Network(e.to_string()))?;
             buf.extend_from_slice(&chunk);
 
             if result.len() + buf.len() > MAX_SSE_BUFFER_BYTES {
-                anyhow::bail!(
+                return Err(OracleError::StreamCorrupted(format!(
                     "SSE stream exceeded maximum buffer size ({} bytes)",
                     MAX_SSE_BUFFER_BYTES
-                );
+                )));
             }
 
             if !bom_stripped {
@@ -255,8 +306,9 @@ impl FireworksProvider {
             }
 
             while let Some((line_end, skip)) = sse_line_boundary(&buf[..]) {
-                let line = String::from_utf8(buf[..line_end].to_vec())
-                    .map_err(|e| anyhow::anyhow!("SSE stream contains invalid UTF-8: {e}"))?;
+                let line = String::from_utf8(buf[..line_end].to_vec()).map_err(|e| {
+                    OracleError::StreamCorrupted(format!("SSE stream invalid UTF-8: {e}"))
+                })?;
                 let _ = buf.split_to(line_end + skip);
 
                 if line.is_empty() {
@@ -264,13 +316,25 @@ impl FireworksProvider {
                         if event_data.ends_with('\n') {
                             event_data.pop();
                         }
-                        if event_data == "[DONE]" {
-                            return Ok(result);
-                        }
-                        if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&event_data) {
+                        let trimmed = event_data.trim();
+                        if trimmed == "[DONE]" {
+                            saw_done = true;
+                        } else {
+                            let parsed: StreamChunk =
+                                serde_json::from_str(trimmed).map_err(|e| {
+                                    OracleError::IncompleteStream(format!(
+                                        "invalid SSE data chunk: {e}; payload='{}'",
+                                        chunk_preview_for_error(trimmed)
+                                    ))
+                                })?;
                             if let Some(choice) = parsed.choices.first() {
                                 if let Some(content) = &choice.delta.content {
                                     result.push_str(content);
+                                }
+                                if let Some(reason) =
+                                    normalize_finish_reason(choice.finish_reason.as_deref())
+                                {
+                                    finish_reason = Some(reason);
                                 }
                             }
                         }
@@ -284,10 +348,10 @@ impl FireworksProvider {
                     event_data.push('\n');
                     event_count += 1;
                     if event_count > MAX_SSE_EVENTS {
-                        anyhow::bail!(
+                        return Err(OracleError::StreamCorrupted(format!(
                             "SSE stream exceeded maximum event count ({} events)",
                             MAX_SSE_EVENTS
-                        );
+                        )));
                     }
                 }
             }
@@ -297,18 +361,37 @@ impl FireworksProvider {
             if event_data.ends_with('\n') {
                 event_data.pop();
             }
-            if event_data != "[DONE]" {
-                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(&event_data) {
-                    if let Some(choice) = parsed.choices.first() {
-                        if let Some(content) = &choice.delta.content {
-                            result.push_str(content);
-                        }
+            let trimmed = event_data.trim();
+            if trimmed == "[DONE]" {
+                saw_done = true;
+            } else {
+                let parsed: StreamChunk = serde_json::from_str(trimmed).map_err(|e| {
+                    OracleError::IncompleteStream(format!(
+                        "invalid trailing SSE data chunk: {e}; payload='{}'",
+                        chunk_preview_for_error(trimmed)
+                    ))
+                })?;
+                if let Some(choice) = parsed.choices.first() {
+                    if let Some(content) = &choice.delta.content {
+                        result.push_str(content);
+                    }
+                    if let Some(reason) = normalize_finish_reason(choice.finish_reason.as_deref()) {
+                        finish_reason = Some(reason);
                     }
                 }
             }
         }
 
-        Ok(result)
+        if !saw_done {
+            return Err(OracleError::IncompleteStream(
+                "stream ended before [DONE] marker".into(),
+            ));
+        }
+
+        Ok(LlmCompletion {
+            text: result,
+            finish_reason,
+        })
     }
 }
 
@@ -354,55 +437,107 @@ impl FireworksProvider {
             });
 
             let use_stream = max_tokens > 4096;
+            let mut combined = String::new();
 
-            let request = ChatRequest {
-                model: self.model.clone(),
+            for segment_idx in 0..=MAX_TRUNCATION_CONTINUATIONS {
+                let request = ChatRequest {
+                    model: self.model.clone(),
+                    max_tokens,
+                    messages: messages.clone(),
+                    stream: use_stream,
+                    temperature: Some(0.0),
+                    response_format: None,
+                };
+
+                let segment_key = if segment_idx == 0 {
+                    idempotency_key.to_string()
+                } else {
+                    format!("{idempotency_key}-c{segment_idx}")
+                };
+
+                let response = self
+                    .client
+                    .post("https://api.fireworks.ai/inference/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("Content-Type", "application/json")
+                    .header("X-Idempotency-Key", segment_key)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| OracleError::Network(e.to_string()))?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    let code = status.as_u16();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(match code {
+                        429 => OracleError::RateLimit {
+                            retry_after: Duration::from_secs(5),
+                        },
+                        401 | 403 => OracleError::AuthFailed(body),
+                        _ => OracleError::ApiError { status: code, body },
+                    });
+                }
+
+                let completion = if use_stream {
+                    self.read_stream(response).await?
+                } else {
+                    let resp: ChatResponse = response
+                        .json()
+                        .await
+                        .map_err(|e| OracleError::StreamCorrupted(e.to_string()))?;
+                    let choice = resp.choices.first().ok_or_else(|| {
+                        OracleError::StreamCorrupted(
+                            "non-stream response contained no choices".into(),
+                        )
+                    })?;
+                    LlmCompletion {
+                        text: choice.message.content.clone(),
+                        finish_reason: normalize_finish_reason(choice.finish_reason.as_deref()),
+                    }
+                };
+
+                let segment_text = completion.text;
+                let finish_reason = normalize_finish_reason(completion.finish_reason.as_deref());
+                if !segment_text.is_empty() {
+                    combined.push_str(&segment_text);
+                }
+
+                if let Some(reason) = finish_reason.as_deref() {
+                    if is_truncation_finish_reason(reason) {
+                        if segment_idx == MAX_TRUNCATION_CONTINUATIONS {
+                            return Err(OracleError::OutputTruncated {
+                                max_tokens,
+                                segments: segment_idx + 1,
+                            });
+                        }
+
+                        if segment_text.is_empty() {
+                            return Err(OracleError::OutputTruncated {
+                                max_tokens,
+                                segments: segment_idx + 1,
+                            });
+                        }
+
+                        messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: segment_text,
+                        });
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: CONTINUATION_PROMPT.to_string(),
+                        });
+                        continue;
+                    }
+                }
+
+                return Ok(combined);
+            }
+
+            Err(OracleError::OutputTruncated {
                 max_tokens,
-                messages,
-                stream: use_stream,
-                temperature: Some(0.0),
-                response_format: None,
-            };
-
-            let response = self
-                .client
-                .post("https://api.fireworks.ai/inference/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
-                .header("X-Idempotency-Key", idempotency_key)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| OracleError::Network(e.to_string()))?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let code = status.as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(match code {
-                    429 => OracleError::RateLimit {
-                        retry_after: Duration::from_secs(5),
-                    },
-                    401 | 403 => OracleError::AuthFailed(body),
-                    _ => OracleError::ApiError { status: code, body },
-                });
-            }
-
-            if use_stream {
-                self.read_stream(response)
-                    .await
-                    .map_err(|e| OracleError::StreamCorrupted(e.to_string()))
-            } else {
-                let resp: ChatResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| OracleError::StreamCorrupted(e.to_string()))?;
-                Ok(resp
-                    .choices
-                    .first()
-                    .map(|c| c.message.content.clone())
-                    .unwrap_or_default())
-            }
+                segments: MAX_TRUNCATION_CONTINUATIONS + 1,
+            })
         };
 
         tokio::time::timeout(self.timeout, fut)
@@ -1016,6 +1151,7 @@ mod tests {
         .is_retryable());
         assert!(OracleError::Timeout(Duration::from_secs(30)).is_retryable());
         assert!(OracleError::Network("connection reset".into()).is_retryable());
+        assert!(OracleError::IncompleteStream("missing done marker".into()).is_retryable());
         assert!(OracleError::ApiError {
             status: 500,
             body: "internal".into()
@@ -1037,6 +1173,11 @@ mod tests {
         }
         .is_retryable());
         assert!(!OracleError::StreamCorrupted("invalid json".into()).is_retryable());
+        assert!(!OracleError::OutputTruncated {
+            max_tokens: 1024,
+            segments: 1,
+        }
+        .is_retryable());
     }
 
     #[test]
