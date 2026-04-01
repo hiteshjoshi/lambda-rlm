@@ -210,6 +210,13 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `4d9085c`
+
+- Hardened `src/codegen.rs` with a TTL scavenger for `CODEGEN_SINGLE_FLIGHT`, generator-prefixed single-flight keys (`claude:`/`opencode:`), and stronger no-runtime child-process reaping so stale leader slots and orphaned generator processes do not accumulate.
+- Tightened leak and preflight guarantees in `src/main.rs` by releasing `FD_SEMAPHORE` permits before file-handle drop in `GuardedFile`, adding an unwind-path permit-return test, and adding a fail-fast `validate_generator_access` regression test for missing `opencode` binaries.
+- Unified secret redaction in `src/main.rs`, `src/codegen.rs`, and `src/oracle.rs` to explicitly cover `CLAUDE_API_KEY` alongside `FIREWORKS_API`/`OPENCODE_*`, and added integration coverage in `tests/e2e_codegen.rs` to assert `--opencode` fails before fix-loop execution when PATH does not contain the binary.
+- Added `#[must_use]` to `merge_dedup_arc` in `src/combinator.rs` to guard against accidental drop of deduplicated `Arc<str>` results in hot aggregation paths.
+
 Latest fix-loop hardening commit: `1756c75`
 
 - Hardened code-generator execution in `src/codegen.rs` with content-addressed replay caching (`b3-codegen_*`), per-generator concurrency bulkheads, symlink-safe result-file checks, and regex-backed OpenCode summary fallback that degrades safely on format drift.
