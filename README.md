@@ -210,6 +210,12 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 ## Changelog
 
+Latest fix-loop hardening commit: `e7dea1b`
+
+- Added code-generator single-flight deduplication in `src/codegen.rs` (`DashMap` + `watch`) so concurrent identical fix-loop retries share one Claude/OpenCode subprocess instead of spawning duplicates.
+- Kept Claude/OpenCode failure-domain isolation while single-flight is active by preserving per-generator circuit breakers, budget-guard semantics, and generator-scoped unavailable error contexts.
+- Added a dedicated loom-model test scaffold in `src/codegen.rs` for codegen-budget restoration race analysis (marked ignored for explicit model-check runs).
+
 Latest fix-loop hardening commit: `a3a007e`
 
 - Hardened `src/codegen.rs` for disk-pressure resilience: if writing `.lambda-rlm-result.md` hits ENOSPC, the fix loop degrades to an inline in-memory prompt instead of failing the iteration.
