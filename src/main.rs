@@ -817,14 +817,20 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
 
 fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
     let metrics = oracle.metrics();
-    let codegen_guards_live = codegen::codegen_guard_live_count();
-    if metrics.budget_guards_live > 0 || metrics.inflight_guards_live > 0 || codegen_guards_live > 0
+    let codegen_guards = codegen::codegen_guard_live_counts();
+    if metrics.budget_guards_live > 0
+        || metrics.inflight_guards_live > 0
+        || codegen_guards.budget > 0
+        || codegen_guards.flight > 0
+        || codegen_guards.child_cleanup > 0
     {
         anyhow::bail!(
-            "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_guards_live={})",
+            "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={})",
             metrics.budget_guards_live,
             metrics.inflight_guards_live,
-            codegen_guards_live
+            codegen_guards.budget,
+            codegen_guards.flight,
+            codegen_guards.child_cleanup
         );
     }
     Ok(())

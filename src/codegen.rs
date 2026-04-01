@@ -46,7 +46,9 @@ const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static CODEGEN_BUDGET_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static CODEGEN_FLIGHT_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static CHILD_CLEANUP_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
 static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightEntry>> = OnceLock::new();
@@ -57,8 +59,18 @@ struct CodegenFlightEntry {
     inserted_at: Instant,
 }
 
-pub fn codegen_guard_live_count() -> u64 {
-    CODEGEN_GUARD_LIVE_COUNT.load(Ordering::Acquire)
+pub struct CodegenGuardLiveCounts {
+    pub budget: u64,
+    pub flight: u64,
+    pub child_cleanup: u64,
+}
+
+pub fn codegen_guard_live_counts() -> CodegenGuardLiveCounts {
+    CodegenGuardLiveCounts {
+        budget: CODEGEN_BUDGET_GUARD_LIVE_COUNT.load(Ordering::Acquire),
+        flight: CODEGEN_FLIGHT_GUARD_LIVE_COUNT.load(Ordering::Acquire),
+        child_cleanup: CHILD_CLEANUP_GUARD_LIVE_COUNT.load(Ordering::Acquire),
+    }
 }
 
 #[must_use = "dropping CodegenBudgetGuard without commit() restores budget"]
@@ -74,7 +86,7 @@ impl<'a> CodegenBudgetGuard<'a> {
             oracle.budget_try_reserve(units),
             "code generation budget exhausted"
         );
-        CODEGEN_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        CODEGEN_BUDGET_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             oracle,
             units,
@@ -89,7 +101,7 @@ impl<'a> CodegenBudgetGuard<'a> {
 
 impl Drop for CodegenBudgetGuard<'_> {
     fn drop(&mut self) {
-        CODEGEN_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
+        CODEGEN_BUDGET_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         if !self.committed {
             if !std::thread::panicking() {
                 tracing::error!(
@@ -104,7 +116,10 @@ impl Drop for CodegenBudgetGuard<'_> {
     }
 }
 
-fn codegen_circuit(generator: &CodeGenerator, interactive: bool) -> Result<&'static CircuitBreaker> {
+fn codegen_circuit(
+    generator: &CodeGenerator,
+    interactive: bool,
+) -> Result<&'static CircuitBreaker> {
     static CLAUDE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     static CLAUDE_INTERACTIVE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     // OpenCode is still less stable under sustained load in our testing, so it
@@ -229,10 +244,7 @@ pub async fn run_code_generator(
                     inserted_at: Instant::now(),
                 });
 
-                let _flight_guard = CodegenFlightGuard {
-                    flights,
-                    key: flight_key.clone(),
-                };
+                let _flight_guard = CodegenFlightGuard::new(flights, flight_key.clone());
 
                 let outcome = run_code_generator_once(
                     oracle,
@@ -402,8 +414,16 @@ struct CodegenFlightGuard<'a> {
     key: String,
 }
 
+impl<'a> CodegenFlightGuard<'a> {
+    fn new(flights: &'a DashMap<String, CodegenFlightEntry>, key: String) -> Self {
+        CODEGEN_FLIGHT_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        Self { flights, key }
+    }
+}
+
 impl Drop for CodegenFlightGuard<'_> {
     fn drop(&mut self) {
+        CODEGEN_FLIGHT_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.flights.remove(&self.key);
         }));
@@ -906,6 +926,7 @@ struct ChildCleanup {
 
 impl ChildCleanup {
     fn new(child: tokio::process::Child) -> Self {
+        CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         Self { child: Some(child) }
     }
 
@@ -926,11 +947,11 @@ impl ChildCleanup {
     fn disarm(&mut self) {
         self.child = None;
     }
-
 }
 
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
+        CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(mut child) = self.child.take() {
                 let _ = std::thread::Builder::new()
@@ -1092,6 +1113,11 @@ fn configure_interactive_generator_command(cmd: &mut tokio::process::Command, wo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
 }
 
 async fn run_generator_interactive_process(
@@ -1383,6 +1409,7 @@ mod tests {
     use super::*;
     use loom::sync::atomic::{AtomicUsize as LoomAtomicUsize, Ordering as LoomOrdering};
     use loom::sync::Arc as LoomArc;
+    use loom::sync::Mutex as LoomMutex;
     use loom::thread as loom_thread;
     use std::time::Duration as StdDuration;
     use std::time::Instant as StdInstant;
@@ -1781,12 +1808,17 @@ mod tests {
         .expect("interactive process should write pid file");
 
         shutdown_tx.send(true).expect("send shutdown");
-        let err = tokio::time::timeout(StdDuration::from_secs(5), join)
+        let shutdown_started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(StdDuration::from_millis(100), join)
             .await
-            .expect("interactive task should finish quickly")
+            .expect("interactive task should finish quickly after shutdown")
             .expect("interactive task join should succeed")
             .expect_err("shutdown should interrupt interactive process");
         assert!(error_has_context(&err, "codegen_retryable"));
+        assert!(
+            shutdown_started.elapsed() <= StdDuration::from_millis(100),
+            "interactive shutdown path exceeded 100ms"
+        );
 
         tokio::time::timeout(StdDuration::from_secs(5), async {
             while pid_alive(pid) {
@@ -1838,6 +1870,39 @@ mod tests {
             clamp_interactive_startup_timeout(StdDuration::from_secs(3 * 60 * 60)),
             INTERACTIVE_STARTUP_TIMEOUT_MAX
         );
+    }
+
+    #[test]
+    #[ignore = "loom model test; run explicitly when validating lock-free invariants"]
+    fn loom_child_cleanup_no_double_reap() {
+        loom::model(|| {
+            let state = LoomArc::new(LoomMutex::new(Some(())));
+            let reap_count = LoomArc::new(LoomAtomicUsize::new(0));
+
+            let state_a = LoomArc::clone(&state);
+            let count_a = LoomArc::clone(&reap_count);
+            let t1 = loom_thread::spawn(move || {
+                let mut lock = state_a.lock().expect("state lock");
+                if lock.take().is_some() {
+                    count_a.fetch_add(1, LoomOrdering::AcqRel);
+                }
+            });
+
+            let state_b = LoomArc::clone(&state);
+            let count_b = LoomArc::clone(&reap_count);
+            let t2 = loom_thread::spawn(move || {
+                let mut lock = state_b.lock().expect("state lock");
+                if lock.take().is_some() {
+                    count_b.fetch_add(1, LoomOrdering::AcqRel);
+                }
+            });
+
+            t1.join().expect("thread1 joined");
+            t2.join().expect("thread2 joined");
+
+            let total = reap_count.load(LoomOrdering::Acquire);
+            assert!(total <= 1, "reap action must happen at most once");
+        });
     }
 
     #[test]

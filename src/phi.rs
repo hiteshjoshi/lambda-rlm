@@ -65,6 +65,12 @@ const JOINSET_DRAIN_TIMEOUT_SECS: u64 = 5;
 const MAX_JOINSET_POOL: usize = 32;
 const AUTO_DETECT_MAX_TOKENS: u32 = 256;
 
+fn is_budget_exhausted_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("Call budget exhausted"))
+}
+
 fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
     cfg.joinset_pool
         .lock()
@@ -376,8 +382,13 @@ pub fn phi(
                             tracing::warn!(depth, child = idx, error = %e, "child failed, degrading");
                             eprintln!("{indent}|  child {idx} failed, degrading: {e}");
                         }
-                        Some(Ok((_idx, Err(e)))) => {
-                            // Depth 0: record error but drain remaining tasks
+                        Some(Ok((idx, Err(e)))) => {
+                            if is_budget_exhausted_error(&e) {
+                                tracing::warn!(depth, child = idx, error = %e, "budget exhausted in child, degrading");
+                                eprintln!("{indent}|  child {idx} budget exhausted, degrading");
+                                continue;
+                            }
+                            // Depth 0: record non-budget error but drain remaining tasks
                             // so their RAII guards drop cleanly.
                             fatal_error.get_or_insert(e);
                             abort_and_drain(&mut set, depth).await;
@@ -433,6 +444,7 @@ pub fn phi(
             shutdown_probe.has_changed().is_ok_and(|changed| changed)
         };
         if *cfg.shutdown.borrow() || shutdown_changed {
+            return_joinset(&cfg, set);
             return Err(anyhow::anyhow!(
                 "Graceful shutdown requested at depth {depth}"
             ));
