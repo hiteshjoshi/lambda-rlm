@@ -598,6 +598,10 @@ fn maybe_scavenge_codegen_single_flight() {
     }
 }
 
+pub fn run_codegen_maintenance() {
+    maybe_scavenge_codegen_single_flight();
+}
+
 fn flight_outcome_to_result(
     outcome: CodegenFlightResult,
     generator: &CodeGenerator,
@@ -1864,7 +1868,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn child_cleanup_drop_is_non_blocking() {
         let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("10")
+        cmd.arg("1000")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null());
@@ -1875,7 +1879,7 @@ mod tests {
         let start = StdInstant::now();
         drop(cleanup);
         assert!(
-            start.elapsed() < StdDuration::from_millis(50),
+            start.elapsed() < StdDuration::from_millis(10),
             "drop should not block runtime thread"
         );
     }

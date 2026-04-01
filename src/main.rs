@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, OwnedSemaphorePermit};
@@ -49,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 
 static INTERACTIVE_SESSION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static INTERACTIVE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INTERACTIVE_SESSION_LIVE: AtomicU64 = AtomicU64::new(0);
 const INTERACTIVE_SESSION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[must_use = "interactive session permit must be held for session lifetime"]
@@ -64,6 +65,7 @@ impl Drop for InteractiveSessionPermit {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if self.0.take().is_some() {
+                INTERACTIVE_SESSION_LIVE.fetch_sub(1, Ordering::AcqRel);
                 INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
             }
         }));
@@ -86,6 +88,7 @@ async fn acquire_interactive_session_permit(interactive: bool) -> Result<Interac
     .context("timed out waiting for interactive session permit")?
     .context("interactive session already in progress")?;
 
+    INTERACTIVE_SESSION_LIVE.fetch_add(1, Ordering::AcqRel);
     INTERACTIVE_SESSION_ACTIVE.store(true, Ordering::Release);
 
     Ok(InteractiveSessionPermit(Some(permit)))
@@ -909,11 +912,13 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
     while Instant::now() < deadline {
         let metrics = oracle.metrics();
         let codegen_guards = codegen::codegen_guard_live_counts();
+        let interactive_live = INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire);
         let live_total = metrics.budget_guards_live
             + metrics.inflight_guards_live
             + codegen_guards.budget
             + codegen_guards.flight
-            + codegen_guards.child_cleanup;
+            + codegen_guards.child_cleanup
+            + interactive_live;
         if live_total == 0 {
             return Ok(());
         }
@@ -939,6 +944,7 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
 
     let metrics = oracle.metrics();
     let codegen_guards = codegen::codegen_guard_live_counts();
+    let interactive_live = INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire);
     debug_assert_eq!(metrics.budget_guards_live, 0, "BudgetGuard leak detected");
     debug_assert_eq!(
         metrics.inflight_guards_live, 0,
@@ -950,13 +956,15 @@ async fn ensure_no_live_guards(oracle: &Arc<Oracle>, interactive_mode: bool) -> 
         codegen_guards.child_cleanup, 0,
         "ChildCleanup leak detected"
     );
+    debug_assert_eq!(interactive_live, 0, "InteractiveSessionPermit leak detected");
     anyhow::bail!(
-        "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={})",
+        "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_budget_guards_live={}, codegen_flight_guards_live={}, child_cleanup_guards_live={}, interactive_session_guards_live={})",
         metrics.budget_guards_live,
         metrics.inflight_guards_live,
         codegen_guards.budget,
         codegen_guards.flight,
-        codegen_guards.child_cleanup
+        codegen_guards.child_cleanup,
+        interactive_live,
     )
 }
 
@@ -1046,6 +1054,7 @@ async fn run() -> Result<()> {
                 tokio::select! {
                     _ = interval.tick() => {
                         oracle_cache.run_cache_maintenance();
+                        codegen::run_codegen_maintenance();
                     }
                     changed = maintenance_shutdown_rx.changed() => {
                         if changed.is_err() || *maintenance_shutdown_rx.borrow() {
@@ -1305,6 +1314,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_session_flag_tracks_permit_lifetime() {
         INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
+        INTERACTIVE_SESSION_LIVE.store(0, Ordering::Release);
         let permit = acquire_interactive_session_permit(true)
             .await
             .expect("interactive permit");
@@ -1312,10 +1322,47 @@ mod tests {
             INTERACTIVE_SESSION_ACTIVE.load(Ordering::Acquire),
             "interactive session flag should be set while permit is held"
         );
+        assert_eq!(
+            INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire),
+            1,
+            "interactive session live counter should increment while permit is held"
+        );
         drop(permit);
         assert!(
             !INTERACTIVE_SESSION_ACTIVE.load(Ordering::Acquire),
             "interactive session flag should clear after permit drop"
+        );
+        assert_eq!(
+            INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire),
+            0,
+            "interactive session live counter should clear after permit drop"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_session_permit_releases_on_task_abort() {
+        INTERACTIVE_SESSION_ACTIVE.store(false, Ordering::Release);
+        INTERACTIVE_SESSION_LIVE.store(0, Ordering::Release);
+
+        let hold = tokio::spawn(async {
+            let _permit = acquire_interactive_session_permit(true)
+                .await
+                .expect("interactive permit inside task");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        hold.abort();
+        let _ = hold.await;
+
+        let reacquired = acquire_interactive_session_permit(true)
+            .await
+            .expect("permit should be released after abort");
+        drop(reacquired);
+        assert_eq!(
+            INTERACTIVE_SESSION_LIVE.load(Ordering::Acquire),
+            0,
+            "interactive session live counter should not leak after abort"
         );
     }
 
