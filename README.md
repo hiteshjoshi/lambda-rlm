@@ -220,6 +220,7 @@ Hardening: circuit breaker (3 failures / 30s cooloff, in-memory), RAII budget gu
 
 Recent releases:
 
+- v3.16 (`108b289`): made interactive Claude/OpenCode sessions shutdown-aware by wiring the fix-loop shutdown channel into interactive child waits, racing process exit vs shutdown to avoid stuck sessions on SIGTERM/SIGINT, clamping interactive startup timeouts defensively (1..=120 minutes), and adding tests that prove shutdown-triggered child kill/reap behavior.
 - v3.15 (`a065094`): fixed interactive TTY hangs by keeping interactive generators in the foreground process group, split `--interactive-timeout` to startup probing only (no session hard-kill), and added interactive process tests for startup-timeout semantics and early non-success exits.
 - v3.14 (`ea8b71c`): removed codegen bulkhead/budget retention from interactive generator sessions so TTY-driven OpenCode/Claude runs no longer starve fix-loop concurrency, tightened interactive error classification (`codegen_retryable` timeout/wait and `codegen_fatal` spawn), and added JoinSet emptiness assertions after abort-drain/pool return.
 - v3.13 (`bedafe5`): removed interactive `spawn_blocking` polling in favor of direct Tokio child waits with async timeouts/reaping, and updated timeout coverage to exercise the interactive path without blocking-pool starvation.
