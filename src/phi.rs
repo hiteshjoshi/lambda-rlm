@@ -91,6 +91,34 @@ fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
     }));
 }
 
+struct JoinSetReturnGuard<'a> {
+    cfg: &'a PhiConfig,
+    set: Option<JoinSet<(usize, Result<String>)>>,
+}
+
+impl<'a> JoinSetReturnGuard<'a> {
+    fn new(cfg: &'a PhiConfig) -> Self {
+        Self {
+            cfg,
+            set: Some(checkout_joinset(cfg)),
+        }
+    }
+
+    fn set_mut(&mut self) -> &mut JoinSet<(usize, Result<String>)> {
+        self.set
+            .as_mut()
+            .expect("joinset guard must hold active set")
+    }
+}
+
+impl Drop for JoinSetReturnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            return_joinset(self.cfg, set);
+        }
+    }
+}
+
 async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) {
     set.abort_all();
     let drain = async {
@@ -342,12 +370,12 @@ pub fn phi(
 
         // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
         // Each spawn acquires a concurrency permit to bound total recursive tasks.
-        let mut set = checkout_joinset(&cfg);
+        let mut set_guard = JoinSetReturnGuard::new(&cfg);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let cfg = Arc::clone(&cfg);
             let sem = Arc::clone(&cfg.concurrency);
             eprintln!("{indent}|  child {}/{num_children}", i + 1);
-            set.spawn(async move {
+            set_guard.set_mut().spawn(async move {
                 // Acquire concurrency permit — blocks if too many tasks active
                 let permit = sem.acquire_owned().await.unwrap();
                 let result = phi(cfg, chunk, depth + 1, Some(permit)).await;
@@ -363,6 +391,7 @@ pub fn phi(
         let mut fatal_error: Option<anyhow::Error> = None;
 
         loop {
+            let set = set_guard.set_mut();
             tokio::select! {
                 biased;
                 // Shutdown takes priority — drain with timeout instead of
@@ -370,8 +399,7 @@ pub fn phi(
                 // complete their Drop before we return.
                 _ = shutdown_rx.changed() => {
                     tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children");
-                    abort_and_drain(&mut set, depth).await;
-                    return_joinset(&cfg, set);
+                    abort_and_drain(set, depth).await;
                     return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
                 }
                 join_result = set.join_next() => {
@@ -391,7 +419,7 @@ pub fn phi(
                             // Depth 0: record non-budget error but drain remaining tasks
                             // so their RAII guards drop cleanly.
                             fatal_error.get_or_insert(e);
-                            abort_and_drain(&mut set, depth).await;
+                            abort_and_drain(set, depth).await;
                             break;
                         }
                         Some(Err(join_err)) if join_err.is_cancelled() => {
@@ -403,7 +431,7 @@ pub fn phi(
                         }
                         Some(Err(join_err)) => {
                             fatal_error.get_or_insert_with(|| anyhow::anyhow!("Child task failed: {join_err}"));
-                            abort_and_drain(&mut set, depth).await;
+                            abort_and_drain(set, depth).await;
                             break;
                         }
                     }
@@ -412,7 +440,6 @@ pub fn phi(
         }
 
         if let Some(e) = fatal_error {
-            return_joinset(&cfg, set);
             return Err(e);
         }
 
@@ -421,7 +448,6 @@ pub fn phi(
             indexed_results.into_iter().map(|(_, text)| text).collect();
 
         if child_results.is_empty() {
-            return_joinset(&cfg, set);
             return Ok(format!(
                 "[degraded: all {} children failed at depth {depth}]",
                 num_children
@@ -444,7 +470,6 @@ pub fn phi(
             shutdown_probe.has_changed().is_ok_and(|changed| changed)
         };
         if *cfg.shutdown.borrow() || shutdown_changed {
-            return_joinset(&cfg, set);
             return Err(anyhow::anyhow!(
                 "Graceful shutdown requested at depth {depth}"
             ));
@@ -460,8 +485,6 @@ pub fn phi(
             cfg.max_tokens,
         )
         .await;
-
-        return_joinset(&cfg, set);
 
         // Graceful degradation for neural reduce failures
         match reduce_result {

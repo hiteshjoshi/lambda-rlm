@@ -818,6 +818,17 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
 fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
     let metrics = oracle.metrics();
     let codegen_guards = codegen::codegen_guard_live_counts();
+    debug_assert_eq!(metrics.budget_guards_live, 0, "BudgetGuard leak detected");
+    debug_assert_eq!(
+        metrics.inflight_guards_live, 0,
+        "InflightGuard leak detected"
+    );
+    debug_assert_eq!(codegen_guards.budget, 0, "CodegenBudgetGuard leak detected");
+    debug_assert_eq!(codegen_guards.flight, 0, "CodegenFlightGuard leak detected");
+    debug_assert_eq!(
+        codegen_guards.child_cleanup, 0,
+        "ChildCleanup leak detected"
+    );
     if metrics.budget_guards_live > 0
         || metrics.inflight_guards_live > 0
         || codegen_guards.budget > 0

@@ -43,6 +43,7 @@ const MAX_CODEGEN_BULKHEAD_PERMITS: usize = 64;
 const CODEGEN_CACHE_SCHEMA_VERSION: u8 = 1;
 const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
+const CODEGEN_SINGLE_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_STARTUP_TIMEOUT_MIN: Duration = Duration::from_secs(60);
 const INTERACTIVE_STARTUP_TIMEOUT_MAX: Duration = Duration::from_secs(120 * 60);
 const INTERACTIVE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -201,6 +202,7 @@ pub async fn run_code_generator(
     interactive_timeout: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
+    validate_codegen_work_dir(work_dir)?;
     maybe_scavenge_codegen_single_flight();
     let flight_key = codegen_flight_key(
         generator,
@@ -211,6 +213,7 @@ pub async fn run_code_generator(
         interactive,
     );
     let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
+    let _ = evict_stale_codegen_flights(flights);
 
     loop {
         match flights.entry(flight_key.clone()) {
@@ -223,19 +226,20 @@ pub async fn run_code_generator(
                     return flight_outcome_to_result(outcome, generator);
                 }
 
-                if rx.changed().await.is_err() {
-                    return Err(anyhow::anyhow!("code generation unavailable").context(
-                        match generator {
-                            CodeGenerator::Claude => "claude_service_unavailable",
-                            CodeGenerator::Opencode => "opencode_service_unavailable",
-                        },
-                    ));
+                match tokio::time::timeout(CODEGEN_SINGLE_FLIGHT_WAIT_TIMEOUT, rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = flights.remove(&flight_key);
+                        continue;
+                    }
                 }
 
                 let resolved = { rx.borrow().clone() };
                 if let Some(outcome) = resolved {
                     return flight_outcome_to_result(outcome, generator);
                 }
+                let _ = flights.remove(&flight_key);
+                continue;
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let (tx, _rx) = watch::channel::<Option<CodegenFlightResult>>(None);
@@ -269,6 +273,28 @@ pub async fn run_code_generator(
             }
         }
     }
+}
+
+fn validate_codegen_work_dir(work_dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(work_dir)
+        .with_context(|| format!("failed to inspect work directory {}", work_dir.display()))?;
+    anyhow::ensure!(meta.is_dir(), "work directory is not a directory");
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "refusing symlink work directory"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(work_dir)
+            .with_context(|| format!("refusing unsafe work directory {}", work_dir.display()))?;
+    }
+
+    Ok(())
 }
 
 async fn run_code_generator_once(
@@ -954,31 +980,46 @@ impl Drop for ChildCleanup {
     fn drop(&mut self) {
         CHILD_CLEANUP_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(mut child) = self.child.take() {
-                let _ = std::thread::Builder::new()
-                    .name("codegen-child-reaper".to_owned())
-                    .spawn(move || {
-                        let _ = child.start_kill();
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        loop {
-                            match child.try_wait() {
-                                Ok(Some(_)) => break,
-                                Ok(None) => {
-                                    if std::time::Instant::now() >= deadline {
-                                        break;
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(20));
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    });
+            if let Some(child) = self.child.take() {
+                spawn_background_child_reap(child);
             }
         }));
     }
+}
+
+async fn kill_and_reap_owned(mut child: tokio::process::Child, wait_timeout: Duration) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(wait_timeout, child.wait()).await;
+}
+
+fn spawn_background_child_reap(mut child: tokio::process::Child) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            kill_and_reap_owned(child, CHILD_REAP_TIMEOUT).await;
+        });
+        return;
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("codegen-child-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.start_kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
 }
 
 async fn read_stream_bounded<R>(mut reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
@@ -1872,6 +1913,17 @@ mod tests {
         .await
         .expect_err("session timeout should terminate hanging interactive process");
         assert!(error_has_context(&err, "codegen_retryable"));
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if codegen_guard_live_counts().child_cleanup == 0 {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("child cleanup guards should drain after timeout");
     }
 
     #[test]

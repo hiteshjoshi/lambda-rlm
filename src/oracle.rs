@@ -1341,4 +1341,47 @@ mod tests {
             assert_eq!(slot.load(LoomOrdering::Acquire), 0);
         });
     }
+
+    #[test]
+    #[ignore = "loom model test; run explicitly when validating lock-free invariants"]
+    fn inflight_guard_drops_on_leader_panic() {
+        struct PanicInflightGuard {
+            slot: LoomArc<AtomicUsize>,
+            live: LoomArc<AtomicUsize>,
+        }
+
+        impl Drop for PanicInflightGuard {
+            fn drop(&mut self) {
+                self.slot.store(0, LoomOrdering::Release);
+                self.live.fetch_sub(1, LoomOrdering::AcqRel);
+            }
+        }
+
+        loom::model(|| {
+            let slot = LoomArc::new(AtomicUsize::new(0));
+            let live = LoomArc::new(AtomicUsize::new(0));
+
+            let leader_slot = LoomArc::clone(&slot);
+            let leader_live = LoomArc::clone(&live);
+            let leader = loom_thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if leader_slot
+                        .compare_exchange(0, 1, LoomOrdering::AcqRel, LoomOrdering::Acquire)
+                        .is_ok()
+                    {
+                        leader_live.fetch_add(1, LoomOrdering::AcqRel);
+                        let _guard = PanicInflightGuard {
+                            slot: LoomArc::clone(&leader_slot),
+                            live: LoomArc::clone(&leader_live),
+                        };
+                        panic!("simulated leader panic");
+                    }
+                }));
+            });
+
+            leader.join().unwrap();
+            assert_eq!(live.load(LoomOrdering::Acquire), 0);
+            assert_eq!(slot.load(LoomOrdering::Acquire), 0);
+        });
+    }
 }
