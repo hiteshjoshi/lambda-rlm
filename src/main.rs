@@ -331,14 +331,21 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         .with_context(|| format!("Cannot resolve path: {}", path.display()))?;
 
     if canonical_root.is_file() {
-        let (_, file_size, _, _) = open_file_no_follow(&canonical_root)
+        let fd_semaphore = Arc::clone(
+            FD_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_OPEN_FILES))),
+        );
+        let fd_permit = fd_semaphore
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("fd limit reached while collecting source file"))?;
+        let (file, file_size, _, _) = open_file_no_follow(&canonical_root)
             .ok_or_else(|| anyhow::anyhow!("Cannot safely open {}", canonical_root.display()))?;
         let oversized = file_size > MAX_AGGREGATE_BYTES;
         let mut out = format!("// === {} ===\n", path.display());
-        let (mut file, _, _, _) = open_file_no_follow(&canonical_root)
-            .ok_or_else(|| anyhow::anyhow!("Failed to open {}", canonical_root.display()))?;
+        let mut guarded = GuardedFile::new(file, fd_permit);
         use std::io::Read;
-        file.read_to_string(&mut out)
+        guarded
+            .file_mut()?
+            .read_to_string(&mut out)
             .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
         if oversized {
             let mut end = MAX_AGGREGATE_BYTES as usize;
