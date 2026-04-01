@@ -13,6 +13,11 @@ use crate::types::TaskType;
 use anyhow::Result;
 use std::sync::Arc;
 
+/// Maximum cross-product pairs sent to the neural comparison at depth 0.
+/// Limits prompt size to prevent context-window overflow on large aggregate results.
+/// The paper does not specify a limit; this is a practical guard.
+const MAX_PAIRWISE_COMPARISONS: usize = 50;
+
 /// Filter empty and degraded-marker results before reduction.
 /// Light-weight: refusal detection is done upstream by Verifier.
 fn filter_nonempty(results: Vec<String>) -> Vec<String> {
@@ -216,7 +221,7 @@ async fn reduce_pairwise_top(
 
     let pair_text: String = pairs
         .iter()
-        .take(50)
+        .take(MAX_PAIRWISE_COMPARISONS)
         .enumerate()
         .map(|(i, (a, b))| format!("Pair {}:\n  A: {}\n  B: {}", i + 1, a, b))
         .collect::<Vec<_>>()
@@ -230,7 +235,7 @@ async fn reduce_pairwise_top(
          Total pairs: {} (showing first {}). \
          Report findings as bullet points.",
         pairs.len(),
-        pairs.len().min(50)
+        pairs.len().min(MAX_PAIRWISE_COMPARISONS)
     );
 
     oracle.call(system, &user, max_tokens).await

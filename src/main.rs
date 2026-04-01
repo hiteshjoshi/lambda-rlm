@@ -818,8 +818,16 @@ async fn run_analysis(
                 }
             }
             if plan.total_calls > available {
-                anyhow::bail!(
-                    "Admission declined: worst-case execution needs {} calls but only {} budget remaining. Reduce input size, increase --max-calls, or use a smaller k/depth.",
+                // Section 4.2: graceful degradation — warn and proceed with best-effort.
+                // Runtime phi-level budget checks (phi.rs budget_try_reserve) will
+                // degrade individual branches instead of crashing the whole tree.
+                tracing::warn!(
+                    planned = plan.total_calls,
+                    available,
+                    "budget insufficient after replanning, proceeding with best-effort degradation"
+                );
+                warn_msg!(
+                    "Budget insufficient: plan needs {} calls but only {} available. Proceeding with best-effort partial execution (Section 4.2 graceful degradation).",
                     plan.total_calls,
                     available
                 );
@@ -902,17 +910,21 @@ async fn run_analysis(
     });
 
     // ── Phase 5: Execute Φ ──
-    // Admission control: reject work that cannot complete given available budget.
-    // Calculate worst-case cost (all leaves at max depth) and compare to budget.
-    // This prevents spawning thousands of tasks that exhaust budget mid-tree,
-    // wasting CPU and leaving zombie tasks.
+    // Section 4.2 graceful degradation: warn if budget is insufficient but proceed
+    // with best-effort execution. Runtime phi-level budget checks (phi.rs:358-377)
+    // degrade individual branches when budget exhausts mid-tree, rather than
+    // fatally rejecting the entire request up-front.
     if !oracle.budget_unlimited() {
         let worst_case = plan.total_calls;
         let available = oracle.budget_remaining();
         if worst_case > available {
-            anyhow::bail!(
-                "Admission declined: worst-case execution needs {} calls but only {} budget remaining. \
-                 Reduce input size, increase --max-calls, or use a smaller k/depth.",
+            tracing::warn!(
+                worst_case,
+                available,
+                "budget may be insufficient, proceeding with best-effort degradation per Section 4.2"
+            );
+            warn_msg!(
+                "Budget warning: worst-case {} calls but only {} available. Branches will degrade gracefully.",
                 worst_case, available
             );
         }
