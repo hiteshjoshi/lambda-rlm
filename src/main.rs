@@ -196,7 +196,7 @@ struct Cli {
     opencode: bool,
 
     /// Max fix iterations when using --claude or --opencode (0 = unlimited)
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "10")]
     max_iterations: usize,
 }
 
@@ -855,32 +855,32 @@ async fn run() -> Result<()> {
         std::fs::canonicalize(&cli.path)?
     };
 
-    let unlimited_iterations = cli.max_iterations == 0;
-    if unlimited_iterations {
+    const FIX_LOOP_HARD_MAX_ITERATIONS: usize = 10;
+    let max_iter = match cli.max_iterations {
+        0 => {
+            eprintln!(
+                ">>> --max-iterations=0 requested; clamping to safe cap {}",
+                FIX_LOOP_HARD_MAX_ITERATIONS
+            );
+            FIX_LOOP_HARD_MAX_ITERATIONS
+        }
+        n => n.min(FIX_LOOP_HARD_MAX_ITERATIONS),
+    };
+    if cli.max_iterations > FIX_LOOP_HARD_MAX_ITERATIONS {
         eprintln!(
-            ">>> --max-iterations=0 requested; running until clean, shutdown, or budget exhaustion"
+            ">>> --max-iterations={} exceeds safe cap {}; clamping",
+            cli.max_iterations, FIX_LOOP_HARD_MAX_ITERATIONS
         );
     }
 
-    let mut iteration: usize = 1;
-    let mut reached_iteration_limit = false;
-    loop {
-        if !unlimited_iterations && iteration > cli.max_iterations {
-            reached_iteration_limit = true;
-            break;
-        }
-
+    for iteration in 1..=max_iter {
         if *shutdown_rx.borrow() {
             eprintln!("\n>>> Shutdown requested; stopping fix loop.");
             break;
         }
 
         eprintln!("\n================================================================");
-        if unlimited_iterations {
-            eprintln!("  ITERATION {iteration} (unbounded)");
-        } else {
-            eprintln!("  ITERATION {iteration}/{}", cli.max_iterations);
-        }
+        eprintln!("  ITERATION {iteration}/{max_iter}");
         eprintln!("================================================================\n");
 
         // 1. Analyze
@@ -926,19 +926,13 @@ async fn run() -> Result<()> {
             eprintln!(">>> Budget exhausted. Terminating fix loop.");
             break;
         }
-
-        iteration = iteration
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("iteration counter overflow"))?;
     }
 
-    if reached_iteration_limit {
-        eprintln!(
-            "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
-            cli.max_iterations, generator
-        );
-        eprintln!(">>> Run again to continue if needed.");
-    }
+    eprintln!(
+        "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
+        max_iter, generator
+    );
+    eprintln!(">>> Run again to continue if needed.");
     ensure_no_live_guards(&oracle)?;
     Ok(())
 }
@@ -989,12 +983,6 @@ mod tests {
             format!("{err:#}").contains("opencode binary not in PATH"),
             "unexpected preflight error: {err:#}"
         );
-    }
-
-    #[test]
-    fn cli_defaults_to_unlimited_fix_iterations() {
-        let cli = Cli::parse_from(["lambda_rlm", "--path", ".", "--question", "smoke"]);
-        assert_eq!(cli.max_iterations, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

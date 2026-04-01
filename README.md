@@ -176,7 +176,7 @@ Six task types, each with specialized leaf prompts and reduce operators:
 | `--max-tokens` | `8192` | Max output tokens |
 | `--claude` | `false` | Enable fix loop with Claude Code |
 | `--opencode` | `false` | Enable fix loop with OpenCode |
-| `--max-iterations` | `0` | Fix loop iterations (0 = unlimited) |
+| `--max-iterations` | `10` | Fix loop iterations (0 = unlimited) |
 | `--dry-run` | `false` | No API calls |
 | `--no-cache` | `false` | Disable replay cache |
 | `--timeout` | `120` | Per-call timeout (seconds) |
