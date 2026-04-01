@@ -315,7 +315,8 @@ impl FireworksProvider {
 fn sanitize_error_text(input: &str) -> String {
     let mut out = input.to_owned();
     for (name, value) in std::env::vars() {
-        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        let looks_sensitive =
+            name == "FIREWORKS_API" || name.starts_with("OPENCODE_") || name == "CLAUDE_API_KEY";
         if looks_sensitive && !value.is_empty() {
             out = out.replace(&value, "[REDACTED]");
         }

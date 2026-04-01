@@ -236,6 +236,7 @@ pub fn merge_dedup(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[must_use]
 pub fn merge_dedup_arc(items: Vec<Arc<str>>) -> Vec<Arc<str>> {
     let mut seen = std::collections::BTreeSet::new();
     items

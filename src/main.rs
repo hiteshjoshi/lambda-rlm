@@ -315,8 +315,8 @@ impl GuardedFile {
 
 impl Drop for GuardedFile {
     fn drop(&mut self) {
-        let _ = self.file.take();
         let _ = self.permit.take();
+        let _ = self.file.take();
     }
 }
 
@@ -734,7 +734,8 @@ fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
 fn sanitize_error(error: &anyhow::Error) -> String {
     let mut detail = format!("{error:?}");
     for (name, value) in std::env::vars() {
-        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        let looks_sensitive =
+            name == "FIREWORKS_API" || name.starts_with("OPENCODE_") || name == "CLAUDE_API_KEY";
         if looks_sensitive && !value.is_empty() {
             detail = detail.replace(&value, "[REDACTED]");
         }
@@ -927,4 +928,78 @@ async fn run() -> Result<()> {
     eprintln!(">>> Run again to continue if needed.");
     ensure_no_live_guards(&oracle)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = self.prior.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_generator_access_fails_fast_when_opencode_missing_from_path() {
+        let _guard = env_lock().lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let empty_path = temp.path().to_string_lossy().to_string();
+        let _path = ScopedEnvVar::set("PATH", &empty_path);
+
+        let err = validate_generator_access(&types::CodeGenerator::Opencode)
+            .expect_err("missing opencode should fail preflight");
+        assert!(
+            format!("{err:#}").contains("opencode binary not in PATH"),
+            "unexpected preflight error: {err:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guarded_file_drop_releases_permit_during_unwind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("guarded.txt");
+        std::fs::write(&file_path, "ok").expect("seed file");
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("acquire permit");
+        let file = std::fs::File::open(&file_path).expect("open file");
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guarded = GuardedFile::new(file, permit);
+            panic!("simulate panic after GuardedFile construction");
+        }));
+        assert!(unwind.is_err());
+
+        let recovered = Arc::clone(&sem)
+            .try_acquire_owned()
+            .expect("fd permit should be returned by Drop");
+        drop(recovered);
+    }
 }

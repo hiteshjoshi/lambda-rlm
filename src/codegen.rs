@@ -16,7 +16,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     sync::OnceLock,
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{watch, Semaphore};
@@ -43,10 +43,18 @@ const CLAUDE_MAX_CONCURRENT: usize = 4;
 const OPENCODE_MAX_CONCURRENT: usize = 2;
 const MAX_CODEGEN_BULKHEAD_PERMITS: usize = 64;
 const CODEGEN_CACHE_SCHEMA_VERSION: u8 = 1;
+const CODEGEN_SINGLE_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
+const CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL: Duration = Duration::from_secs(60);
 static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 type CodegenFlightResult = Result<Arc<str>, Arc<str>>;
 type CodegenFlightSender = Arc<watch::Sender<Option<CodegenFlightResult>>>;
-static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightSender>> = OnceLock::new();
+static CODEGEN_SINGLE_FLIGHT: OnceLock<DashMap<String, CodegenFlightEntry>> = OnceLock::new();
+static CODEGEN_SINGLE_FLIGHT_LAST_SCAVENGE_SECS: AtomicU64 = AtomicU64::new(0);
+
+struct CodegenFlightEntry {
+    sender: CodegenFlightSender,
+    inserted_at: Instant,
+}
 
 pub fn codegen_guard_live_count() -> u64 {
     CODEGEN_GUARD_LIVE_COUNT.load(Ordering::Acquire)
@@ -167,13 +175,14 @@ pub async fn run_code_generator(
     question: &str,
     iteration: usize,
 ) -> Result<Arc<str>> {
+    maybe_scavenge_codegen_single_flight();
     let flight_key = codegen_flight_key(generator, work_dir, question, iteration, result);
     let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
 
     loop {
         match flights.entry(flight_key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                let mut rx = entry.get().subscribe();
+                let mut rx = entry.get().sender.subscribe();
                 let existing = rx.borrow().clone();
                 drop(entry);
 
@@ -198,7 +207,10 @@ pub async fn run_code_generator(
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let (tx, _rx) = watch::channel::<Option<CodegenFlightResult>>(None);
                 let tx: CodegenFlightSender = Arc::new(tx);
-                entry.insert(Arc::clone(&tx));
+                entry.insert(CodegenFlightEntry {
+                    sender: Arc::clone(&tx),
+                    inserted_at: Instant::now(),
+                });
 
                 let _flight_guard = CodegenFlightGuard {
                     flights,
@@ -293,7 +305,7 @@ async fn run_code_generator_once(
 }
 
 struct CodegenFlightGuard<'a> {
-    flights: &'a DashMap<String, CodegenFlightSender>,
+    flights: &'a DashMap<String, CodegenFlightEntry>,
     key: String,
 }
 
@@ -316,7 +328,46 @@ fn codegen_flight_key(
     hasher.update(question.as_bytes());
     hasher.update(&iteration.to_le_bytes());
     hasher.update(result.as_bytes());
-    format!("codegen:{}", hasher.finalize().to_hex())
+    format!("{}:{}", generator, hasher.finalize().to_hex())
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn evict_stale_codegen_flights(flights: &DashMap<String, CodegenFlightEntry>) -> usize {
+    let mut removed = 0usize;
+    flights.retain(|_key, entry| {
+        let keep = entry.inserted_at.elapsed() <= CODEGEN_SINGLE_FLIGHT_TTL;
+        if !keep {
+            removed += 1;
+        }
+        keep
+    });
+    removed
+}
+
+fn maybe_scavenge_codegen_single_flight() {
+    let now = now_unix_secs();
+    let last = CODEGEN_SINGLE_FLIGHT_LAST_SCAVENGE_SECS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < CODEGEN_SINGLE_FLIGHT_SCAVENGE_INTERVAL.as_secs() {
+        return;
+    }
+    if CODEGEN_SINGLE_FLIGHT_LAST_SCAVENGE_SECS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
+    let removed = evict_stale_codegen_flights(flights);
+    if removed > 0 {
+        tracing::warn!(removed, "evicted stale codegen single-flight entries");
+    }
 }
 
 fn flight_outcome_to_result(
@@ -759,20 +810,25 @@ impl Drop for ChildCleanup {
                 return;
             }
 
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            break;
+            let _ = std::thread::Builder::new()
+                .name("codegen-child-reaper".to_owned())
+                .spawn(move || {
+                    let _ = child.start_kill();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            Err(_) => break,
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    Err(_) => break,
-                }
-            }
+                });
+            return;
         }
     }
 }
@@ -820,7 +876,8 @@ fn classify_non_success_exit(
 fn sanitize_generator_stderr(input: &str) -> String {
     let mut out = input.to_owned();
     for (name, value) in std::env::vars() {
-        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        let looks_sensitive =
+            name == "FIREWORKS_API" || name.starts_with("OPENCODE_") || name == "CLAUDE_API_KEY";
         if looks_sensitive && !value.is_empty() {
             out = out.replace(&value, "[REDACTED]");
         }
@@ -1169,6 +1226,29 @@ mod tests {
     }
 
     #[test]
+    fn codegen_flight_key_is_generator_prefixed() {
+        let key = codegen_flight_key(&CodeGenerator::Opencode, Path::new("/tmp"), "q", 1, "r");
+        assert!(key.starts_with("opencode:"));
+    }
+
+    #[test]
+    fn stale_single_flight_entries_are_evicted() {
+        let flights = DashMap::new();
+        let (tx, _rx) = watch::channel::<Option<CodegenFlightResult>>(None);
+        flights.insert(
+            "stale".to_string(),
+            CodegenFlightEntry {
+                sender: Arc::new(tx),
+                inserted_at: Instant::now() - (CODEGEN_SINGLE_FLIGHT_TTL + Duration::from_secs(1)),
+            },
+        );
+
+        let removed = evict_stale_codegen_flights(&flights);
+        assert_eq!(removed, 1);
+        assert!(flights.is_empty());
+    }
+
+    #[test]
     fn extract_result_treats_empty_stdout_as_degraded() {
         let summary = CodeGenerator::Opencode
             .extract_result(b"   \n\n")
@@ -1197,6 +1277,16 @@ mod tests {
 
         assert!(error_has_context(&retryable, "codegen_retryable"));
         assert!(error_has_context(&fatal, "codegen_fatal"));
+    }
+
+    #[test]
+    fn sanitize_generator_stderr_redacts_claude_api_key() {
+        let needle = "unit-test-claude-secret";
+        std::env::set_var("CLAUDE_API_KEY", needle);
+        let sanitized = sanitize_generator_stderr(&format!("boom {needle}"));
+        std::env::remove_var("CLAUDE_API_KEY");
+        assert!(!sanitized.contains(needle));
+        assert!(sanitized.contains("[REDACTED]"));
     }
 
     #[test]
