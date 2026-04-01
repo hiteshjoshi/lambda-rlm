@@ -291,7 +291,7 @@ impl Cli {
 /// 256MB aligns with Phi's hard input limit and prevents oversized ingest.
 const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OPEN_FILES: usize = 1024;
-static FD_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static FD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn collect_source_files(path: &PathBuf) -> Result<String> {
     let extensions = [
@@ -304,12 +304,12 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         .with_context(|| format!("Cannot resolve path: {}", path.display()))?;
 
     if canonical_root.is_file() {
-        let meta = std::fs::metadata(&canonical_root)
-            .with_context(|| format!("Cannot stat {}", canonical_root.display()))?;
-        let oversized = meta.len() > MAX_AGGREGATE_BYTES;
+        let (_, file_size, _, _) = open_file_no_follow(&canonical_root)
+            .ok_or_else(|| anyhow::anyhow!("Cannot safely open {}", canonical_root.display()))?;
+        let oversized = file_size > MAX_AGGREGATE_BYTES;
         let mut out = format!("// === {} ===\n", path.display());
-        let mut file = std::fs::File::open(&canonical_root)
-            .with_context(|| format!("Failed to open {}", canonical_root.display()))?;
+        let (mut file, _, _, _) = open_file_no_follow(&canonical_root)
+            .ok_or_else(|| anyhow::anyhow!("Failed to open {}", canonical_root.display()))?;
         use std::io::Read;
         file.read_to_string(&mut out)
             .with_context(|| format!("Failed to read {}", canonical_root.display()))?;
@@ -411,10 +411,10 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
             }
 
             // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
-            let fd_permit = match FD_SEMAPHORE
-                .get_or_init(|| tokio::sync::Semaphore::new(MAX_OPEN_FILES))
-                .try_acquire()
-            {
+            let fd_semaphore = Arc::clone(
+                FD_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_OPEN_FILES))),
+            );
+            let fd_permit = match fd_semaphore.try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
                     tracing::warn!(
@@ -447,12 +447,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                 #[cfg(not(unix))]
                 let _ = (open_dev, open_ino);
 
-                let next_total = accumulated_bytes.checked_add(size).with_context(|| {
-                    format!(
-                        "Aggregate size overflow while scanning {}",
-                        file_path.display()
-                    )
-                })?;
+                let next_total = accumulated_bytes.saturating_add(size);
                 if next_total > MAX_AGGREGATE_BYTES {
                     let omitted = next_total - MAX_AGGREGATE_BYTES;
                     tracing::warn!(
@@ -699,13 +694,27 @@ fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
 
 fn sanitize_error(error: &anyhow::Error) -> String {
     let mut detail = format!("{error:?}");
-    if let Ok(api_key) = std::env::var("FIREWORKS_API") {
-        if !api_key.is_empty() {
-            detail = detail.replace(&api_key, "[REDACTED]");
+    for (name, value) in std::env::vars() {
+        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        if looks_sensitive && !value.is_empty() {
+            detail = detail.replace(&value, "[REDACTED]");
         }
     }
     tracing::error!(error = %detail, "request failed");
     "Not Found".to_string()
+}
+
+fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
+    let metrics = oracle.metrics();
+    let codegen_guards_live = codegen::codegen_guard_live_count();
+    if metrics.budget_guards_live > 0 || codegen_guards_live > 0 {
+        anyhow::bail!(
+            "resource leak detected at shutdown (budget_guards_live={}, codegen_guards_live={})",
+            metrics.budget_guards_live,
+            codegen_guards_live
+        );
+    }
+    Ok(())
 }
 
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
@@ -787,6 +796,7 @@ async fn run() -> Result<()> {
         // Single-shot mode: analyze and print
         let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
         println!("{result}");
+        ensure_no_live_guards(&oracle)?;
         return Ok(());
     }
     let generator = generator.unwrap();
@@ -840,6 +850,7 @@ async fn run() -> Result<()> {
         if is_clean {
             eprintln!("\n>>> Analysis came back clean. Nothing to fix.");
             println!("{result}");
+            ensure_no_live_guards(&oracle)?;
             return Ok(());
         }
 
@@ -875,12 +886,6 @@ async fn run() -> Result<()> {
         max_iter, generator
     );
     eprintln!(">>> Run again to continue if needed.");
-    let codegen_guards_live = codegen::codegen_guard_live_count();
-    if codegen_guards_live > 0 {
-        tracing::error!(
-            codegen_guards_live,
-            "LEAK: CodegenBudgetGuard instances still live at shutdown"
-        );
-    }
+    ensure_no_live_guards(&oracle)?;
     Ok(())
 }

@@ -314,9 +314,10 @@ impl FireworksProvider {
 
 fn sanitize_error_text(input: &str) -> String {
     let mut out = input.to_owned();
-    if let Ok(api_key) = std::env::var("FIREWORKS_API") {
-        if !api_key.is_empty() {
-            out = out.replace(&api_key, "[REDACTED]");
+    for (name, value) in std::env::vars() {
+        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        if looks_sensitive && !value.is_empty() {
+            out = out.replace(&value, "[REDACTED]");
         }
     }
     out
@@ -947,6 +948,12 @@ impl Oracle {
                     "    OpenCode avg lat.: {:.1}ms/call\n",
                     codegen_opencode_latency_ms as f64 / codegen_opencode_calls as f64
                 ),
+            );
+        }
+        if leaked_budget_guards > 0 {
+            tracing::error!(
+                leaked_budget_guards,
+                "LEAK: BudgetGuard instances still live"
             );
         }
         let corruptions = self.cache.corruption_count();

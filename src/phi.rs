@@ -21,8 +21,8 @@ use crate::types::TaskType;
 use crate::verify::{Verifier, VerifyResult};
 use anyhow::Result;
 use futures::future::BoxFuture;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -74,11 +74,13 @@ fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
 
 fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
     set.detach_all();
-    if let Ok(mut pool) = cfg.joinset_pool.lock() {
-        if pool.len() < MAX_JOINSET_POOL {
-            pool.push(set);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(mut pool) = cfg.joinset_pool.lock() {
+            if pool.len() < MAX_JOINSET_POOL {
+                pool.push(set);
+            }
         }
-    }
+    }));
 }
 
 async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) {

@@ -28,6 +28,8 @@ const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 const CODEGEN_BUDGET_UNITS: usize = 50;
 const RESULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const LOG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INLINE_ANALYSIS_BYTES: usize = 128 * 1024;
 const CLAUDE_CB_THRESHOLD: usize = 3;
 const CLAUDE_CB_COOLDOWN: Duration = Duration::from_secs(60);
 const OPENCODE_CB_THRESHOLD: usize = 2;
@@ -114,6 +116,32 @@ fn build_prompt(question: &str, iteration: usize) -> String {
          5. If there is nothing actionable (only informational notes or the analysis is clean), \
             output exactly: CLEAN\n\n\
          Start by reading .lambda-rlm-result.md now.",
+    )
+}
+
+fn build_prompt_with_inline_result(question: &str, iteration: usize, result: &str) -> String {
+    let mut inline = result.to_owned();
+    if inline.len() > MAX_INLINE_ANALYSIS_BYTES {
+        let mut end = MAX_INLINE_ANALYSIS_BYTES;
+        while end > 0 && !inline.is_char_boundary(end) {
+            end -= 1;
+        }
+        inline.truncate(end);
+        inline.push_str("\n\n[TRUNCATED: source analysis clipped due to storage constraints]");
+    }
+
+    format!(
+        "Read this analysis directly (result file unavailable due to disk constraints) — it's iteration {iteration} of a λ-RLM \
+         fix loop for the question: \"{question}\".\n\n\
+         --- BEGIN ANALYSIS ---\n{inline}\n--- END ANALYSIS ---\n\n\
+         Your job:\n\
+         1. Read the findings carefully.\n\
+         2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
+         3. When done, output a single line summary of what you changed.\n\
+         4. Do a proper git commit(non-signed)\n\
+         5. Update readme with commit id and change-log\n\
+         5. If there is nothing actionable (only informational notes or the analysis is clean), \
+            output exactly: CLEAN"
     )
 }
 
@@ -285,6 +313,50 @@ async fn write_result_file_atomically(
     .await
     .context("Result file writer task timed out")?
     .context("Result file writer task failed")??;
+
+    Ok(())
+}
+
+fn is_storage_full_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::StorageFull;
+        }
+        let lower = cause.to_string().to_ascii_lowercase();
+        lower.contains("no space left") || lower.contains("disk full")
+    })
+}
+
+async fn write_log_file_atomically(log_file: &Path, content: &str) -> Result<()> {
+    let log_path = log_file.to_path_buf();
+    let parent = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("log file has no parent"))?
+        .to_path_buf();
+    let content = content.to_owned();
+
+    tokio::time::timeout(
+        LOG_WRITE_TIMEOUT,
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if log_path.exists() {
+                let _ = open_file_no_follow(&log_path)?;
+            }
+            let mut tmp = tempfile::NamedTempFile::new_in(&parent)?;
+            tmp.write_all(content.as_bytes())?;
+            tmp.as_file_mut().sync_all()?;
+            let persisted = tmp.persist(&log_path).map_err(|e| {
+                anyhow::anyhow!("Failed to move {}: {}", log_path.display(), e.error)
+            })?;
+            persisted.sync_all()?;
+            if let Ok(dir) = std::fs::File::open(&parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }),
+    )
+    .await
+    .context("log file writer task timed out")?
+    .context("log file writer task failed")??;
 
     Ok(())
 }
@@ -527,6 +599,17 @@ fn classify_non_success_exit(
     }
 }
 
+fn sanitize_generator_stderr(input: &str) -> String {
+    let mut out = input.to_owned();
+    for (name, value) in std::env::vars() {
+        let looks_sensitive = name == "FIREWORKS_API" || name.starts_with("OPENCODE_");
+        if looks_sensitive && !value.is_empty() {
+            out = out.replace(&value, "[REDACTED]");
+        }
+    }
+    out
+}
+
 async fn run_generator_process(
     mut cmd: tokio::process::Command,
     generator: &CodeGenerator,
@@ -627,7 +710,15 @@ async fn run_claude(
     question: &str,
     iteration: usize,
 ) -> Result<Arc<str>> {
-    write_result_file_atomically(work_dir, result, iteration).await?;
+    let mut wrote_result_file = true;
+    if let Err(error) = write_result_file_atomically(work_dir, result, iteration).await {
+        if is_storage_full_error(&error) {
+            tracing::warn!(iteration, error = %error, "disk full writing result file; falling back to in-memory prompt");
+            wrote_result_file = false;
+        } else {
+            return Err(error);
+        }
+    }
 
     let run = async {
         let log_file = work_dir.join(format!(".lambda-rlm-claude-{iteration}.log"));
@@ -636,7 +727,11 @@ async fn run_claude(
             ">>> Iteration {iteration}: launching claude in {} ...",
             work_dir.display()
         );
-        let prompt = build_prompt(question, iteration);
+        let prompt = if wrote_result_file {
+            build_prompt(question, iteration)
+        } else {
+            build_prompt_with_inline_result(question, iteration, result)
+        };
 
         let mut cmd = tokio::process::Command::new("claude");
         cmd.arg("--dangerously-skip-permissions")
@@ -650,12 +745,12 @@ async fn run_claude(
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
 
         // Save full output to log — warn on failure rather than swallowing
-        if let Err(e) = tokio::fs::write(&log_file, stdout).await {
+        if let Err(e) = write_log_file_atomically(&log_file, stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
             tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
             return Err(classify_non_success_exit("claude", output.status));
         }
@@ -682,7 +777,15 @@ async fn run_opencode(
     question: &str,
     iteration: usize,
 ) -> Result<Arc<str>> {
-    write_result_file_atomically(work_dir, result, iteration).await?;
+    let mut wrote_result_file = true;
+    if let Err(error) = write_result_file_atomically(work_dir, result, iteration).await {
+        if is_storage_full_error(&error) {
+            tracing::warn!(iteration, error = %error, "disk full writing result file; falling back to in-memory prompt");
+            wrote_result_file = false;
+        } else {
+            return Err(error);
+        }
+    }
 
     let run = async {
         let log_file = work_dir.join(format!(".lambda-rlm-opencode-{iteration}.log"));
@@ -691,14 +794,18 @@ async fn run_opencode(
             ">>> Iteration {iteration}: launching opencode in {} ...",
             work_dir.display()
         );
-        let prompt = build_prompt(question, iteration);
+        let prompt = if wrote_result_file {
+            build_prompt(question, iteration)
+        } else {
+            build_prompt_with_inline_result(question, iteration, result)
+        };
 
         let mut cmd = tokio::process::Command::new("opencode");
-        cmd.arg("run")
-            .arg("--file")
-            .arg(".lambda-rlm-result.md")
-            .arg("--")
-            .arg(&prompt);
+        cmd.arg("run");
+        if wrote_result_file {
+            cmd.arg("--file").arg(".lambda-rlm-result.md");
+        }
+        cmd.arg("--").arg(&prompt);
         configure_generator_command(&mut cmd, work_dir);
 
         let output = run_generator_process(cmd, &CodeGenerator::Opencode).await?;
@@ -706,12 +813,12 @@ async fn run_opencode(
         let stdout = std::str::from_utf8(&output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;
 
-        if let Err(e) = tokio::fs::write(&log_file, stdout).await {
+        if let Err(e) = write_log_file_atomically(&log_file, stdout).await {
             tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
         }
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
             tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
             return Err(classify_non_success_exit("opencode", output.status));
         }
@@ -738,6 +845,18 @@ pub fn log_file_name(generator: &CodeGenerator, iteration: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration as StdDuration;
+
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
 
     #[test]
     fn result_validation_rejects_oversized_payload() {
@@ -861,5 +980,30 @@ mod tests {
 
         claude.record_success();
         opencode.record_success();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_cleanup_drop_reaps_process() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("1000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        let cleanup = ChildCleanup::new(child);
+        drop(cleanup);
+
+        tokio::time::timeout(StdDuration::from_secs(5), async move {
+            loop {
+                if !pid_alive(pid) {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("child process should be reaped within timeout");
     }
 }
