@@ -513,6 +513,24 @@ impl ReplayCache {
         Some(content.to_string())
     }
 
+    /// Read from cache and enforce caller-provided semantic validation.
+    /// Invalid payloads are quarantined to prevent repeated bad replays.
+    pub fn get_validated<F>(&self, key: &str, validator: F) -> Option<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let content = self.get(key)?;
+        if validator(&content) {
+            return Some(content);
+        }
+        tracing::warn!(
+            key,
+            "cache payload failed semantic validation, quarantining"
+        );
+        self.quarantine(key);
+        None
+    }
+
     /// Evict oldest entries when max_entries is exceeded.
     /// Evicts down to 80% capacity to amortize the cost.
     fn evict_if_needed(&self) {

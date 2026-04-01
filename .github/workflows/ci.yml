@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Miri leak check
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: cargo +nightly miri test -- --test-threads=1

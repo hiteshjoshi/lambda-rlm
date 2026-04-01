@@ -132,6 +132,7 @@ struct StreamDelta {
 // via inflight_tx.send() before the guard drops; on error/panic,
 // dropping the Sender signals waiters to fall through and try themselves.
 
+#[must_use = "InflightGuard must be held until the in-flight leader path finishes"]
 struct InflightGuard<'a> {
     map: &'a DashMap<String, Arc<tokio::sync::watch::Sender<Option<String>>>>,
     gauge: &'a AtomicUsize,
@@ -309,6 +310,16 @@ impl FireworksProvider {
 
         Ok(result)
     }
+}
+
+fn sanitize_error_text(input: &str) -> String {
+    let mut out = input.to_owned();
+    if let Ok(api_key) = std::env::var("FIREWORKS_API") {
+        if !api_key.is_empty() {
+            out = out.replace(&api_key, "[REDACTED]");
+        }
+    }
+    out
 }
 
 // LlmProvider trait impl replaced with direct async method on FireworksProvider
@@ -583,7 +594,12 @@ impl Oracle {
 
         // 2. Cache check
         let cache_key = ReplayCache::key(&self.model, system, user_prompt, max_tokens);
-        if let Some(cached) = self.cache.get(&cache_key) {
+        if let Some(cached) = self.cache.get_validated(&cache_key, |cached| {
+            !cached.trim().is_empty()
+                && !cached
+                    .bytes()
+                    .any(|b| b < 0x20 && b != b'\n' && b != b'\t' && b != b'\r')
+        }) {
             self.cache_hits.fetch_add(1, Ordering::AcqRel);
             let n = self.call_count.fetch_add(1, Ordering::AcqRel) + 1;
             tracing::debug!(
@@ -742,7 +758,7 @@ impl Oracle {
                         .fetch_add(latency.as_millis() as u64, Ordering::AcqRel);
 
                     if let Err(e) = self.cache.put(&cache_key, &text) {
-                        tracing::warn!(error = %e, "cache write failed (non-fatal)");
+                        tracing::warn!(error = %sanitize_error_text(&e.to_string()), "cache write failed (non-fatal)");
                     }
 
                     eprintln!(
@@ -760,7 +776,7 @@ impl Oracle {
                     // Fatal: trip breaker immediately, do not retry
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
-                    tracing::error!(call = n, error = %e, "fatal API error, not retrying");
+                    tracing::error!(call = n, error = %sanitize_error_text(&e.to_string()), "fatal API error, not retrying");
                     eprintln!("    M #{n} FATAL: {e}");
                     resources.commit_budget();
                     anyhow::bail!("{e}");
@@ -768,7 +784,7 @@ impl Oracle {
                 Err(e) => {
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
-                    tracing::error!(call = n, attempt = attempt + 1, error = %e, "API call failed");
+                    tracing::error!(call = n, attempt = attempt + 1, error = %sanitize_error_text(&e.to_string()), "API call failed");
                     eprintln!("    M #{n} ERROR (attempt {}): {e}", attempt + 1);
 
                     if !e.is_retryable() {
@@ -889,7 +905,11 @@ impl Oracle {
             &mut buf,
             format_args!(
                 "    Inflight invariant: {}\n",
-                if inflight_consistent { "ok" } else { "mismatch" }
+                if inflight_consistent {
+                    "ok"
+                } else {
+                    "mismatch"
+                }
             ),
         );
         w(
@@ -898,7 +918,10 @@ impl Oracle {
         );
         w(
             &mut buf,
-            format_args!("    Cache hit rate:   {:.2}%\n", metrics.cache_hit_rate * 100.0),
+            format_args!(
+                "    Cache hit rate:   {:.2}%\n",
+                metrics.cache_hit_rate * 100.0
+            ),
         );
         w(
             &mut buf,

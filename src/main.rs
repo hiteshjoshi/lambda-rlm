@@ -40,7 +40,7 @@ static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -92,6 +92,9 @@ fn validate_generator_access(generator: &types::CodeGenerator) -> Result<()> {
         types::CodeGenerator::Opencode => "opencode",
     };
     which::which(binary).with_context(|| format!("{binary} binary not in PATH"))?;
+    if matches!(generator, types::CodeGenerator::Opencode) {
+        codegen::validate_opencode_binary_version()?;
+    }
     Ok(())
 }
 
@@ -287,6 +290,8 @@ impl Cli {
 /// scanning enormous repositories or zip bombs before chunking begins.
 /// 256MB aligns with Phi's hard input limit and prevents oversized ingest.
 const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_OPEN_FILES: usize = 1024;
+static FD_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 fn collect_source_files(path: &PathBuf) -> Result<String> {
     let extensions = [
@@ -406,6 +411,20 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
             }
 
             // Open with O_NOFOLLOW, fstat the open fd, check size, then read.
+            let fd_permit = match FD_SEMAPHORE
+                .get_or_init(|| tokio::sync::Semaphore::new(MAX_OPEN_FILES))
+                .try_acquire()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        "fd limit reached while collecting; skipping file"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
             if let Some((mut file, size, open_dev, open_ino)) = open_file_no_follow(&file_path) {
                 // TOCTOU inode check: verify the opened file is the same inode
                 // the directory walker saw.
@@ -462,6 +481,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
                     }
                 }
             }
+            drop(fd_permit);
         }
         if accumulated_bytes >= MAX_AGGREGATE_BYTES {
             break;
@@ -677,9 +697,15 @@ fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sanitize_error(error: &anyhow::Error) -> &'static str {
-    tracing::error!(error = ?error, "request failed");
-    "Not Found"
+fn sanitize_error(error: &anyhow::Error) -> String {
+    let mut detail = format!("{error:?}");
+    if let Ok(api_key) = std::env::var("FIREWORKS_API") {
+        if !api_key.is_empty() {
+            detail = detail.replace(&api_key, "[REDACTED]");
+        }
+    }
+    tracing::error!(error = %detail, "request failed");
+    "Not Found".to_string()
 }
 
 // ── Main — Algorithm 1: Complete λ-RLM System ───────────────────
@@ -849,5 +875,12 @@ async fn run() -> Result<()> {
         max_iter, generator
     );
     eprintln!(">>> Run again to continue if needed.");
+    let codegen_guards_live = codegen::codegen_guard_live_count();
+    if codegen_guards_live > 0 {
+        tracing::error!(
+            codegen_guards_live,
+            "LEAK: CodegenBudgetGuard instances still live at shutdown"
+        );
+    }
     Ok(())
 }

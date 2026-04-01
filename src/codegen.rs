@@ -8,7 +8,14 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::time::Instant;
-use std::{path::Path, process::Stdio, sync::Arc, sync::OnceLock, time::SystemTime};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+    sync::OnceLock,
+    time::SystemTime,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::Duration;
 
@@ -25,7 +32,15 @@ const CLAUDE_CB_THRESHOLD: usize = 3;
 const CLAUDE_CB_COOLDOWN: Duration = Duration::from_secs(60);
 const OPENCODE_CB_THRESHOLD: usize = 2;
 const OPENCODE_CB_COOLDOWN: Duration = Duration::from_secs(120);
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENCODE_TIMEOUT: Duration = Duration::from_secs(45);
+static CODEGEN_GUARD_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+pub fn codegen_guard_live_count() -> u64 {
+    CODEGEN_GUARD_LIVE_COUNT.load(Ordering::Acquire)
+}
+
+#[must_use = "dropping CodegenBudgetGuard without commit() restores budget"]
 struct CodegenBudgetGuard<'a> {
     oracle: &'a Oracle,
     units: usize,
@@ -38,6 +53,7 @@ impl<'a> CodegenBudgetGuard<'a> {
             oracle.budget_try_reserve(units),
             "code generation budget exhausted"
         );
+        CODEGEN_GUARD_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             oracle,
             units,
@@ -52,6 +68,7 @@ impl<'a> CodegenBudgetGuard<'a> {
 
 impl Drop for CodegenBudgetGuard<'_> {
     fn drop(&mut self) {
+        CODEGEN_GUARD_LIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
         if !self.committed {
             if !std::thread::panicking() {
                 tracing::error!(
@@ -68,6 +85,8 @@ impl Drop for CodegenBudgetGuard<'_> {
 
 fn codegen_circuit(generator: &CodeGenerator) -> Result<&'static CircuitBreaker> {
     static CLAUDE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
+    // OpenCode is still less stable under sustained load in our testing, so it
+    // uses a stricter threshold/longer cooldown to isolate faults faster.
     static OPENCODE_CIRCUIT: OnceLock<CircuitBreaker> = OnceLock::new();
     let circuit = match generator {
         CodeGenerator::Claude => CLAUDE_CIRCUIT
@@ -202,7 +221,10 @@ fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
 fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect result path: {}", path.display()))?;
-    anyhow::ensure!(!meta.file_type().is_symlink(), "refusing symlink result file");
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "refusing symlink result file"
+    );
     let file = std::fs::File::open(path)?;
     Ok((file, meta.len(), 0, 0))
 }
@@ -308,9 +330,34 @@ fn is_opencode_preamble_line(line: &str) -> bool {
 }
 
 fn extract_opencode_summary_line(text: &str) -> Option<&str> {
+    if text
+        .bytes()
+        .any(|byte| byte < 0x20 && byte != b'\n' && byte != b'\t' && byte != b'\r')
+    {
+        return None;
+    }
     text.lines()
         .find(|line| !is_opencode_preamble_line(line))
         .or_else(|| first_non_empty_line(text))
+}
+
+pub fn validate_opencode_binary_version() -> Result<()> {
+    let output = std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .context("failed to run `opencode --version`")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`opencode --version` exited with {}",
+        output.status
+    );
+    let version = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        version.trim_start().starts_with("opencode 1."),
+        "OpenCode v1.x required, found: {}",
+        version.trim()
+    );
+    Ok(())
 }
 
 impl CodeGenerator {
@@ -328,9 +375,9 @@ impl CodeGenerator {
             CodeGenerator::Opencode => extract_opencode_summary_line(&stdout),
         };
 
-        summary
-            .map(Arc::from)
-            .ok_or_else(|| anyhow::anyhow!("{self} output did not contain a non-empty summary line"))
+        summary.map(Arc::from).ok_or_else(|| {
+            anyhow::anyhow!("{self} output did not contain a non-empty summary line")
+        })
     }
 }
 
@@ -423,7 +470,19 @@ impl Drop for ChildCleanup {
             }
 
             let _ = child.start_kill();
-            let _ = child.try_wait();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
         }
     }
 }
@@ -470,8 +529,16 @@ fn classify_non_success_exit(
 
 async fn run_generator_process(
     mut cmd: tokio::process::Command,
-    generator_name: &str,
+    generator: &CodeGenerator,
 ) -> Result<GeneratorOutput> {
+    let generator_name = match generator {
+        CodeGenerator::Claude => "claude",
+        CodeGenerator::Opencode => "opencode",
+    };
+    let timeout = match generator {
+        CodeGenerator::Claude => CLAUDE_TIMEOUT,
+        CodeGenerator::Opencode => OPENCODE_TIMEOUT,
+    };
     let child = cmd.spawn().with_context(|| {
         format!("Failed to spawn `{generator_name}` — is it installed and on PATH?")
     })?;
@@ -503,11 +570,19 @@ async fn run_generator_process(
             .map_err(anyhow::Error::from)
     });
 
-    let status = match child.child_mut()?.wait().await {
-        Ok(status) => status,
-        Err(error) => {
+    let status = match tokio::time::timeout(timeout, child.child_mut()?.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
             child.kill_and_reap().await;
             return Err(error).with_context(|| format!("Failed to run {generator_name}"));
+        }
+        Err(_) => {
+            child.kill_and_reap().await;
+            return Err(anyhow::anyhow!(
+                "{generator_name} timed out after {}s",
+                timeout.as_secs()
+            ))
+            .context("codegen_retryable");
         }
     };
     child.disarm();
@@ -569,7 +644,7 @@ async fn run_claude(
             .arg(&prompt);
         configure_generator_command(&mut cmd, work_dir);
 
-        let output = run_generator_process(cmd, "claude").await?;
+        let output = run_generator_process(cmd, &CodeGenerator::Claude).await?;
 
         let stdout = std::str::from_utf8(&output.stdout)
             .context("claude subprocess produced invalid UTF-8 on stdout")?;
@@ -626,7 +701,7 @@ async fn run_opencode(
             .arg(&prompt);
         configure_generator_command(&mut cmd, work_dir);
 
-        let output = run_generator_process(cmd, "opencode").await?;
+        let output = run_generator_process(cmd, &CodeGenerator::Opencode).await?;
 
         let stdout = std::str::from_utf8(&output.stdout)
             .context("opencode subprocess produced invalid UTF-8 on stdout")?;
@@ -725,6 +800,17 @@ mod tests {
             .extract_result(output)
             .expect("summary");
         assert_eq!(summary.as_ref(), "Fixed input validation and added tests");
+    }
+
+    #[test]
+    fn extract_result_rejects_control_chars_for_opencode() {
+        let output = b"OpenCode v1.0\nStatus: done\n\x01bad";
+        let err = CodeGenerator::Opencode.extract_result(output).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("did not contain a non-empty summary line"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
