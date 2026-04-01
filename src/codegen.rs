@@ -325,6 +325,7 @@ async fn run_code_generator_once(
     }
 }
 
+#[must_use = "CodegenFlightGuard must stay alive to release single-flight ownership"]
 struct CodegenFlightGuard<'a> {
     flights: &'a DashMap<String, CodegenFlightEntry>,
     key: String,
@@ -332,7 +333,9 @@ struct CodegenFlightGuard<'a> {
 
 impl Drop for CodegenFlightGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.flights.remove(&self.key);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.flights.remove(&self.key);
+        }));
     }
 }
 
@@ -825,6 +828,7 @@ struct GeneratorOutput {
     stderr: Vec<u8>,
 }
 
+#[must_use = "ChildCleanup must be kept until process exits or is explicitly reaped"]
 struct ChildCleanup {
     child: Option<tokio::process::Child>,
 }
@@ -855,35 +859,37 @@ impl ChildCleanup {
 
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                });
-                return;
-            }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(mut child) = self.child.take() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    });
+                    return;
+                }
 
-            let _ = std::thread::Builder::new()
-                .name("codegen-child-reaper".to_owned())
-                .spawn(move || {
-                    let _ = child.start_kill();
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    loop {
-                        match child.try_wait() {
-                            Ok(Some(_)) => break,
-                            Ok(None) => {
-                                if std::time::Instant::now() >= deadline {
-                                    break;
+                let _ = std::thread::Builder::new()
+                    .name("codegen-child-reaper".to_owned())
+                    .spawn(move || {
+                        let _ = child.start_kill();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) => break,
+                                Ok(None) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
-                    }
-                });
-            return;
-        }
+                    });
+            }
+        }));
     }
 }
 
@@ -1470,6 +1476,21 @@ mod tests {
         std::env::remove_var("CLAUDE_API_KEY");
         assert!(!sanitized.contains(needle));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn is_storage_full_error_matches_io_kind() {
+        let io = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let err = anyhow::Error::new(io);
+        assert!(is_storage_full_error(&err));
+    }
+
+    #[test]
+    fn is_storage_full_error_matches_common_disk_full_messages() {
+        let err = anyhow::anyhow!("write failed: No space left on device");
+        assert!(is_storage_full_error(&err));
+        let other = anyhow::anyhow!("permission denied");
+        assert!(!is_storage_full_error(&other));
     }
 
     #[test]

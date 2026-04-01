@@ -426,7 +426,11 @@ pub fn phi(
             eprintln!("{indent}|  (synthesis: {chars} chars)");
         }
 
-        if *cfg.shutdown.borrow() {
+        let shutdown_changed = {
+            let shutdown_probe = cfg.shutdown.clone();
+            shutdown_probe.has_changed().is_ok_and(|changed| changed)
+        };
+        if *cfg.shutdown.borrow() || shutdown_changed {
             return Err(anyhow::anyhow!(
                 "Graceful shutdown requested at depth {depth}"
             ));

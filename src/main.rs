@@ -330,6 +330,7 @@ const MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OPEN_FILES: usize = 1024;
 static FD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
+#[must_use = "GuardedFile holds an FD permit until dropped"]
 struct GuardedFile {
     file: Option<std::fs::File>,
     permit: Option<OwnedSemaphorePermit>,
@@ -352,8 +353,10 @@ impl GuardedFile {
 
 impl Drop for GuardedFile {
     fn drop(&mut self) {
-        let _ = self.permit.take();
-        let _ = self.file.take();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.permit.take();
+            let _ = self.file.take();
+        }));
     }
 }
 
@@ -809,10 +812,14 @@ fn is_auto_detect_truncation_error(error: &anyhow::Error) -> bool {
 fn ensure_no_live_guards(oracle: &Arc<Oracle>) -> Result<()> {
     let metrics = oracle.metrics();
     let codegen_guards_live = codegen::codegen_guard_live_count();
-    if metrics.budget_guards_live > 0 || codegen_guards_live > 0 {
+    if metrics.budget_guards_live > 0
+        || metrics.inflight_guards_live > 0
+        || codegen_guards_live > 0
+    {
         anyhow::bail!(
-            "resource leak detected at shutdown (budget_guards_live={}, codegen_guards_live={})",
+            "resource leak detected at shutdown (budget_guards_live={}, inflight_guards_live={}, codegen_guards_live={})",
             metrics.budget_guards_live,
+            metrics.inflight_guards_live,
             codegen_guards_live
         );
     }
@@ -1066,6 +1073,25 @@ mod tests {
     fn truncation_error_detection_ignores_other_errors() {
         let err = anyhow::anyhow!("network timeout");
         assert!(!is_auto_detect_truncation_error(&err));
+    }
+
+    #[test]
+    fn sanitize_error_redacts_configured_secrets() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _fireworks = ScopedEnvVar::set("FIREWORKS_API", "fw-test-secret");
+        let _claude = ScopedEnvVar::set("CLAUDE_API_KEY", "claude-test-secret");
+        let _opencode = ScopedEnvVar::set("OPENCODE_TOKEN", "opencode-test-secret");
+
+        let err = anyhow::anyhow!(
+            "failure fw-test-secret claude-test-secret opencode-test-secret"
+        );
+        let exposed = sanitize_error(&err);
+        assert_eq!(exposed, "Not Found");
+
+        let debug = format!("{err:?}");
+        assert!(debug.contains("fw-test-secret"));
+        assert!(debug.contains("claude-test-secret"));
+        assert!(debug.contains("opencode-test-secret"));
     }
 
     #[test]
