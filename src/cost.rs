@@ -48,7 +48,12 @@ impl CostModel {
 
     /// Total cost T(n) — Theorem 2, Equation 7
     /// Returns finite cost; saturates to f64::MAX / 2.0 on overflow/NaN.
-    pub fn total_cost(&self, n: usize, k: usize, tau: usize, neural_reduce: bool) -> f64 {
+    ///
+    /// Reduce cost depends on neural type:
+    /// - Symbolic: 0
+    /// - Depth0Only: 1 × c_reduce (single neural call at root)
+    /// - AllDepths: c_reduce × (n/τ - 1)/(k - 1) (every internal node)
+    pub fn total_cost(&self, n: usize, k: usize, tau: usize, rnt: ReduceNeuralType) -> f64 {
         if n <= tau {
             return self.cost_leaf(n);
         }
@@ -56,15 +61,19 @@ impl CostModel {
         let kf = k as f64;
         let tf = tau as f64;
         let leaf_cost = (nf / tf) * self.cost_leaf(tau);
-        if !neural_reduce || k <= 1 {
-            return if leaf_cost.is_finite() {
-                leaf_cost
-            } else {
-                f64::MAX / 2.0
-            };
-        }
-        let c_reduce = self.cost_reduce(k, true);
-        let reduce_cost = c_reduce * (nf * kf - tf) / (tf * (kf - 1.0));
+        let reduce_cost = match rnt {
+            ReduceNeuralType::Symbolic => 0.0,
+            ReduceNeuralType::Depth0Only => self.cost_reduce(k, true),
+            ReduceNeuralType::AllDepths => {
+                if k <= 1 {
+                    0.0
+                } else {
+                    let c_reduce = self.cost_reduce(k, true);
+                    // Paper recurrence: (n/τ - 1)/(k - 1) internal nodes in a k-ary tree
+                    c_reduce * (nf / tf - 1.0) / (kf - 1.0)
+                }
+            }
+        };
         let total = leaf_cost + reduce_cost;
         if total.is_finite() {
             total
@@ -75,7 +84,12 @@ impl CostModel {
 
     /// End-to-end accuracy — Theorem 3
     /// Returns value in [0, 1]; clamps non-finite intermediates to prevent NaN propagation.
-    pub fn total_accuracy(&self, n: usize, k: usize, tau: usize, neural_reduce: bool) -> f64 {
+    ///
+    /// Accuracy penalty per neural reduce:
+    /// - Symbolic: 1.0 (no degradation)
+    /// - Depth0Only: 0.95^1 (one neural step)
+    /// - AllDepths: 0.95^d (neural at each depth level)
+    pub fn total_accuracy(&self, n: usize, k: usize, tau: usize, rnt: ReduceNeuralType) -> f64 {
         if n <= tau {
             return self.accuracy_at(n);
         }
@@ -83,7 +97,11 @@ impl CostModel {
         if !d.is_finite() || d < 0.0 {
             return 0.0;
         }
-        let a_reduce: f64 = if neural_reduce { 0.95 } else { 1.0 };
+        let a_reduce_total: f64 = match rnt {
+            ReduceNeuralType::Symbolic => 1.0,
+            ReduceNeuralType::Depth0Only => 0.95,
+            ReduceNeuralType::AllDepths => 0.95_f64.powf(d),
+        };
         let a_leaf = self.accuracy_at(tau);
         let k_pow_d = (k as f64).powf(d);
         let leaf_acc = if !k_pow_d.is_finite() || k_pow_d > 1000.0 {
@@ -91,7 +109,7 @@ impl CostModel {
         } else {
             a_leaf.powf(k_pow_d)
         };
-        let result = a_reduce.powf(d) * leaf_acc;
+        let result = a_reduce_total * leaf_acc;
         if result.is_finite() {
             result
         } else {
@@ -157,13 +175,34 @@ fn default_k() -> usize {
     2
 }
 
+/// Classifies the neural cost profile of each task's reduce operator.
+/// - Symbolic: zero neural calls (Classify, Aggregate)
+/// - Depth0Only: one neural call at depth 0 (Search=FilterBest, Pairwise=neural comparison)
+/// - AllDepths: neural call at every internal node (Summarise, MultiHop)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReduceNeuralType {
+    Symbolic,
+    Depth0Only,
+    AllDepths,
+}
+
+pub fn reduce_neural_type(task: &TaskType) -> ReduceNeuralType {
+    match task {
+        TaskType::Search | TaskType::Pairwise => ReduceNeuralType::Depth0Only,
+        TaskType::Summarise | TaskType::MultiHop => ReduceNeuralType::AllDepths,
+        TaskType::Classify | TaskType::Aggregate | TaskType::Auto => ReduceNeuralType::Symbolic,
+    }
+}
+
+/// Backward-compatible wrapper: returns true if any neural reduce calls exist.
+#[allow(dead_code)]
 pub fn is_neural_reduce(task: &TaskType) -> bool {
-    matches!(task, TaskType::Summarise | TaskType::MultiHop)
+    reduce_neural_type(task) != ReduceNeuralType::Symbolic
 }
 
 pub fn composition_desc(task: &TaskType) -> &'static str {
     match task {
-        TaskType::Search => "FilterBest (deterministic)",
+        TaskType::Search => "FilterBest (neural at depth 0)",
         TaskType::Classify => "Concat (deterministic)",
         TaskType::Aggregate => "Merge+Dedup (deterministic)",
         TaskType::Pairwise => "Cross+Filter -> M(analyze)",
@@ -205,7 +244,8 @@ pub fn compute_plan(
     model: &str,
     context_window: usize,
 ) -> Plan {
-    let neural = is_neural_reduce(task);
+    let rnt = reduce_neural_type(task);
+    let neural = rnt != ReduceNeuralType::Symbolic;
 
     // Check plan cache (includes model fingerprint to invalidate on model change)
     let cache_key = ReplayCache::plan_key(
@@ -221,11 +261,11 @@ pub fn compute_plan(
         if let Some(cached) = cache.get(&cache_key) {
             if let Ok(plan) = serde_json::from_str::<Plan>(&cached) {
                 if plan.verify_checksum() {
-                    eprintln!("  Plan loaded from cache (deterministic replay)");
+                    verbose!("  Plan loaded from cache (deterministic replay)");
                     return plan;
                 }
                 tracing::warn!("cached plan checksum mismatch, recomputing");
-                eprintln!("  Plan cache checksum mismatch — recomputing");
+                verbose!("  Plan cache checksum mismatch — recomputing");
             }
         }
     }
@@ -276,8 +316,8 @@ pub fn compute_plan(
         let mut best_k = 2usize;
         let mut best_cost = f64::MAX;
         for kc in 2..=16 {
-            let cost = cost_model.total_cost(input_size, kc, tau, neural);
-            let acc = cost_model.total_accuracy(input_size, kc, tau, neural);
+            let cost = cost_model.total_cost(input_size, kc, tau, rnt);
+            let acc = cost_model.total_accuracy(input_size, kc, tau, rnt);
             if acc >= alpha && cost < best_cost {
                 best_cost = cost;
                 best_k = kc;
@@ -310,27 +350,28 @@ pub fn compute_plan(
         }
     };
 
-    let reduce_calls = if neural && depth > 0 {
-        let mut internal = 0usize;
-        for d in 0..depth {
-            let level = (k as f64).powf(d as f64);
-            let level_usize = if level > usize::MAX as f64 {
-                usize::MAX
-            } else {
-                level as usize
-            };
-            internal = internal.saturating_add(level_usize);
+    let reduce_calls = match rnt {
+        ReduceNeuralType::AllDepths if depth > 0 => {
+            // Neural at every internal node: sum of k^d for d in 0..depth
+            let mut internal = 0usize;
+            for d in 0..depth {
+                let level = (k as f64).powf(d as f64);
+                let level_usize = if level > usize::MAX as f64 {
+                    usize::MAX
+                } else {
+                    level as usize
+                };
+                internal = internal.saturating_add(level_usize);
+            }
+            internal
         }
-        internal
-    } else if matches!(task, TaskType::Pairwise) {
-        1
-    } else {
-        0
+        ReduceNeuralType::Depth0Only => 1, // Single neural call at root
+        _ => 0,
     };
 
     let total_calls = leaf_calls.saturating_add(reduce_calls);
-    let estimated_cost = cost_model.total_cost(input_size, k, tau, neural);
-    let estimated_accuracy = cost_model.total_accuracy(input_size, k, tau, neural);
+    let estimated_cost = cost_model.total_cost(input_size, k, tau, rnt);
+    let estimated_accuracy = cost_model.total_accuracy(input_size, k, tau, rnt);
 
     let mut plan = Plan {
         k,

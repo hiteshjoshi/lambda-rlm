@@ -63,8 +63,7 @@ pub struct PhiConfig {
 const MAX_PHI_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const JOINSET_DRAIN_TIMEOUT_MILLIS: u64 = 500;
 const MAX_JOINSET_POOL: usize = 100;
-const AUTO_DETECT_MAX_TOKENS: u32 = 256;
-const RESOURCE_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const AUTO_DETECT_MAX_TOKENS: u32 = 2048;
 
 fn is_budget_exhausted_error(error: &anyhow::Error) -> bool {
     error
@@ -80,9 +79,11 @@ fn checkout_joinset(cfg: &PhiConfig) -> JoinSet<(usize, Result<String>)> {
         .unwrap_or_else(JoinSet::new)
 }
 
-fn return_joinset(cfg: &PhiConfig, mut set: JoinSet<(usize, Result<String>)>) {
-    set.detach_all();
-    debug_assert!(set.is_empty(), "JoinSet pool received non-empty set");
+fn return_joinset(cfg: &PhiConfig, set: JoinSet<(usize, Result<String>)>) {
+    if !set.is_empty() {
+        tracing::error!("JoinSet pool received non-empty set");
+        return;
+    }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Ok(mut pool) = cfg.joinset_pool.lock() {
             if pool.len() < MAX_JOINSET_POOL {
@@ -127,12 +128,11 @@ impl Drop for JoinSetReturnGuard<'_> {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
+                    tracing::error!(
                         timeout_ms = JOINSET_DRAIN_TIMEOUT_MILLIS,
-                        "joinset drop drain timed out after abort_all; detaching remaining tasks"
+                        "joinset drop drain timed out after abort_all"
                     );
-                    set.detach_all();
-                    break;
+                    return;
                 }
                 std::thread::yield_now();
             }
@@ -141,7 +141,7 @@ impl Drop for JoinSetReturnGuard<'_> {
     }
 }
 
-async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) {
+async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usize) -> Result<()> {
     set.abort_all();
     let drain = async {
         while let Some(res) = set.join_next().await {
@@ -157,9 +157,10 @@ async fn abort_and_drain(set: &mut JoinSet<(usize, Result<String>)>, depth: usiz
             timeout_ms = JOINSET_DRAIN_TIMEOUT_MILLIS,
             "joinset drain timed out after abort_all"
         );
-        set.detach_all();
+        anyhow::bail!("joinset drain timed out after abort_all");
     }
     debug_assert!(set.is_empty(), "abort_and_drain left JoinSet non-empty");
+    Ok(())
 }
 
 /// PRE: cfg.task != Auto (resolved in Phase 2)
@@ -199,8 +200,8 @@ pub fn phi(
                 limit = max_input,
                 "input exceeds memory safety limit, truncating"
             );
-            eprintln!(
-                "{indent}|  WARNING: input {} bytes exceeds {} limit, truncating",
+            warn_msg!(
+                "{indent}|  input {} bytes exceeds {} limit, truncating",
                 text.len(),
                 max_input
             );
@@ -215,7 +216,7 @@ pub fn phi(
 
         // ── BASE CASE: |P| ≤ τ → Verify(M(P)) ──
         if text.len() <= cfg.tau {
-            eprintln!(
+            verbose!(
                 "{indent}+- LEAF ({} chars) depth={depth} trace={}",
                 text.len(),
                 hex::encode(&cfg.trace_id[..4])
@@ -225,19 +226,19 @@ pub fn phi(
                 return Err(anyhow::anyhow!("Graceful shutdown requested"));
             }
 
-            match cfg.oracle.call(&sys, &prompt, 2048).await {
+            match cfg.oracle.call(&sys, &prompt, cfg.max_tokens).await {
                 Ok(raw) => {
                     // Verify the leaf output before returning
                     match cfg.verifier.check(&raw, text.len()) {
                         VerifyResult::Accept(verified) => return Ok(verified),
                         VerifyResult::Degraded(output, reason) => {
                             tracing::debug!(depth, reason, "leaf verified (degraded)");
-                            eprintln!("{indent}|  VERIFIED (degraded): {reason}");
+                            verbose!("{indent}|  VERIFIED (degraded): {reason}");
                             return Ok(output);
                         }
                         VerifyResult::Reject(reason) => {
                             tracing::debug!(depth, reason, "leaf verified (rejected)");
-                            eprintln!("{indent}|  VERIFIED (rejected): {reason}");
+                            verbose!("{indent}|  VERIFIED (rejected): {reason}");
                             if depth > 0 {
                                 return Ok(String::new()); // filtered out by reduce
                             }
@@ -247,7 +248,8 @@ pub fn phi(
                 }
                 Err(e) if depth > 0 => {
                     tracing::warn!(depth, error = %e, "leaf call failed, degrading");
-                    eprintln!("{indent}|  DEGRADED (leaf failed): {e}");
+                    error_msg!("{indent}|  leaf call failed at depth {depth}: {e}");
+                    crate::bump_degraded();
                     return Ok(format!("[degraded: leaf call failed at depth {depth}]"));
                 }
                 Err(e) => return Err(e),
@@ -262,7 +264,7 @@ pub fn phi(
                 chars = text.len(),
                 "max recursion depth reached, treating as leaf"
             );
-            eprintln!(
+            verbose!(
                 "{indent}+- DEPTH LIMIT ({} chars) depth={depth}/{}",
                 text.len(),
                 cfg.max_depth
@@ -281,16 +283,18 @@ pub fn phi(
             if *cfg.shutdown.borrow() {
                 return Err(anyhow::anyhow!("Graceful shutdown requested"));
             }
-            match cfg.oracle.call(&sys, &prompt, 2048).await {
+            match cfg.oracle.call(&sys, &prompt, cfg.max_tokens).await {
                 Ok(raw) => match cfg.verifier.check(&raw, text.len()) {
                     VerifyResult::Accept(v) | VerifyResult::Degraded(v, _) => return Ok(v),
                     VerifyResult::Reject(reason) => {
+                        crate::bump_degraded();
                         return Ok(format!(
                             "[degraded: depth limit, verification rejected: {reason}]"
                         ));
                     }
                 },
                 Err(_) if depth > 0 => {
+                    crate::bump_degraded();
                     return Ok(format!(
                         "[degraded: depth limit leaf failed at depth {depth}]"
                     ));
@@ -325,7 +329,7 @@ pub fn phi(
             chunks
         };
 
-        eprintln!(
+        verbose!(
             "{indent}+- SPLIT ({} chars) -> {} children, depth={depth} trace={}",
             text.len(),
             chunks.len(),
@@ -346,86 +350,63 @@ pub fn phi(
             });
         }
 
-        // 3. BUDGET PRE-FLIGHT CHECK (tree-aware, pessimistic reservation)
-        // Uses atomic try_acquire_n + release_n to eliminate TOCTOU race.
-        // Under high concurrency, a read-then-check allows multiple branches to
-        // simultaneously see sufficient budget and proceed, causing partial
-        // orphan exhaustion. The atomic reserve serializes concurrent checks:
-        // only branches that atomically acquire the estimated budget proceed.
+        // 3. BUDGET PRE-FLIGHT CHECK (optimistic reservation)
+        // Reserve only immediate child calls; deeper levels reserve independently.
+        // This prevents a single deep branch from pessimistically hoarding the
+        // full remaining budget and starving siblings.
         let num_children = chunks.len();
         if !cfg.oracle.budget_unlimited() {
-            let remaining_depth = cfg.max_depth.saturating_sub(depth);
-            let estimated_subtree = if remaining_depth <= 1 {
-                // Leaf level: each child is one call
-                num_children
-            } else {
-                // Interior: estimate k^remaining_depth leaves, capped to avoid overflow
-                let leaves = (cfg.k as u64)
-                    .checked_pow(remaining_depth as u32)
-                    .unwrap_or(u64::MAX)
-                    .min(100_000) as usize;
-                leaves
-            };
-            // Atomic reservation: if two branches race, only one succeeds.
-            // Immediately release after the gate — children acquire individually
-            // via oracle.call(). The atomic reserve-release prevents phantom
-            // budget availability without changing per-call accounting.
-            if !cfg.oracle.budget_try_reserve(estimated_subtree) {
+            if !cfg.oracle.budget_try_reserve(num_children) {
                 let remaining = cfg.oracle.budget_remaining();
                 tracing::warn!(
                     depth,
                     num_children,
-                    estimated_subtree,
                     remaining,
-                    "budget insufficient for subtree, degrading"
+                    "budget insufficient for immediate children, degrading"
                 );
-                eprintln!(
-                    "{indent}|  DEGRADED (budget: subtree needs ~{estimated_subtree}, have {remaining})"
+                warn_msg!(
+                    "budget insufficient: children need {num_children}, have {remaining} (depth {depth})"
                 );
+                crate::bump_degraded();
                 return Ok(format!(
-                    "[degraded: budget_exhausted, subtree needs ~{} but {} remaining]",
-                    estimated_subtree, remaining
+                    "[degraded: budget_exhausted, children need {} but {} remaining]",
+                    num_children, remaining
                 ));
             }
-            cfg.oracle.budget_unreserve(estimated_subtree);
+            cfg.oracle.budget_unreserve(num_children);
         }
 
-        // 4. MAP — JoinSet structured concurrency, index-tagged for ordering
-        // Each spawn acquires a concurrency permit to bound total recursive tasks.
+        // 4. MAP — JoinSet structured concurrency, index-tagged for ordering.
+        // Acquire one permit per child spawn instead of acquiring all child permits
+        // up-front. Up-front acquire_many() can deadlock on wide splits (children >
+        // semaphore capacity) because no semaphore can ever satisfy that request.
         let mut set_guard = JoinSetReturnGuard::new(&cfg);
-        let mut permit_pool = tokio::time::timeout(
-            Duration::from_secs(RESOURCE_ACQUIRE_TIMEOUT_SECS),
-            Arc::clone(&cfg.concurrency).acquire_many_owned(num_children as u32),
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!(
-                depth,
-                children = num_children,
-                timeout_secs = RESOURCE_ACQUIRE_TIMEOUT_SECS,
-                "timed out acquiring phi child permits"
-            );
-            anyhow::anyhow!("timed out acquiring phi child permits")
-        })?
-        .map_err(|_| anyhow::anyhow!("phi concurrency semaphore closed"))?;
+        let mut shutdown_rx = cfg.shutdown.clone();
         for (i, chunk) in chunks.into_iter().enumerate() {
+            let permit_fut = Arc::clone(&cfg.concurrency).acquire_owned();
+            let permit = tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() || *shutdown_rx.borrow() {
+                        tracing::info!(depth, spawned = i, total = num_children, "shutdown while waiting for phi child permit");
+                    }
+                    return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
+                }
+                permit = permit_fut => {
+                    permit.map_err(|_| anyhow::anyhow!("phi concurrency semaphore closed"))?
+                }
+            };
             let cfg = Arc::clone(&cfg);
-            let permit = permit_pool
-                .split(1)
-                .ok_or_else(|| anyhow::anyhow!("failed to split child semaphore permit"))?;
-            eprintln!("{indent}|  child {}/{num_children}", i + 1);
+            verbose!("{indent}|  child {}/{num_children}", i + 1);
             set_guard.set_mut().spawn(async move {
                 let result = phi(cfg, chunk, depth + 1, Some(permit)).await;
                 (i, result)
             });
         }
-        drop(permit_pool);
 
         // Collect results with cooperative shutdown check.
         // On depth-0 fatal errors, drain remaining tasks before returning
         // to ensure RAII guards (SemaphorePermit, BudgetGuard) fire cleanly.
         let mut indexed_results: Vec<(usize, String)> = Vec::with_capacity(num_children);
-        let mut shutdown_rx = cfg.shutdown.clone();
         let mut fatal_error: Option<anyhow::Error> = None;
 
         loop {
@@ -437,7 +418,7 @@ pub fn phi(
                 // complete their Drop before we return.
                 _ = shutdown_rx.changed() => {
                     tracing::info!(depth, collected = indexed_results.len(), total = num_children, "shutdown: draining children");
-                    abort_and_drain(set, depth).await;
+                    abort_and_drain(set, depth).await?;
                     return Err(anyhow::anyhow!("Graceful shutdown requested at depth {depth}"));
                 }
                 join_result = set.join_next() => {
@@ -446,18 +427,18 @@ pub fn phi(
                         Some(Ok((idx, Ok(text)))) => indexed_results.push((idx, text)),
                         Some(Ok((idx, Err(e)))) if depth > 0 => {
                             tracing::warn!(depth, child = idx, error = %e, "child failed, degrading");
-                            eprintln!("{indent}|  child {idx} failed, degrading: {e}");
+                            error_msg!("child {idx} failed at depth {depth}: {e}");
                         }
                         Some(Ok((idx, Err(e)))) => {
                             if is_budget_exhausted_error(&e) {
                                 tracing::warn!(depth, child = idx, error = %e, "budget exhausted in child, degrading");
-                                eprintln!("{indent}|  child {idx} budget exhausted, degrading");
+                                warn_msg!("child {idx} budget exhausted at depth {depth}");
                                 continue;
                             }
                             // Depth 0: record non-budget error but drain remaining tasks
                             // so their RAII guards drop cleanly.
                             fatal_error.get_or_insert(e);
-                            abort_and_drain(set, depth).await;
+                            abort_and_drain(set, depth).await?;
                             break;
                         }
                         Some(Err(join_err)) if join_err.is_cancelled() => {
@@ -465,11 +446,11 @@ pub fn phi(
                         }
                         Some(Err(join_err)) if depth > 0 => {
                             tracing::error!(depth, error = %join_err, "child task panicked");
-                            eprintln!("{indent}|  child task panicked, degrading: {join_err}");
+                            error_msg!("child task panicked at depth {depth}: {join_err}");
                         }
                         Some(Err(join_err)) => {
                             fatal_error.get_or_insert_with(|| anyhow::anyhow!("Child task failed: {join_err}"));
-                            abort_and_drain(set, depth).await;
+                            abort_and_drain(set, depth).await?;
                             break;
                         }
                     }
@@ -486,6 +467,7 @@ pub fn phi(
             indexed_results.into_iter().map(|(_, text)| text).collect();
 
         if child_results.is_empty() {
+            crate::bump_degraded();
             return Ok(format!(
                 "[degraded: all {} children failed at depth {depth}]",
                 num_children
@@ -493,14 +475,14 @@ pub fn phi(
         }
 
         // 5. REDUCE ⊕ — task-specific composition
-        eprintln!(
+        verbose!(
             "{indent}+- REDUCE depth={depth} ({} children -> 1 result)",
             child_results.len(),
         );
 
         if matches!(cfg.task, TaskType::Summarise | TaskType::MultiHop) {
             let chars: usize = child_results.iter().map(|r| r.len()).sum();
-            eprintln!("{indent}|  (synthesis: {chars} chars)");
+            verbose!("{indent}|  (synthesis: {chars} chars)");
         }
 
         let shutdown_changed = {
@@ -529,12 +511,73 @@ pub fn phi(
             Ok(text) => Ok(text),
             Err(e) if depth > 0 => {
                 tracing::warn!(depth, error = %e, "reduce failed, degrading");
-                eprintln!("{indent}|  DEGRADED (reduce failed): {e}");
+                error_msg!("reduce failed at depth {depth}: {e}");
+                crate::bump_degraded();
                 Ok(format!("[degraded: reduce failed at depth {depth}]"))
             }
             Err(e) => Err(e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{phi, PhiConfig};
+    use crate::oracle::Oracle;
+    use crate::types::TaskType;
+    use crate::verify::Verifier;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{watch, Semaphore};
+
+    fn wide_input(definitions: usize) -> String {
+        let mut out = String::from("// === src/wide.rs ===\n");
+        for i in 0..definitions {
+            out.push_str(&format!("fn item_{i}() {{ let _ = {i}; }}\n"));
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wide_split_does_not_require_all_permits_upfront() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let oracle = Oracle::new(
+            "dry-run".to_string(),
+            "kimi-k2p5-turbo".to_string(),
+            true,
+            4,
+            Duration::from_secs(1),
+            0,
+            20_000,
+            cache_dir.path().to_path_buf(),
+            false,
+            1024,
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = Arc::new(PhiConfig {
+            question: "summarize".to_string(),
+            task: TaskType::Summarise,
+            tau: 32,
+            k: 2,
+            max_depth: 8,
+            overlap: 200,
+            max_tokens: 256,
+            keywords: Vec::new(),
+            oracle,
+            verifier: Verifier::new(TaskType::Summarise, Vec::new()),
+            shutdown: shutdown_rx,
+            concurrency: Arc::new(Semaphore::new(4)),
+            joinset_pool: Arc::new(Mutex::new(Vec::new())),
+            trace_id: [7u8; 16],
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(15), phi(cfg, wide_input(160), 0, None))
+            .await
+            .expect("phi should complete without permit deadlock")
+            .expect("phi should succeed");
+
+        assert!(!result.trim().is_empty());
+    }
 }
 
 // ── Task Auto-Detection — Phase 2 ───────────────────────────────
@@ -569,15 +612,16 @@ pub async fn auto_detect_task(
     // toward expensive task types (e.g., MultiHop, Pairwise).
     let preview = sanitize_for_classification(preview);
 
-    let system = "You are a task classifier. Given a document preview and a question, \
-                  classify the required task type as EXACTLY one of these:\n\
-                  - search: find specific information or code\n\
-                  - classify: label, categorize, or identify types of each section\n\
-                  - aggregate: extract, count, collect, or list items across the document\n\
-                  - pairwise: compare, find duplicates, or cross-reference items\n\
-                  - summarise: summarize, explain, or understand the document\n\
-                  - multi_hop: trace a flow, chain reasoning across sections, follow dependencies\n\n\
-                  Respond with ONLY the task type name, nothing else.";
+    let system = "You are a task classifier. Output ONLY one word from this list:\n\
+                  search, classify, aggregate, pairwise, summarise, multi_hop\n\n\
+                  Rules:\n\
+                  - search = find specific information or code\n\
+                  - classify = label or categorize sections\n\
+                  - aggregate = extract, count, or list items\n\
+                  - pairwise = compare or find duplicates\n\
+                  - summarise = summarize or explain\n\
+                  - multi_hop = trace flows or chain reasoning\n\n\
+                  Output the single word only. No explanation.";
 
     let user = format!(
         "Document preview (first {} chars of {} total):\n{}\n\nQuestion: {}",
@@ -602,15 +646,15 @@ pub async fn auto_detect_task(
                 raw = other,
                 "auto-detect returned unknown task, defaulting to summarise"
             );
-            eprintln!(
-                "    Auto-detect returned '{}', defaulting to summarise",
+            warn_msg!(
+                "Auto-detect returned '{}', defaulting to summarise",
                 other
             );
             TaskType::Summarise
         }
     };
 
-    eprintln!("  Phase 2: auto-detected task = {task}");
+    verbose!("  Phase 2: auto-detected task = {task}");
     Ok(task)
 }
 
@@ -658,11 +702,11 @@ fn leaf_prompt(chunk: &str, question: &str, task: &TaskType) -> (String, String)
         ),
 
         TaskType::Summarise => (
-            "Summarize this code section in 3-5 concise bullets: \
-             functions/structs defined, what they do, dependencies, patterns used. \
-             Reference file paths where relevant."
+            "Summarize this code section, focusing on aspects relevant to the question. \
+             3-5 concise bullets: functions/structs defined, what they do, dependencies, \
+             patterns used. Reference file paths where relevant."
                 .into(),
-            format!("```\n{chunk}\n```"),
+            format!("Question: {question}\n\nCode:\n```\n{chunk}\n```"),
         ),
 
         TaskType::MultiHop => (
