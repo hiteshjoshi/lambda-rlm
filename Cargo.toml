@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal", "process", "net"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +27,8 @@ fs4 = "0.8"
 portable-pty = "0.8"
 memchr = "2"
 getrandom = "0.2"
+axum = { version = "0.8", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(not(windows))'.dependencies]
 jemallocator = "0.5"

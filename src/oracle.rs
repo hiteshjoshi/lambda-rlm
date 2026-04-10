@@ -4,6 +4,7 @@
 //! replay cache, per-call timeout, retries with exponential backoff,
 //! telemetry counters. All state is lock-free (atomics).
 //!
+use crate::history;
 use crate::resilience::{BudgetGuard, CachePermit, CallBudget, CircuitBreaker, ReplayCache};
 use crate::types::CodeGenerator;
 use anyhow::Result;
@@ -772,6 +773,30 @@ impl Oracle {
         }) {
             self.cache_hits.fetch_add(1, Ordering::AcqRel);
             let n = self.call_count.fetch_add(1, Ordering::AcqRel) + 1;
+            history::record_event(history::EventRecord {
+                component: "oracle".to_owned(),
+                kind: "call.cache_hit".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("M #{n} cache hit"),
+                call_no: Some(n),
+                attempt: Some(0),
+                latency_ms: Some(0),
+                cache_hit: Some(true),
+                idempotency_key: None,
+                request_payload: Some(
+                    serde_json::json!({
+                        "model": &self.model,
+                        "max_tokens": max_tokens,
+                        "system": system,
+                        "user_prompt": user_prompt,
+                    })
+                    .to_string(),
+                ),
+                response_payload: Some(cached.clone()),
+                error_payload: None,
+                extra_json: Some(serde_json::json!({"cache_key": cache_key}).to_string()),
+                iteration_override: None,
+            });
             tracing::debug!(
                 call = n,
                 input_len = user_prompt.len(),
@@ -850,11 +875,37 @@ impl Oracle {
         };
 
         if self.dry_run {
-            resources.commit_budget();
-            return Ok(format!(
+            let dry = format!(
                 "[DRY RUN] Call #{n} ({} chars in, max_tok={max_tokens})",
                 user_prompt.len()
-            ));
+            );
+            history::record_event(history::EventRecord {
+                component: "oracle".to_owned(),
+                kind: "call.dry_run".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("M #{n} dry-run call"),
+                call_no: Some(n),
+                attempt: Some(1),
+                latency_ms: Some(0),
+                cache_hit: Some(false),
+                idempotency_key: Some(idempotency_key.clone()),
+                request_payload: Some(
+                    serde_json::json!({
+                        "model": &self.model,
+                        "max_tokens": max_tokens,
+                        "system": system,
+                        "user_prompt": user_prompt,
+                        "idempotency_key": idempotency_key,
+                    })
+                    .to_string(),
+                ),
+                response_payload: Some(dry.clone()),
+                error_payload: None,
+                extra_json: None,
+                iteration_override: None,
+            });
+            resources.commit_budget();
+            return Ok(dry);
         }
 
         // 4. Retry loop with circuit breaker + exponential backoff
@@ -919,6 +970,17 @@ impl Oracle {
                 tokio::time::sleep(backoff).await;
             }
 
+            let request_payload = serde_json::json!({
+                "model": &self.model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "user_prompt": user_prompt,
+                "attempt": attempt + 1,
+                "max_retries": self.max_retries,
+                "idempotency_key": idempotency_key,
+            })
+            .to_string();
+
             let start = Instant::now();
             // No CbFailureGuard here: all error paths below call record_failure()
             // explicitly. Task cancellation (quorum abort) must NOT record failure.
@@ -929,6 +991,22 @@ impl Oracle {
             match api_result {
                 Ok(text) => {
                     let latency = start.elapsed();
+                    history::record_event(history::EventRecord {
+                        component: "oracle".to_owned(),
+                        kind: "call.attempt".to_owned(),
+                        status: "ok".to_owned(),
+                        message: format!("M #{n} attempt {} succeeded", attempt + 1),
+                        call_no: Some(n),
+                        attempt: Some(attempt + 1),
+                        latency_ms: Some(latency.as_millis() as u64),
+                        cache_hit: Some(false),
+                        idempotency_key: Some(idempotency_key.clone()),
+                        request_payload: Some(request_payload),
+                        response_payload: Some(text.clone()),
+                        error_payload: None,
+                        extra_json: None,
+                        iteration_override: None,
+                    });
                     self.circuit.record_success();
                     self.total_input_chars
                         .fetch_add(user_prompt.len() as u64, Ordering::Relaxed);
@@ -953,6 +1031,22 @@ impl Oracle {
                     return Ok(text);
                 }
                 Err(e) if e.is_fatal() => {
+                    history::record_event(history::EventRecord {
+                        component: "oracle".to_owned(),
+                        kind: "call.attempt".to_owned(),
+                        status: "error".to_owned(),
+                        message: format!("M #{n} fatal attempt {}", attempt + 1),
+                        call_no: Some(n),
+                        attempt: Some(attempt + 1),
+                        latency_ms: Some(start.elapsed().as_millis() as u64),
+                        cache_hit: Some(false),
+                        idempotency_key: Some(idempotency_key.clone()),
+                        request_payload: Some(request_payload),
+                        response_payload: None,
+                        error_payload: Some(e.to_string()),
+                        extra_json: None,
+                        iteration_override: None,
+                    });
                     // Fatal: trip breaker immediately, do not retry
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
@@ -962,6 +1056,22 @@ impl Oracle {
                     anyhow::bail!("{e}");
                 }
                 Err(e) if e.is_token_budget_error() => {
+                    history::record_event(history::EventRecord {
+                        component: "oracle".to_owned(),
+                        kind: "call.attempt".to_owned(),
+                        status: "error".to_owned(),
+                        message: format!("M #{n} token budget error on attempt {}", attempt + 1),
+                        call_no: Some(n),
+                        attempt: Some(attempt + 1),
+                        latency_ms: Some(start.elapsed().as_millis() as u64),
+                        cache_hit: Some(false),
+                        idempotency_key: Some(idempotency_key.clone()),
+                        request_payload: Some(request_payload),
+                        response_payload: None,
+                        error_payload: Some(e.to_string()),
+                        extra_json: None,
+                        iteration_override: None,
+                    });
                     // Token budget: the model ran out of tokens. This is NOT an API failure —
                     // do NOT trip the circuit breaker. Fail fast, let caller handle.
                     self.errors.fetch_add(1, Ordering::AcqRel);
@@ -971,6 +1081,32 @@ impl Oracle {
                     anyhow::bail!("{e}");
                 }
                 Err(e) => {
+                    history::record_event(history::EventRecord {
+                        component: "oracle".to_owned(),
+                        kind: "call.attempt".to_owned(),
+                        status: if e.is_retryable() {
+                            "warn".to_owned()
+                        } else {
+                            "error".to_owned()
+                        },
+                        message: format!("M #{n} attempt {} failed", attempt + 1),
+                        call_no: Some(n),
+                        attempt: Some(attempt + 1),
+                        latency_ms: Some(start.elapsed().as_millis() as u64),
+                        cache_hit: Some(false),
+                        idempotency_key: Some(idempotency_key.clone()),
+                        request_payload: Some(request_payload),
+                        response_payload: None,
+                        error_payload: Some(e.to_string()),
+                        extra_json: Some(
+                            serde_json::json!({
+                                "retryable": e.is_retryable(),
+                                "fatal": e.is_fatal(),
+                            })
+                            .to_string(),
+                        ),
+                        iteration_override: None,
+                    });
                     self.circuit.record_failure();
                     self.errors.fetch_add(1, Ordering::AcqRel);
                     tracing::error!(call = n, attempt = attempt + 1, error = %sanitize_error_text(&e.to_string()), "API call failed");

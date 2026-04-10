@@ -82,6 +82,8 @@ macro_rules! warn_msg {
 mod codegen;
 mod combinator;
 mod cost;
+mod dashboard;
+mod history;
 mod oracle;
 mod phi;
 mod reduce;
@@ -97,7 +99,7 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use regex::Regex;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -364,6 +366,18 @@ struct Cli {
     verbose: bool,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "lambda_rlm")]
+struct DashboardArgsRaw {
+    /// Host interface for dashboard server
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port for dashboard server
+    #[arg(long, default_value_t = 9889)]
+    port: u16,
+}
+
 /// Schema version for CLI configuration. Bump when adding/removing/renaming
 /// parameters that change runtime behavior. Logged at startup alongside a
 /// blake3 hash of effective values — any config drift across deployments
@@ -466,6 +480,21 @@ fn parse_interactive_timeout_seconds(raw: &str) -> std::result::Result<u64, Stri
     }
 }
 
+fn parse_dashboard_args() -> Option<DashboardArgsRaw> {
+    use std::ffi::OsStr;
+
+    let mut args = std::env::args_os();
+    let bin = args.next()?;
+    let first = args.next()?;
+    if first != OsStr::new("dashboard") {
+        return None;
+    }
+    let mut dashboard_argv = Vec::new();
+    dashboard_argv.push(bin);
+    dashboard_argv.extend(args);
+    Some(DashboardArgsRaw::parse_from(dashboard_argv))
+}
+
 // ── File Collector ───────────────────────────────────────────────
 
 /// PRE: path exists and is readable
@@ -537,10 +566,7 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
             file.take(MAX_AGGREGATE_BYTES)
                 .read_to_end(&mut bytes)
                 .with_context(|| {
-                    format!(
-                        "Failed to read truncated contents of {}",
-                        path.display()
-                    )
+                    format!("Failed to read truncated contents of {}", path.display())
                 })?;
             while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
                 let _ = bytes.pop();
@@ -565,7 +591,10 @@ fn collect_source_files(path: &PathBuf) -> Result<String> {
         return Ok(out);
     }
 
-    anyhow::ensure!(root_meta.is_dir(), "input path is neither file nor directory");
+    anyhow::ensure!(
+        root_meta.is_dir(),
+        "input path is neither file nor directory"
+    );
 
     let mut all_code = String::new();
     let mut file_count = 0usize;
@@ -840,7 +869,8 @@ async fn run_analysis(
             );
             verbose!(
                 "  Budget-aware replanning: k={} total_calls={} (budget={available})",
-                plan.k, plan.total_calls
+                plan.k,
+                plan.total_calls
             );
         }
     }
@@ -858,7 +888,9 @@ async fn run_analysis(
     );
     verbose!(
         "  Calls:       {} leaf + {} reduce = {} total",
-        plan.leaf_calls, plan.reduce_calls, plan.total_calls
+        plan.leaf_calls,
+        plan.reduce_calls,
+        plan.total_calls
     );
     verbose!("  Concurrency: {} max parallel\n", cli.concurrency);
 
@@ -964,30 +996,6 @@ fn build_oracle(cli: &Cli) -> Result<Arc<Oracle>> {
         !cli.no_cache,
         cli.max_cache_entries,
     ))
-}
-
-fn validate_codegen_result_target(work_dir: &Path) -> Result<()> {
-    let target = work_dir.join(".lambda-rlm-result.md");
-    match std::fs::symlink_metadata(&target) {
-        Ok(meta) => {
-            anyhow::ensure!(
-                !meta.file_type().is_symlink(),
-                "refusing codegen result target symlink: {}",
-                target.display()
-            );
-            anyhow::ensure!(
-                open_file_no_follow(&target).is_some(),
-                "refusing unsafe codegen result target: {}",
-                target.display()
-            );
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect result target {}", target.display()));
-        }
-    }
-    Ok(())
 }
 
 fn sanitize_error(error: &anyhow::Error) -> String {
@@ -1168,6 +1176,15 @@ fn main() {
 }
 
 async fn run() -> Result<()> {
+    if let Some(dashboard_cli) = parse_dashboard_args() {
+        let _ = history::initialize_global();
+        return dashboard::run_dashboard(dashboard::DashboardArgs {
+            host: dashboard_cli.host,
+            port: dashboard_cli.port,
+        })
+        .await;
+    }
+
     let cli = Cli::parse();
     cli.validate()?;
     VERBOSE.store(cli.verbose, Ordering::Relaxed);
@@ -1182,12 +1199,13 @@ async fn run() -> Result<()> {
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(default_filter)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_target(false)
         .with_writer(non_blocking)
         .init();
+
+    let _ = history::initialize_global();
 
     let _ = INTERACTIVE_SESSION_SEMAPHORE.set(Arc::new(tokio::sync::Semaphore::new(1)));
 
@@ -1271,118 +1289,259 @@ async fn run() -> Result<()> {
         None
     };
 
-    if generator.is_none() {
-        // Single-shot mode: analyze and print
-        let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
-        println!("{result}");
-        ensure_no_live_guards(&oracle, cli.interactive).await?;
-        return Ok(());
-    }
-    let generator = generator.unwrap();
-
-    // ── Fix loop mode ──
-    let work_dir = if cli.path.is_file() {
-        std::fs::canonicalize(cli.path.parent().unwrap_or(&cli.path))?
-    } else {
-        std::fs::canonicalize(&cli.path)?
-    };
-
-    let unlimited_iterations = cli.max_iterations == 0;
-    if unlimited_iterations {
-        eprintln!(
-            ">>> --max-iterations=0 requested; running until clean, shutdown, or budget exhaustion"
-        );
-    }
-
-    let mut iteration: usize = 1;
-    let mut reached_iteration_limit = false;
-    loop {
-        if !unlimited_iterations && iteration > cli.max_iterations {
-            reached_iteration_limit = true;
-            break;
-        }
-
-        if *shutdown_rx.borrow() {
-            eprintln!("\n>>> Shutdown requested; stopping fix loop.");
-            break;
-        }
-
-        eprintln!("\n================================================================");
-        if unlimited_iterations {
-            eprintln!("  ITERATION {iteration} (unbounded)");
+    let run_id = history::start_run(&history::RunStart {
+        mode: if generator.is_some() {
+            "fix_loop".to_owned()
         } else {
-            eprintln!("  ITERATION {iteration}/{}", cli.max_iterations);
-        }
-        eprintln!("================================================================\n");
+            "analysis".to_owned()
+        },
+        path: Some(cli.path.display().to_string()),
+        question: Some(cli.question.clone()),
+        task: cli.task.to_string(),
+        generator: generator.map(|g| g.to_string()),
+        model: cli.model.clone(),
+        config_fingerprint: cli.config_fingerprint(),
+    });
 
-        // 1. Analyze
-        let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
-
-        // 2. Check if clean (heuristic: very short output or known "no issues" patterns)
-        let lower = result.trim().to_lowercase();
-        let is_clean = lower == "no_match"
-            || lower == "no_data"
-            || lower.starts_with("no relevant")
-            || lower.starts_with("no items found")
-            || lower.starts_with("no useful output");
-
-        if is_clean {
-            eprintln!("\n>>> Analysis came back clean. Nothing to fix.");
+    let mut final_output_for_history: Option<String> = None;
+    let run_result: Result<()> = async {
+        if generator.is_none() {
+            history::set_iteration(0);
+            let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
+            history::record_event(history::EventRecord {
+                component: "main".to_owned(),
+                kind: "analysis.result".to_owned(),
+                status: "ok".to_owned(),
+                message: "single-shot analysis completed".to_owned(),
+                call_no: None,
+                attempt: None,
+                latency_ms: None,
+                cache_hit: None,
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: Some(result.clone()),
+                error_payload: None,
+                extra_json: None,
+                iteration_override: Some(0),
+            });
+            final_output_for_history = Some(result.clone());
             println!("{result}");
             ensure_no_live_guards(&oracle, cli.interactive).await?;
             return Ok(());
         }
 
-        // 3. Hand to code generator
-        validate_codegen_result_target(&work_dir)?;
-        if cli.interactive && !std::io::stdin().is_terminal() {
-            anyhow::bail!("--interactive requires an attached TTY on stdin");
-        }
-        let _interactive_permit = acquire_interactive_session_permit(cli.interactive).await?;
-        let summary = codegen::run_code_generator(
-            oracle.as_ref(),
-            &generator,
-            &result,
-            &work_dir,
-            &cli.question,
-            iteration,
-            cli.interactive,
-            Duration::from_secs(cli.interactive_timeout),
-            shutdown_rx.clone(),
-        )
-        .await?;
+        let generator = generator.expect("generator resolved");
 
+        // ── Fix loop mode ──
+        let work_dir = if cli.path.is_file() {
+            std::fs::canonicalize(cli.path.parent().unwrap_or(&cli.path))?
+        } else {
+            std::fs::canonicalize(&cli.path)?
+        };
+
+        let unlimited_iterations = cli.max_iterations == 0;
+        if unlimited_iterations {
+            eprintln!(
+                ">>> --max-iterations=0 requested; running until clean, shutdown, or budget exhaustion"
+            );
+        }
+
+        let mut iteration: usize = 1;
+        let mut previous_codegen_summary: Option<String> = None;
+        let mut reached_iteration_limit = false;
+        loop {
+            if !unlimited_iterations && iteration > cli.max_iterations {
+                reached_iteration_limit = true;
+                break;
+            }
+
+            if *shutdown_rx.borrow() {
+                eprintln!("\n>>> Shutdown requested; stopping fix loop.");
+                break;
+            }
+
+            history::set_iteration(iteration);
+            history::record_event(history::EventRecord {
+                component: "main".to_owned(),
+                kind: "iteration.start".to_owned(),
+                status: "running".to_owned(),
+                message: format!("iteration {iteration} started"),
+                call_no: None,
+                attempt: None,
+                latency_ms: None,
+                cache_hit: None,
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: None,
+                error_payload: None,
+                extra_json: None,
+                iteration_override: Some(iteration),
+            });
+
+            eprintln!("\n================================================================");
+            if unlimited_iterations {
+                eprintln!("  ITERATION {iteration} (unbounded)");
+            } else {
+                eprintln!("  ITERATION {iteration}/{}", cli.max_iterations);
+            }
+            eprintln!("================================================================\n");
+
+            // 1. Analyze
+            let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
+            history::record_event(history::EventRecord {
+                component: "main".to_owned(),
+                kind: "analysis.result".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("iteration {iteration} analysis completed"),
+                call_no: None,
+                attempt: None,
+                latency_ms: None,
+                cache_hit: None,
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: Some(result.clone()),
+                error_payload: None,
+                extra_json: None,
+                iteration_override: Some(iteration),
+            });
+
+            // 2. Check if clean (heuristic: very short output or known "no issues" patterns)
+            let lower = result.trim().to_lowercase();
+            let is_clean = lower == "no_match"
+                || lower == "no_data"
+                || lower.starts_with("no relevant")
+                || lower.starts_with("no items found")
+                || lower.starts_with("no useful output");
+
+            if is_clean {
+                history::record_event(history::EventRecord {
+                    component: "main".to_owned(),
+                    kind: "iteration.clean".to_owned(),
+                    status: "ok".to_owned(),
+                    message: format!("iteration {iteration} reported clean"),
+                    call_no: None,
+                    attempt: None,
+                    latency_ms: None,
+                    cache_hit: None,
+                    idempotency_key: None,
+                    request_payload: None,
+                    response_payload: Some(result.clone()),
+                    error_payload: None,
+                    extra_json: None,
+                    iteration_override: Some(iteration),
+                });
+                final_output_for_history = Some(result.clone());
+                eprintln!("\n>>> Analysis came back clean. Nothing to fix.");
+                println!("{result}");
+                ensure_no_live_guards(&oracle, cli.interactive).await?;
+                return Ok(());
+            }
+
+            // 3. Hand to code generator
+            if cli.interactive && !std::io::stdin().is_terminal() {
+                anyhow::bail!("--interactive requires an attached TTY on stdin");
+            }
+            let _interactive_permit = acquire_interactive_session_permit(cli.interactive).await?;
+            let summary = codegen::run_code_generator(
+                oracle.as_ref(),
+                &generator,
+                &result,
+                &work_dir,
+                &cli.question,
+                iteration,
+                previous_codegen_summary.as_deref(),
+                cli.interactive,
+                Duration::from_secs(cli.interactive_timeout),
+                shutdown_rx.clone(),
+            )
+            .await?;
+
+            history::record_event(history::EventRecord {
+                component: "codegen".to_owned(),
+                kind: "codegen.summary".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("iteration {iteration} codegen completed"),
+                call_no: None,
+                attempt: None,
+                latency_ms: None,
+                cache_hit: None,
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: Some(summary.to_string()),
+                error_payload: None,
+                extra_json: Some(
+                    serde_json::json!({
+                        "generator": generator.to_string(),
+                        "interactive": cli.interactive,
+                    })
+                    .to_string(),
+                ),
+                iteration_override: Some(iteration),
+            });
+
+            ensure_no_live_guards(&oracle, cli.interactive).await?;
+
+            oracle.print_telemetry();
+            print_runtime_telemetry();
+
+            let trimmed: String = summary.chars().take(200).collect();
+            eprintln!(">>> Iteration {iteration} done: {trimmed}");
+            previous_codegen_summary = Some(summary.to_string());
+
+            history::record_event(history::EventRecord {
+                component: "main".to_owned(),
+                kind: "iteration.end".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("iteration {iteration} done: {trimmed}"),
+                call_no: None,
+                attempt: None,
+                latency_ms: None,
+                cache_hit: None,
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: None,
+                error_payload: None,
+                extra_json: None,
+                iteration_override: Some(iteration),
+            });
+
+            if !oracle.budget_unlimited() && oracle.budget_remaining() == 0 {
+                error_msg!("Budget exhausted. Terminating fix loop.");
+                break;
+            }
+
+            iteration = iteration
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("iteration counter overflow"))?;
+        }
+
+        if reached_iteration_limit {
+            let msg = format!(
+                "Reached max iterations ({}) with {}. Stopping loop.",
+                cli.max_iterations, generator
+            );
+            final_output_for_history = Some(msg.clone());
+            eprintln!("\n>>> {msg}");
+            eprintln!(">>> Run again to continue if needed.");
+        }
         ensure_no_live_guards(&oracle, cli.interactive).await?;
+        Ok(())
+    }
+    .await;
 
-        oracle.print_telemetry();
-        print_runtime_telemetry();
-
-        let trimmed: String = summary.chars().take(200).collect();
-        eprintln!(">>> Iteration {iteration} done: {trimmed}");
-        verbose!(
-            "    (full log: {})",
-            codegen::log_file_name(&generator, iteration)
-        );
-
-        if !oracle.budget_unlimited() && oracle.budget_remaining() == 0 {
-            error_msg!("Budget exhausted. Terminating fix loop.");
-            break;
+    if let Some(run_id) = run_id.as_deref() {
+        match &run_result {
+            Ok(()) => history::finish_run(run_id, "ok", final_output_for_history.as_deref(), None),
+            Err(error) => history::finish_run(
+                run_id,
+                "error",
+                final_output_for_history.as_deref(),
+                Some(&sanitize_error(error)),
+            ),
         }
-
-        iteration = iteration
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("iteration counter overflow"))?;
     }
-
-    if reached_iteration_limit {
-        eprintln!(
-            "\n>>> Reached max iterations ({}) with {}. Stopping loop.",
-            cli.max_iterations, generator
-        );
-        eprintln!(">>> Run again to continue if needed.");
-    }
-    ensure_no_live_guards(&oracle, cli.interactive).await?;
-    Ok(())
+    history::clear_active_context();
+    run_result
 }
 
 #[cfg(test)]
@@ -1440,6 +1599,14 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_parser_accepts_host_and_port() {
+        let args =
+            DashboardArgsRaw::parse_from(["lambda_rlm", "--host", "0.0.0.0", "--port", "9999"]);
+        assert_eq!(args.host, "0.0.0.0");
+        assert_eq!(args.port, 9999);
+    }
+
+    #[test]
     fn truncation_error_detection_matches_oracle_message() {
         let err = anyhow::anyhow!(
             "response truncated at max_tokens=64 after 5 segment(s); increase token budget"
@@ -1468,9 +1635,18 @@ mod tests {
         // sanitize_error should show the message but redact all secrets
         assert!(!exposed.contains("fw-test-secret"), "fireworks key leaked");
         assert!(!exposed.contains("claude-test-secret"), "claude key leaked");
-        assert!(!exposed.contains("opencode-test-secret"), "opencode key leaked");
-        assert!(!exposed.contains("custom-test-secret"), "custom token leaked");
-        assert!(exposed.contains("[REDACTED]"), "should contain redaction markers");
+        assert!(
+            !exposed.contains("opencode-test-secret"),
+            "opencode key leaked"
+        );
+        assert!(
+            !exposed.contains("custom-test-secret"),
+            "custom token leaked"
+        );
+        assert!(
+            exposed.contains("[REDACTED]"),
+            "should contain redaction markers"
+        );
 
         let debug = format!("{err:?}");
         assert!(debug.contains("fw-test-secret"));
