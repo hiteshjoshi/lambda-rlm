@@ -573,10 +573,11 @@ mod tests {
             trace_id: [7u8; 16],
         });
 
-        let result = tokio::time::timeout(Duration::from_secs(15), phi(cfg, wide_input(160), 0, None))
-            .await
-            .expect("phi should complete without permit deadlock")
-            .expect("phi should succeed");
+        let result =
+            tokio::time::timeout(Duration::from_secs(15), phi(cfg, wide_input(160), 0, None))
+                .await
+                .expect("phi should complete without permit deadlock")
+                .expect("phi should succeed");
 
         assert!(!result.trim().is_empty());
     }
@@ -648,10 +649,7 @@ pub async fn auto_detect_task(
                 raw = other,
                 "auto-detect returned unknown task, defaulting to summarise"
             );
-            warn_msg!(
-                "Auto-detect returned '{}', defaulting to summarise",
-                other
-            );
+            warn_msg!("Auto-detect returned '{}', defaulting to summarise", other);
             TaskType::Summarise
         }
     };

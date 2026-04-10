@@ -26,15 +26,20 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
+use crate::history;
 use crate::oracle::Oracle;
 use crate::resilience::CircuitBreaker;
 use crate::types::CodeGenerator;
 
+#[allow(dead_code)]
 const RESULT_FILE_NAME: &str = ".lambda-rlm-result.md";
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+#[allow(dead_code)]
 const MAX_LOG_FILES_PER_GENERATOR: usize = 10;
 const CODEGEN_BUDGET_UNITS: usize = 50;
+#[allow(dead_code)]
 const RESULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+#[allow(dead_code)]
 const LOG_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INLINE_ANALYSIS_BYTES: usize = 128 * 1024;
 const CLAUDE_CB_THRESHOLD: usize = 3;
@@ -276,6 +281,7 @@ fn codegen_circuit(
 ///
 /// PRE: question is non-empty, iteration >= 1
 /// POST: prompt instructs the generator to read .lambda-rlm-result.md and act
+#[allow(dead_code)]
 fn build_prompt(question: &str, iteration: usize) -> String {
     format!(
         "Read the analysis in .lambda-rlm-result.md — it's iteration {iteration} of a λ-RLM \
@@ -292,7 +298,26 @@ fn build_prompt(question: &str, iteration: usize) -> String {
     )
 }
 
-fn build_prompt_with_inline_result(question: &str, iteration: usize, result: &str) -> String {
+fn previous_iteration_context(previous_summary: Option<&str>) -> String {
+    const MAX_PREV_SUMMARY_CHARS: usize = 1200;
+    let Some(summary) = previous_summary.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "No previous iteration summary available (iteration 1 or missing context)."
+            .to_string();
+    };
+
+    let mut clipped: String = summary.chars().take(MAX_PREV_SUMMARY_CHARS).collect();
+    if summary.chars().count() > MAX_PREV_SUMMARY_CHARS {
+        clipped.push_str("...");
+    }
+    clipped
+}
+
+fn build_prompt_with_inline_result(
+    question: &str,
+    iteration: usize,
+    result: &str,
+    previous_summary: Option<&str>,
+) -> String {
     let mut inline = result.to_owned();
     if inline.len() > MAX_INLINE_ANALYSIS_BYTES {
         let mut end = MAX_INLINE_ANALYSIS_BYTES;
@@ -303,13 +328,17 @@ fn build_prompt_with_inline_result(question: &str, iteration: usize, result: &st
         inline.push_str("\n\n[TRUNCATED: source analysis clipped due to storage constraints]");
     }
 
+    let previous_context = previous_iteration_context(previous_summary);
+
     format!(
         "Read this analysis directly (result file unavailable due to disk constraints) — it's iteration {iteration} of a λ-RLM \
-         fix loop for the question: \"{question}\".\n\n\
-         --- BEGIN ANALYSIS ---\n{inline}\n--- END ANALYSIS ---\n\n\
-         Your job:\n\
-         1. Read the findings carefully.\n\
-         2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
+          fix loop for the question: \"{question}\".\n\n\
+         Previous iteration outcome:\n{previous_context}\n\n\
+          --- BEGIN ANALYSIS ---\n{inline}\n--- END ANALYSIS ---\n\n\
+          Your job:\n\
+          0. Use the previous iteration outcome to avoid repeating completed work.\n\
+          1. Read the findings carefully.\n\
+          2. Act on every actionable item — fix bugs, refactor code, add missing pieces.\n\
          3. When done, output a single line summary of what you changed.\n\
          4. Do a proper git commit(signed commit preferred)\n\
          5. Update readme with commit id and change-log\n\
@@ -329,6 +358,7 @@ pub async fn run_code_generator(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
     interactive: bool,
     interactive_timeout: Duration,
     shutdown: watch::Receiver<bool>,
@@ -342,6 +372,7 @@ pub async fn run_code_generator(
             work_dir,
             question,
             iteration,
+            previous_summary,
             interactive,
             interactive_timeout,
             shutdown,
@@ -356,6 +387,7 @@ pub async fn run_code_generator(
         question,
         iteration,
         result,
+        previous_summary,
         interactive,
     );
     let flights = CODEGEN_SINGLE_FLIGHT.get_or_init(DashMap::new);
@@ -419,6 +451,7 @@ pub async fn run_code_generator(
                     work_dir,
                     question,
                     iteration,
+                    previous_summary,
                     interactive,
                     interactive_timeout,
                     shutdown.clone(),
@@ -477,17 +510,34 @@ async fn run_code_generator_once(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
     interactive: bool,
     interactive_timeout: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
-    let cache_key = codegen_cache_key(generator, result, interactive);
+    let cache_key = codegen_cache_key(generator, result, previous_summary, interactive);
     if !interactive {
         if let Some(cached) = oracle
             .cache()
             .get_validated(&cache_key, |value| validate_codegen_summary(value).is_ok())
         {
             tracing::debug!(generator = %generator, iteration, "codegen replay cache hit");
+            history::record_event(history::EventRecord {
+                component: "codegen".to_owned(),
+                kind: "codegen.cache_hit".to_owned(),
+                status: "ok".to_owned(),
+                message: format!("{generator} iteration {iteration} replay cache hit"),
+                call_no: None,
+                attempt: Some(0),
+                latency_ms: Some(0),
+                cache_hit: Some(true),
+                idempotency_key: None,
+                request_payload: None,
+                response_payload: Some(cached.clone()),
+                error_payload: None,
+                extra_json: None,
+                iteration_override: Some(iteration),
+            });
             return Ok(Arc::from(cached));
         }
     }
@@ -509,6 +559,7 @@ async fn run_code_generator_once(
                         work_dir,
                         question,
                         iteration,
+                        previous_summary,
                         interactive_timeout,
                         INTERACTIVE_SESSION_TIMEOUT,
                         shutdown,
@@ -522,6 +573,7 @@ async fn run_code_generator_once(
                         work_dir,
                         question,
                         iteration,
+                        previous_summary,
                         interactive_timeout,
                         INTERACTIVE_SESSION_TIMEOUT,
                         shutdown,
@@ -581,8 +633,12 @@ async fn run_code_generator_once(
     .with_context(|| format!("{generator} bulkhead saturated"))?;
     let started = Instant::now();
     let run = match generator {
-        CodeGenerator::Claude => run_claude(result, work_dir, question, iteration).await,
-        CodeGenerator::Opencode => run_opencode(result, work_dir, question, iteration).await,
+        CodeGenerator::Claude => {
+            run_claude(result, work_dir, question, iteration, previous_summary).await
+        }
+        CodeGenerator::Opencode => {
+            run_opencode(result, work_dir, question, iteration, previous_summary).await
+        }
     };
     oracle.record_codegen_call(generator, started.elapsed());
     budget_guard.commit();
@@ -654,6 +710,7 @@ fn codegen_flight_key(
     question: &str,
     iteration: usize,
     result: &str,
+    previous_summary: Option<&str>,
     interactive: bool,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -662,6 +719,9 @@ fn codegen_flight_key(
     hasher.update(question.as_bytes());
     hasher.update(&iteration.to_le_bytes());
     hasher.update(&[interactive as u8]);
+    if let Some(summary) = previous_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        hasher.update(summary.as_bytes());
+    }
     hasher.update(result.as_bytes());
     format!("{}:{}", generator, hasher.finalize().to_hex())
 }
@@ -788,7 +848,12 @@ fn codegen_bulkhead(generator: &CodeGenerator) -> Arc<Semaphore> {
     }
 }
 
-fn codegen_cache_key(generator: &CodeGenerator, result: &str, interactive: bool) -> String {
+fn codegen_cache_key(
+    generator: &CodeGenerator,
+    result: &str,
+    previous_summary: Option<&str>,
+    interactive: bool,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[CODEGEN_CACHE_SCHEMA_VERSION]);
     hasher.update(b"codegen\x00");
@@ -797,6 +862,10 @@ fn codegen_cache_key(generator: &CodeGenerator, result: &str, interactive: bool)
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\x00");
     hasher.update(&[interactive as u8]);
+    hasher.update(b"\x00");
+    if let Some(summary) = previous_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        hasher.update(summary.as_bytes());
+    }
     hasher.update(b"\x00");
     hasher.update(result.as_bytes());
     format!("b3-codegen_{}", hasher.finalize().to_hex())
@@ -818,6 +887,7 @@ fn validate_codegen_summary(summary: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_analysis_result_content(result: &str) -> Result<()> {
     anyhow::ensure!(!result.trim().is_empty(), "result is empty");
     anyhow::ensure!(
@@ -847,6 +917,7 @@ fn validate_generator_output(generator: &CodeGenerator, output: &str) -> Result<
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
@@ -889,6 +960,7 @@ fn open_file_no_follow(path: &Path) -> Result<(std::fs::File, u64, u64, u64)> {
     Ok((file, meta.len(), 0, 0))
 }
 
+#[allow(dead_code)]
 async fn write_result_file_atomically(
     work_dir: &Path,
     result: &str,
@@ -961,6 +1033,7 @@ async fn write_result_file_atomically(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn is_storage_full_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
@@ -971,6 +1044,7 @@ fn is_storage_full_error(error: &anyhow::Error) -> bool {
     })
 }
 
+#[allow(dead_code)]
 async fn write_log_file_atomically(log_file: &Path, content: &str) -> Result<()> {
     let log_path = log_file.to_path_buf();
     let parent = log_path
@@ -1005,6 +1079,7 @@ async fn write_log_file_atomically(log_file: &Path, content: &str) -> Result<()>
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn remove_result_file(work_dir: &Path) {
     let result_file = work_dir.join(RESULT_FILE_NAME);
     if let Err(error) = tokio::fs::remove_file(&result_file).await {
@@ -1151,6 +1226,7 @@ impl CodeGenerator {
     }
 }
 
+#[allow(dead_code)]
 fn cleanup_old_logs(work_dir: &Path, generator: &CodeGenerator) {
     let mut entries: Vec<(SystemTime, std::path::PathBuf)> = Vec::new();
     let prefix = match generator {
@@ -1813,7 +1889,9 @@ async fn terminate_pty_child_with_escalation(
 async fn run_opencode_interactive_pty(
     work_dir: &Path,
     question: &str,
+    result: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
     startup_timeout: Duration,
     session_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1823,7 +1901,7 @@ async fn run_opencode_interactive_pty(
         ">>> Iteration {iteration}: launching interactive opencode in {} ...",
         work_dir.display()
     );
-    eprintln!(">>> Start by opening .lambda-rlm-result.md, then apply fixes for: \"{question}\"");
+    eprintln!(">>> Use inline analysis and apply fixes for: \"{question}\"");
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -1835,10 +1913,13 @@ async fn run_opencode_interactive_pty(
     let mut pty_cmd = CommandBuilder::new("opencode");
     pty_cmd.cwd(work_dir);
     pty_cmd.arg("run");
-    pty_cmd.arg("--file");
-    pty_cmd.arg(RESULT_FILE_NAME);
     pty_cmd.arg("--");
-    pty_cmd.arg(interactive_prompt(question, iteration));
+    pty_cmd.arg(interactive_prompt(
+        question,
+        iteration,
+        result,
+        previous_summary,
+    ));
     let child = pair
         .slave
         .spawn_command(pty_cmd)
@@ -2117,10 +2198,28 @@ async fn run_opencode_interactive_pty(
     }
 }
 
-fn interactive_prompt(question: &str, iteration: usize) -> String {
+fn interactive_prompt(
+    question: &str,
+    iteration: usize,
+    result: &str,
+    previous_summary: Option<&str>,
+) -> String {
+    let mut inline = result.to_owned();
+    if inline.len() > MAX_INLINE_ANALYSIS_BYTES {
+        let mut end = MAX_INLINE_ANALYSIS_BYTES;
+        while !inline.is_char_boundary(end) {
+            end -= 1;
+        }
+        inline.truncate(end);
+        inline.push_str("\n\n[TRUNCATED: analysis payload shortened for interactive prompt]");
+    }
+    let previous_context = previous_iteration_context(previous_summary);
+
     format!(
         "You are running interactive mode for lambda-RLM iteration {iteration}.\n\
-         Read .lambda-rlm-result.md first, then execute fixes for: \"{question}\".\n\
+         Use the analysis below, then execute fixes for: \"{question}\".\n\
+         Previous iteration outcome:\n{previous_context}\n\n\
+         Analysis:\n{inline}\n\n\
          Commit your changes when done and print a one-line summary (or CLEAN)."
     )
 }
@@ -2135,64 +2234,67 @@ async fn run_claude(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
 ) -> Result<Arc<str>> {
-    let mut wrote_result_file = true;
-    if let Err(error) = write_result_file_atomically(work_dir, result, iteration).await {
-        if is_storage_full_error(&error) {
-            tracing::warn!(iteration, error = %error, "disk full writing result file; falling back to in-memory prompt");
-            wrote_result_file = false;
+    eprintln!(
+        ">>> Iteration {iteration}: launching claude in {} ...",
+        work_dir.display()
+    );
+    let prompt = build_prompt_with_inline_result(question, iteration, result, previous_summary);
+
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("--dangerously-skip-permissions")
+        .arg("-p")
+        .arg(&prompt);
+    configure_generator_command(&mut cmd, work_dir);
+
+    let output = run_generator_process(cmd, &CodeGenerator::Claude).await?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("claude subprocess produced invalid UTF-8 on stdout")?;
+    let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
+
+    history::record_event(history::EventRecord {
+        component: "codegen".to_owned(),
+        kind: "generator.invocation".to_owned(),
+        status: if output.status.success() {
+            "ok".to_owned()
         } else {
-            return Err(error);
-        }
+            "error".to_owned()
+        },
+        message: format!("claude iteration {iteration} completed"),
+        call_no: None,
+        attempt: Some(1),
+        latency_ms: None,
+        cache_hit: None,
+        idempotency_key: None,
+        request_payload: Some(prompt.clone()),
+        response_payload: Some(stdout.to_owned()),
+        error_payload: if stderr.trim().is_empty() {
+            None
+        } else {
+            Some(stderr.clone())
+        },
+        extra_json: Some(
+            serde_json::json!({
+                "generator": "claude",
+                "iteration": iteration,
+                "exit_success": output.status.success(),
+            })
+            .to_string(),
+        ),
+        iteration_override: Some(iteration),
+    });
+
+    if !output.status.success() {
+        tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
+        return Err(classify_non_success_exit(
+            "claude",
+            &ProcessExitStatus::Std(output.status),
+        ));
     }
 
-    let run = async {
-        let log_file = work_dir.join(format!(".lambda-rlm-claude-{iteration}.log"));
-
-        eprintln!(
-            ">>> Iteration {iteration}: launching claude in {} ...",
-            work_dir.display()
-        );
-        let prompt = if wrote_result_file {
-            build_prompt(question, iteration)
-        } else {
-            build_prompt_with_inline_result(question, iteration, result)
-        };
-
-        let mut cmd = tokio::process::Command::new("claude");
-        cmd.arg("--dangerously-skip-permissions")
-            .arg("-p")
-            .arg(&prompt);
-        configure_generator_command(&mut cmd, work_dir);
-
-        let output = run_generator_process(cmd, &CodeGenerator::Claude).await?;
-
-        let stdout = std::str::from_utf8(&output.stdout)
-            .context("claude subprocess produced invalid UTF-8 on stdout")?;
-
-        // Save full output to log — warn on failure rather than swallowing
-        if let Err(e) = write_log_file_atomically(&log_file, stdout).await {
-            tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
-        }
-
-        if !output.status.success() {
-            let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
-            tracing::error!(status = %output.status, stderr = %stderr, "claude exited with failure status");
-            return Err(classify_non_success_exit(
-                "claude",
-                &ProcessExitStatus::Std(output.status),
-            ));
-        }
-
-        let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
-
-        Ok(summary)
-    }
-    .await;
-
-    remove_result_file(work_dir).await;
-    cleanup_old_logs(work_dir, &CodeGenerator::Claude);
-    run
+    let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
+    Ok(summary)
 }
 
 async fn run_claude_interactive(
@@ -2200,12 +2302,11 @@ async fn run_claude_interactive(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
     startup_timeout: Duration,
     session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
-    write_result_file_atomically(work_dir, result, iteration).await?;
-
     let run = async {
         eprintln!(
             ">>> Iteration {iteration}: launching interactive claude in {} ...",
@@ -2213,7 +2314,12 @@ async fn run_claude_interactive(
         );
         let mut cmd = tokio::process::Command::new("claude");
         cmd.arg("--dangerously-skip-permissions")
-            .arg(interactive_prompt(question, iteration));
+            .arg(interactive_prompt(
+                question,
+                iteration,
+                result,
+                previous_summary,
+            ));
         configure_interactive_generator_command(&mut cmd, work_dir);
         run_generator_interactive_process(
             cmd,
@@ -2227,7 +2333,42 @@ async fn run_claude_interactive(
     }
     .await;
 
-    remove_result_file(work_dir).await;
+    history::record_event(history::EventRecord {
+        component: "codegen".to_owned(),
+        kind: "generator.invocation".to_owned(),
+        status: if run.is_ok() {
+            "ok".to_owned()
+        } else {
+            "error".to_owned()
+        },
+        message: format!("interactive claude iteration {iteration} finished"),
+        call_no: None,
+        attempt: Some(1),
+        latency_ms: None,
+        cache_hit: None,
+        idempotency_key: None,
+        request_payload: Some(interactive_prompt(
+            question,
+            iteration,
+            result,
+            previous_summary,
+        )),
+        response_payload: None,
+        error_payload: run
+            .as_ref()
+            .err()
+            .map(|err: &anyhow::Error| err.to_string()),
+        extra_json: Some(
+            serde_json::json!({
+                "generator": "claude",
+                "interactive": true,
+                "iteration": iteration,
+            })
+            .to_string(),
+        ),
+        iteration_override: Some(iteration),
+    });
+
     run
 }
 
@@ -2241,65 +2382,67 @@ async fn run_opencode(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
 ) -> Result<Arc<str>> {
-    let mut wrote_result_file = true;
-    if let Err(error) = write_result_file_atomically(work_dir, result, iteration).await {
-        if is_storage_full_error(&error) {
-            tracing::warn!(iteration, error = %error, "disk full writing result file; falling back to in-memory prompt");
-            wrote_result_file = false;
+    eprintln!(
+        ">>> Iteration {iteration}: launching opencode in {} ...",
+        work_dir.display()
+    );
+    let prompt = build_prompt_with_inline_result(question, iteration, result, previous_summary);
+
+    let mut cmd = tokio::process::Command::new("opencode");
+    cmd.arg("run");
+    cmd.arg("--").arg(&prompt);
+    configure_generator_command(&mut cmd, work_dir);
+
+    let output = run_generator_process(cmd, &CodeGenerator::Opencode).await?;
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("opencode subprocess produced invalid UTF-8 on stdout")?;
+    let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
+
+    history::record_event(history::EventRecord {
+        component: "codegen".to_owned(),
+        kind: "generator.invocation".to_owned(),
+        status: if output.status.success() {
+            "ok".to_owned()
         } else {
-            return Err(error);
-        }
+            "error".to_owned()
+        },
+        message: format!("opencode iteration {iteration} completed"),
+        call_no: None,
+        attempt: Some(1),
+        latency_ms: None,
+        cache_hit: None,
+        idempotency_key: None,
+        request_payload: Some(prompt.clone()),
+        response_payload: Some(stdout.to_owned()),
+        error_payload: if stderr.trim().is_empty() {
+            None
+        } else {
+            Some(stderr.clone())
+        },
+        extra_json: Some(
+            serde_json::json!({
+                "generator": "opencode",
+                "iteration": iteration,
+                "exit_success": output.status.success(),
+            })
+            .to_string(),
+        ),
+        iteration_override: Some(iteration),
+    });
+
+    if !output.status.success() {
+        tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
+        return Err(classify_non_success_exit(
+            "opencode",
+            &ProcessExitStatus::Std(output.status),
+        ));
     }
 
-    let run = async {
-        let log_file = work_dir.join(format!(".lambda-rlm-opencode-{iteration}.log"));
-
-        eprintln!(
-            ">>> Iteration {iteration}: launching opencode in {} ...",
-            work_dir.display()
-        );
-        let prompt = if wrote_result_file {
-            build_prompt(question, iteration)
-        } else {
-            build_prompt_with_inline_result(question, iteration, result)
-        };
-
-        let mut cmd = tokio::process::Command::new("opencode");
-        cmd.arg("run");
-        if wrote_result_file {
-            cmd.arg("--file").arg(".lambda-rlm-result.md");
-        }
-        cmd.arg("--").arg(&prompt);
-        configure_generator_command(&mut cmd, work_dir);
-
-        let output = run_generator_process(cmd, &CodeGenerator::Opencode).await?;
-
-        let stdout = std::str::from_utf8(&output.stdout)
-            .context("opencode subprocess produced invalid UTF-8 on stdout")?;
-
-        if let Err(e) = write_log_file_atomically(&log_file, stdout).await {
-            tracing::warn!(path = %log_file.display(), error = %e, "failed to write iteration log");
-        }
-
-        if !output.status.success() {
-            let stderr = sanitize_generator_stderr(&String::from_utf8_lossy(&output.stderr));
-            tracing::error!(status = %output.status, stderr = %stderr, "opencode exited with failure status");
-            return Err(classify_non_success_exit(
-                "opencode",
-                &ProcessExitStatus::Std(output.status),
-            ));
-        }
-
-        let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
-
-        Ok(summary)
-    }
-    .await;
-
-    remove_result_file(work_dir).await;
-    cleanup_old_logs(work_dir, &CodeGenerator::Opencode);
-    run
+    let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
+    Ok(summary)
 }
 
 async fn run_opencode_interactive(
@@ -2307,17 +2450,18 @@ async fn run_opencode_interactive(
     work_dir: &Path,
     question: &str,
     iteration: usize,
+    previous_summary: Option<&str>,
     startup_timeout: Duration,
     session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Arc<str>> {
-    write_result_file_atomically(work_dir, result, iteration).await?;
-
     let run = async {
         run_opencode_interactive_pty(
             work_dir,
             question,
+            result,
             iteration,
+            previous_summary,
             startup_timeout,
             session_timeout,
             shutdown_rx,
@@ -2327,11 +2471,47 @@ async fn run_opencode_interactive(
     }
     .await;
 
-    remove_result_file(work_dir).await;
+    history::record_event(history::EventRecord {
+        component: "codegen".to_owned(),
+        kind: "generator.invocation".to_owned(),
+        status: if run.is_ok() {
+            "ok".to_owned()
+        } else {
+            "error".to_owned()
+        },
+        message: format!("interactive opencode iteration {iteration} finished"),
+        call_no: None,
+        attempt: Some(1),
+        latency_ms: None,
+        cache_hit: None,
+        idempotency_key: None,
+        request_payload: Some(interactive_prompt(
+            question,
+            iteration,
+            result,
+            previous_summary,
+        )),
+        response_payload: None,
+        error_payload: run
+            .as_ref()
+            .err()
+            .map(|err: &anyhow::Error| err.to_string()),
+        extra_json: Some(
+            serde_json::json!({
+                "generator": "opencode",
+                "interactive": true,
+                "iteration": iteration,
+            })
+            .to_string(),
+        ),
+        iteration_override: Some(iteration),
+    });
+
     run
 }
 
 /// Log file name for the given generator and iteration.
+#[allow(dead_code)]
 pub fn log_file_name(generator: &CodeGenerator, iteration: usize) -> String {
     match generator {
         CodeGenerator::Claude => format!(".lambda-rlm-claude-{iteration}.log"),
@@ -2468,8 +2648,8 @@ mod tests {
     #[test]
     fn codegen_cache_key_changes_with_generator() {
         let result = "fix critical issue";
-        let claude = codegen_cache_key(&CodeGenerator::Claude, result, false);
-        let opencode = codegen_cache_key(&CodeGenerator::Opencode, result, false);
+        let claude = codegen_cache_key(&CodeGenerator::Claude, result, None, false);
+        let opencode = codegen_cache_key(&CodeGenerator::Opencode, result, None, false);
         assert_ne!(claude, opencode);
         assert!(claude.starts_with("b3-codegen_"));
         assert!(opencode.starts_with("b3-codegen_"));
@@ -2478,8 +2658,8 @@ mod tests {
     #[test]
     fn codegen_cache_key_differs_for_interactive_mode() {
         let result = "fix critical issue";
-        let headless = codegen_cache_key(&CodeGenerator::Claude, result, false);
-        let interactive = codegen_cache_key(&CodeGenerator::Claude, result, true);
+        let headless = codegen_cache_key(&CodeGenerator::Claude, result, None, false);
+        let interactive = codegen_cache_key(&CodeGenerator::Claude, result, None, true);
         assert_ne!(headless, interactive);
     }
 
@@ -2491,6 +2671,7 @@ mod tests {
             "q",
             1,
             "r",
+            None,
             false,
         );
         assert!(key.starts_with("opencode:"));

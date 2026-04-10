@@ -77,6 +77,9 @@ lambda_rlm -p ./src -q "Find duplicate logic" -t pairwise
 
 # Dry run (no API calls — test your setup)
 lambda_rlm -p ./src -q "test" --dry-run
+
+# Launch dashboard (history viewer)
+lambda_rlm dashboard --port 9889
 ```
 
 Task type is auto-detected if you don't pass `-t`.
@@ -129,7 +132,17 @@ lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 5
 lambda_rlm -p ./src -q "Fix all bugs" --claude --max-iterations 0
 ```
 
-Headless mode (default) runs fully autonomous and writes logs to `.lambda-rlm-claude-{n}.log` or `.lambda-rlm-opencode-{n}.log` in the target directory. Interactive mode inherits your terminal, marks the session active immediately after spawn to avoid TTY startup deadlocks, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
+Headless mode (default) runs fully autonomous and stores run history, analysis outputs, request/response payloads, and generator output in `~/.lambda-rlm/history.db`. It no longer writes `.lambda-rlm-result.md` or `.lambda-rlm-*.log` into your project directory. Interactive mode inherits your terminal, marks the session active immediately after spawn to avoid TTY startup deadlocks, races child-exit/shutdown/timeout fairly, enforces a 30-minute session safety timeout to prevent stuck children, and requires an attached TTY.
+
+## Dashboard
+
+The dashboard is a thin viewer over SQLite history data:
+
+```bash
+lambda_rlm dashboard --host 127.0.0.1 --port 9889
+```
+
+Open `http://127.0.0.1:9889` to inspect runs, iterations, and full API request/response payloads in sequence.
 
 ## How it works
 
@@ -196,6 +209,8 @@ Six task types, each with specialized leaf prompts and reduce operators:
 ```
 src/
   main.rs        — CLI, file collector, fix loop driver
+  dashboard.rs   — web dashboard over persisted run history
+  history.rs     — SQLite persistence for runs/events/artifacts
   types.rs       — TaskType, CodeGenerator enums (shared across modules)
   codegen.rs     — post-RLM code generation: Claude CLI / OpenCode CLI dispatch
   combinator.rs  — structural chunking, keyword extraction, text splitting
