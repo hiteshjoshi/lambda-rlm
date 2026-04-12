@@ -29,6 +29,7 @@ use tokio::time::Duration;
 use crate::history;
 use crate::oracle::Oracle;
 use crate::resilience::CircuitBreaker;
+use crate::runlog::RunLogger;
 use crate::types::CodeGenerator;
 
 #[allow(dead_code)]
@@ -362,6 +363,7 @@ pub async fn run_code_generator(
     interactive: bool,
     interactive_timeout: Duration,
     shutdown: watch::Receiver<bool>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
     validate_codegen_work_dir(work_dir)?;
     if !single_flight_enabled(interactive) {
@@ -376,6 +378,7 @@ pub async fn run_code_generator(
             interactive,
             interactive_timeout,
             shutdown,
+            run_logger,
         )
         .await;
     }
@@ -455,6 +458,7 @@ pub async fn run_code_generator(
                     interactive,
                     interactive_timeout,
                     shutdown.clone(),
+                    run_logger,
                 )
                 .await
                 .map_err(|error| {
@@ -514,6 +518,7 @@ async fn run_code_generator_once(
     interactive: bool,
     interactive_timeout: Duration,
     shutdown: watch::Receiver<bool>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
     let cache_key = codegen_cache_key(generator, result, previous_summary, interactive);
     if !interactive {
@@ -563,6 +568,7 @@ async fn run_code_generator_once(
                         interactive_timeout,
                         INTERACTIVE_SESSION_TIMEOUT,
                         shutdown,
+                        run_logger,
                     )
                     .await
                 }
@@ -577,6 +583,7 @@ async fn run_code_generator_once(
                         interactive_timeout,
                         INTERACTIVE_SESSION_TIMEOUT,
                         shutdown,
+                        run_logger,
                     ),
                 )
                 .await
@@ -634,10 +641,26 @@ async fn run_code_generator_once(
     let started = Instant::now();
     let run = match generator {
         CodeGenerator::Claude => {
-            run_claude(result, work_dir, question, iteration, previous_summary).await
+            run_claude(
+                result,
+                work_dir,
+                question,
+                iteration,
+                previous_summary,
+                run_logger,
+            )
+            .await
         }
         CodeGenerator::Opencode => {
-            run_opencode(result, work_dir, question, iteration, previous_summary).await
+            run_opencode(
+                result,
+                work_dir,
+                question,
+                iteration,
+                previous_summary,
+                run_logger,
+            )
+            .await
         }
     };
     oracle.record_codegen_call(generator, started.elapsed());
@@ -2235,12 +2258,16 @@ async fn run_claude(
     question: &str,
     iteration: usize,
     previous_summary: Option<&str>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
     eprintln!(
         ">>> Iteration {iteration}: launching claude in {} ...",
         work_dir.display()
     );
     let prompt = build_prompt_with_inline_result(question, iteration, result, previous_summary);
+    if let Some(logger) = run_logger {
+        logger.write_codegen_prompt(iteration, "claude", &prompt);
+    }
 
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("--dangerously-skip-permissions")
@@ -2294,6 +2321,14 @@ async fn run_claude(
     }
 
     let summary = CodeGenerator::Claude.extract_result(&output.stdout)?;
+    if let Some(logger) = run_logger {
+        logger.write_codegen_result(
+            iteration,
+            Some(stdout),
+            Some(&stderr),
+            Some(summary.as_ref()),
+        );
+    }
     Ok(summary)
 }
 
@@ -2306,20 +2341,19 @@ async fn run_claude_interactive(
     startup_timeout: Duration,
     session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
+    let prompt = interactive_prompt(question, iteration, result, previous_summary);
+    if let Some(logger) = run_logger {
+        logger.write_codegen_prompt(iteration, "claude", &prompt);
+    }
     let run = async {
         eprintln!(
             ">>> Iteration {iteration}: launching interactive claude in {} ...",
             work_dir.display()
         );
         let mut cmd = tokio::process::Command::new("claude");
-        cmd.arg("--dangerously-skip-permissions")
-            .arg(interactive_prompt(
-                question,
-                iteration,
-                result,
-                previous_summary,
-            ));
+        cmd.arg("--dangerously-skip-permissions").arg(&prompt);
         configure_interactive_generator_command(&mut cmd, work_dir);
         run_generator_interactive_process(
             cmd,
@@ -2369,6 +2403,17 @@ async fn run_claude_interactive(
         iteration_override: Some(iteration),
     });
 
+    if let Some(logger) = run_logger {
+        match &run {
+            Ok(summary) => {
+                logger.write_codegen_result(iteration, None, None, Some(summary.as_ref()));
+            }
+            Err(error) => {
+                logger.write_codegen_result(iteration, None, Some(&error.to_string()), None);
+            }
+        }
+    }
+
     run
 }
 
@@ -2383,12 +2428,16 @@ async fn run_opencode(
     question: &str,
     iteration: usize,
     previous_summary: Option<&str>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
     eprintln!(
         ">>> Iteration {iteration}: launching opencode in {} ...",
         work_dir.display()
     );
     let prompt = build_prompt_with_inline_result(question, iteration, result, previous_summary);
+    if let Some(logger) = run_logger {
+        logger.write_codegen_prompt(iteration, "opencode", &prompt);
+    }
 
     let mut cmd = tokio::process::Command::new("opencode");
     cmd.arg("run");
@@ -2442,6 +2491,14 @@ async fn run_opencode(
     }
 
     let summary = CodeGenerator::Opencode.extract_result(&output.stdout)?;
+    if let Some(logger) = run_logger {
+        logger.write_codegen_result(
+            iteration,
+            Some(stdout),
+            Some(&stderr),
+            Some(summary.as_ref()),
+        );
+    }
     Ok(summary)
 }
 
@@ -2454,7 +2511,12 @@ async fn run_opencode_interactive(
     startup_timeout: Duration,
     session_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
+    run_logger: Option<&RunLogger>,
 ) -> Result<Arc<str>> {
+    let prompt = interactive_prompt(question, iteration, result, previous_summary);
+    if let Some(logger) = run_logger {
+        logger.write_codegen_prompt(iteration, "opencode", &prompt);
+    }
     let run = async {
         run_opencode_interactive_pty(
             work_dir,
@@ -2506,6 +2568,17 @@ async fn run_opencode_interactive(
         ),
         iteration_override: Some(iteration),
     });
+
+    if let Some(logger) = run_logger {
+        match &run {
+            Ok(summary) => {
+                logger.write_codegen_result(iteration, None, None, Some(summary.as_ref()));
+            }
+            Err(error) => {
+                logger.write_codegen_result(iteration, None, Some(&error.to_string()), None);
+            }
+        }
+    }
 
     run
 }

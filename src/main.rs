@@ -88,6 +88,7 @@ mod oracle;
 mod phi;
 mod reduce;
 mod resilience;
+mod runlog;
 mod types;
 mod verify;
 
@@ -102,7 +103,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tracing_subscriber::EnvFilter;
 
@@ -1303,11 +1304,44 @@ async fn run() -> Result<()> {
         config_fingerprint: cli.config_fingerprint(),
     });
 
+    let run_started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let run_logger = runlog::RunLogger::initialize(&cli.path, run_id.as_deref());
+    if let Some(logger) = run_logger.as_ref() {
+        logger.write_run_start(&serde_json::json!({
+            "run_id": run_id,
+            "started_at_ms": run_started_ms,
+            "mode": if generator.is_some() { "fix_loop" } else { "analysis" },
+            "path": cli.path.display().to_string(),
+            "question": cli.question,
+            "task": cli.task.to_string(),
+            "generator": generator.map(|g| g.to_string()),
+            "model": cli.model,
+            "config_fingerprint": cli.config_fingerprint(),
+            "status": "running"
+        }));
+        logger.append_event("run.start", "running", "run started", None);
+        if generator.is_none() {
+            logger.write_codegen_disabled();
+        }
+    }
+
     let mut final_output_for_history: Option<String> = None;
     let run_result: Result<()> = async {
         if generator.is_none() {
             history::set_iteration(0);
             let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
+            if let Some(logger) = run_logger.as_ref() {
+                logger.write_analysis(0, &result);
+                logger.append_event(
+                    "analysis.complete",
+                    "ok",
+                    "single-shot analysis completed",
+                    Some(serde_json::json!({"iteration": 0})),
+                );
+            }
             history::record_event(history::EventRecord {
                 component: "main".to_owned(),
                 kind: "analysis.result".to_owned(),
@@ -1388,6 +1422,15 @@ async fn run() -> Result<()> {
 
             // 1. Analyze
             let result = run_analysis(&cli, &oracle, shutdown_rx.clone()).await?;
+            if let Some(logger) = run_logger.as_ref() {
+                logger.write_analysis(iteration, &result);
+                logger.append_event(
+                    "analysis.complete",
+                    "ok",
+                    "iteration analysis completed",
+                    Some(serde_json::json!({"iteration": iteration})),
+                );
+            }
             history::record_event(history::EventRecord {
                 component: "main".to_owned(),
                 kind: "analysis.result".to_owned(),
@@ -1453,6 +1496,7 @@ async fn run() -> Result<()> {
                 cli.interactive,
                 Duration::from_secs(cli.interactive_timeout),
                 shutdown_rx.clone(),
+                run_logger.as_ref(),
             )
             .await?;
 
@@ -1486,6 +1530,18 @@ async fn run() -> Result<()> {
 
             let trimmed: String = summary.chars().take(200).collect();
             eprintln!(">>> Iteration {iteration} done: {trimmed}");
+            if let Some(logger) = run_logger.as_ref() {
+                logger.append_event(
+                    "codegen.complete",
+                    "ok",
+                    "generator iteration completed",
+                    Some(serde_json::json!({
+                        "iteration": iteration,
+                        "generator": generator.to_string(),
+                        "summary": summary.as_ref(),
+                    })),
+                );
+            }
             previous_codegen_summary = Some(summary.to_string());
 
             history::record_event(history::EventRecord {
@@ -1538,6 +1594,53 @@ async fn run() -> Result<()> {
                 final_output_for_history.as_deref(),
                 Some(&sanitize_error(error)),
             ),
+        }
+    }
+
+    if let Some(logger) = run_logger.as_ref() {
+        let finished_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        match &run_result {
+            Ok(()) => {
+                logger.write_run_finish(&serde_json::json!({
+                    "run_id": run_id,
+                    "started_at_ms": run_started_ms,
+                    "finished_at_ms": finished_at_ms,
+                    "mode": if generator.is_some() { "fix_loop" } else { "analysis" },
+                    "path": cli.path.display().to_string(),
+                    "question": cli.question,
+                    "task": cli.task.to_string(),
+                    "generator": generator.map(|g| g.to_string()),
+                    "model": cli.model,
+                    "config_fingerprint": cli.config_fingerprint(),
+                    "status": "ok"
+                }));
+                logger.append_event("run.finish", "ok", "run completed", None);
+            }
+            Err(error) => {
+                logger.write_run_finish(&serde_json::json!({
+                    "run_id": run_id,
+                    "started_at_ms": run_started_ms,
+                    "finished_at_ms": finished_at_ms,
+                    "mode": if generator.is_some() { "fix_loop" } else { "analysis" },
+                    "path": cli.path.display().to_string(),
+                    "question": cli.question,
+                    "task": cli.task.to_string(),
+                    "generator": generator.map(|g| g.to_string()),
+                    "model": cli.model,
+                    "config_fingerprint": cli.config_fingerprint(),
+                    "status": "error",
+                    "error": sanitize_error(error),
+                }));
+                logger.append_event(
+                    "run.finish",
+                    "error",
+                    "run failed",
+                    Some(serde_json::json!({"error": sanitize_error(error)})),
+                );
+            }
         }
     }
     history::clear_active_context();
